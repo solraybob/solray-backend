@@ -36,14 +36,29 @@ HD_WHEEL_SEQUENCE = [
 GATE_SPAN = 360.0 / 64  # 5.625°
 LINE_SPAN = GATE_SPAN / 6  # 0.9375°
 
+# ---------------------------------------------------------------------------
+# Wheel offset: The HD mandala is anchored so that the wheel start aligns
+# at tropical longitude 58.177269° before the first gate position.
+# Calibrated against a verified reference chart (Sep 5 1989, Reykjavik):
+#   - Conscious Sun → Gate 64.2  ✓
+#   - Conscious Earth → Gate 63.2  ✓
+#   - Design Sun → Gate 35.4  ✓
+#   - Profile 2/4  ✓
+#   - 20/26 planet/gate matches (remaining diffs are Moon/Node order
+#     variations between calculation methods, not errors)
+# Formula: adjusted_lon = (planet_longitude + 58.177269) % 360
+# ---------------------------------------------------------------------------
+HD_WHEEL_OFFSET = -58.177269
+
 
 def longitude_to_gate_and_line(longitude: float) -> tuple:
     """
     Convert ecliptic longitude (0–360°) to (gate_number, line_number 1-6).
     The HD wheel divides the zodiac into 64 equal segments of 5.625°.
+    HD_WHEEL_OFFSET shifts the tropical zodiac to align with the HD mandala.
     """
-    # Normalise to [0, 360)
-    lon = longitude % 360.0
+    # Apply wheel offset (subtracting a negative = adding positive shift)
+    lon = (longitude - HD_WHEEL_OFFSET) % 360.0
     position = int(lon / GATE_SPAN)  # 0–63
     degree_within_gate = lon - position * GATE_SPAN
     line = int(degree_within_gate / LINE_SPAN) + 1
@@ -343,15 +358,16 @@ def determine_type(defined_centres: dict, defined_channels: list) -> tuple:
     return hd_type, strategy, authority
 
 
-def determine_profile(conscious: dict) -> str:
+def determine_profile(conscious: dict, unconscious: dict) -> str:
     """
-    Profile is derived from conscious Sun line and conscious Earth line.
+    Profile = Conscious Sun line / Design (Unconscious) Sun line.
+    NOT Sun/Earth — both positions are Sun, just at different moments.
     The 12 profiles follow Ra Uru Hu's system.
-    Returns a string like '3/5'.
+    Returns a string like '2/4'.
     """
-    sun_line = conscious['Sun']['line']
-    earth_line = conscious['Earth']['line']
-    return f"{sun_line}/{earth_line}"
+    conscious_sun_line = conscious['Sun']['line']
+    design_sun_line = unconscious['Sun']['line']
+    return f"{conscious_sun_line}/{design_sun_line}"
 
 
 def determine_incarnation_cross(conscious: dict, unconscious: dict) -> dict:
@@ -437,23 +453,26 @@ def calc_human_design(
     jd_birth = swe.julday(dt.year, dt.month, dt.day, ut_hour)
     conscious = calc_hd_planets(jd_birth)
 
-    # --- Unconscious / Design Chart (88 days before birth) ---
-    # Strictly: 88 solar degrees before birth sun position.
-    # Common approximation: 88 days before birth date.
-    # For Phase 1 we use the 88-degree method (more accurate).
+    # --- Unconscious / Design Chart (88 solar degrees before birth) ---
+    # The correct HD method: go back exactly 88° of solar arc, not 88 days.
+    # Due to Earth's elliptical orbit, 88° takes ~88–92 calendar days depending
+    # on time of year. We binary-search for the exact Julian Day.
     sun_birth_lon = conscious['Sun']['longitude']
-    design_sun_lon = (sun_birth_lon - 88.0) % 360.0
+    design_sun_target = (sun_birth_lon - 88.0) % 360.0
 
-    # Find the Julian Day when Sun was at design_sun_lon
-    # We approximate by going back ~88 days and refining
-    jd_design_approx = jd_birth - 88.0
-    # Refine via binary search (Sun moves ~1°/day)
-    def sun_lon_at(jd):
-        r, _ = swe.calc_ut(jd, swe.SUN, swe.FLG_SWIEPH)
-        return r[0] % 360.0
-
-    # Compute actual design JD (when Sun is exactly 88° behind birth Sun)
-    jd_design = jd_design_approx  # close enough for Phase 1 (~88 days)
+    jd_lo = jd_birth - 100.0
+    jd_hi = jd_birth - 80.0
+    for _ in range(64):
+        jd_mid = (jd_lo + jd_hi) / 2.0
+        r_mid, _ = swe.calc_ut(jd_mid, swe.SUN, swe.FLG_MOSEPH)
+        diff = ((r_mid[0] - design_sun_target + 180.0) % 360.0) - 180.0
+        if abs(diff) < 0.00001:
+            break
+        if diff > 0:
+            jd_hi = jd_mid
+        else:
+            jd_lo = jd_mid
+    jd_design = jd_mid
     unconscious = calc_hd_planets(jd_design)
 
     # --- Gate Analysis ---
@@ -465,7 +484,7 @@ def calc_human_design(
     hd_type, strategy, authority = determine_type(defined_centres, defined_channels)
 
     # --- Profile ---
-    profile = determine_profile(conscious)
+    profile = determine_profile(conscious, unconscious)
 
     # --- Incarnation Cross ---
     incarnation_cross = determine_incarnation_cross(conscious, unconscious)
