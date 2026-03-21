@@ -28,8 +28,11 @@ from sqlalchemy.sql import func
 # Config
 # ---------------------------------------------------------------------------
 
-_DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
-_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', f'sqlite:///{os.path.abspath(_DB_PATH)}')
+# Default to Supabase PostgreSQL pooler if DATABASE_URL is not set.
+# For local dev without env var, this still connects to Supabase.
+# Override DATABASE_URL to sqlite:///... for fully offline local dev.
+_SUPABASE_DEFAULT = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:5432/postgres'
+_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', _SUPABASE_DEFAULT)
 
 def _build_database_url(raw_url: str) -> str:
     """Convert DATABASE_URL to an async-compatible SQLAlchemy URL.
