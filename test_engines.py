@@ -109,6 +109,46 @@ def test_astrology():
         house_str = f"House {p['house']:2d}" if p['house'] else "House  ?"
         print(f"    {name:<12} {p['sign']:<14} {p['degree']:6.2f}°  {house_str}{retro}")
 
+    # --- Extended points ---
+    print("\n  EXTENDED POINTS:")
+    ext = chart.get('extended_points', {})
+    all_pass &= check(len(ext) > 0, f"Extended points present: {len(ext)}")
+
+    expected_ext = ['Chiron', 'Ceres', 'Pallas', 'Juno', 'Vesta',
+                    'BlackMoonLilith', 'Earth', 'PartOfFortune', 'Vertex', 'EastPoint']
+    for ep_key in expected_ext:
+        present = ep_key in ext
+        all_pass &= check(present, f"Extended point present: {ep_key}")
+
+    for key, pt in ext.items():
+        if pt.get('absolute_degree') is None:
+            err = pt.get('error', 'unknown error')
+            print(f"    {pt.get('name', key):<22} [no data] ({err})")
+            continue
+        retro = " ℞" if pt.get('retrograde') else ""
+        house_str = f"House {pt['house']:2d}" if pt.get('house') else "House  ?"
+        extra = f"  [{pt.get('chart_type', '')}]" if 'chart_type' in pt else ""
+        print(f"    {pt.get('name', key):<22} {pt['sign']:<14} {pt['degree']:6.2f}°  "
+              f"{house_str}{retro}{extra}")
+
+    # Chiron specifically — should now have real data (via SE1 files or Moshier fallback)
+    chiron = ext.get('Chiron', {})
+    chiron_ok = chiron.get('absolute_degree') is not None
+    all_pass &= check(chiron_ok, f"Chiron has valid longitude (got: {chiron.get('absolute_degree')})")
+    if chiron_ok and chiron.get('note'):
+        print(f"    ℹ️  Chiron: {chiron['note']}")
+
+    # Sign rulership sanity checks
+    from astrology import SIGN_RULERS
+    all_pass &= check(SIGN_RULERS.get('Virgo') == 'Ceres',
+        f"Virgo ruler is Ceres (got: {SIGN_RULERS.get('Virgo')})")
+    all_pass &= check(SIGN_RULERS.get('Taurus') == 'Earth',
+        f"Taurus ruler is Earth (got: {SIGN_RULERS.get('Taurus')})")
+    all_pass &= check(SIGN_RULERS.get('Libra') == 'Venus',
+        f"Libra ruler is still Venus (got: {SIGN_RULERS.get('Libra')})")
+    all_pass &= check(SIGN_RULERS.get('Gemini') == 'Mercury',
+        f"Gemini ruler is still Mercury (got: {SIGN_RULERS.get('Gemini')})")
+
     # --- Transits ---
     print(f"\n  TRANSITS for {TODAY}:")
     transits = get_transits_and_aspects(chart, TODAY)
@@ -119,6 +159,15 @@ def test_astrology():
             continue
         retro = " ℞" if p['retrograde'] else ""
         print(f"    {name:<12} {p['sign']:<14} {p['degree']:6.2f}°{retro}")
+
+    print(f"\n  EXTENDED TRANSIT POINTS for {TODAY}:")
+    ext_t = transits.get('extended_transit_points', {})
+    for key, pt in ext_t.items():
+        if pt.get('absolute_degree') is None:
+            print(f"    {pt.get('name', key):<22} [no data]")
+            continue
+        retro = " ℞" if pt.get('retrograde') else ""
+        print(f"    {pt.get('name', key):<22} {pt['sign']:<14} {pt['degree']:6.2f}°{retro}")
 
     # --- Aspects ---
     aspects = transits['aspects']
