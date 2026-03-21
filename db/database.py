@@ -32,7 +32,7 @@ from sqlalchemy.sql import func
 _DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
 _RAW_DATABASE_URL = os.environ.get(
     'DATABASE_URL',
-    f'sqlite+aiosqlite:///{os.path.abspath(_DB_PATH)}'
+    'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:6543/postgres'
 )
 
 # Convert PostgreSQL URLs to async-compatible format
