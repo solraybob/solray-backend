@@ -719,3 +719,29 @@ async def debug_db():
     import os
     db_url = os.environ.get('DATABASE_URL', 'NOT_SET')
     return {"db_set": db_url != 'NOT_SET', "db_type": "postgres" if "postgresql" in db_url else "sqlite", "prefix": db_url[:40]}
+
+
+# ---------------------------------------------------------------------------
+# POST /chat
+# ---------------------------------------------------------------------------
+
+@app.post('/chat', summary='Chat with your Higher Self')
+async def chat_endpoint(
+    req: ChatRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    blueprint = await get_blueprint(db, user_id)
+    if not blueprint:
+        raise HTTPException(status_code=404, detail='Blueprint not found')
+    from datetime import date
+    forecast = await get_cached_forecast(db, user_id, date.today().isoformat())
+    history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
+    try:
+        response = higher_self_chat(blueprint=blueprint, forecast=forecast, conversation_history=history, user_message=req.message)
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
