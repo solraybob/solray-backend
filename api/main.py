@@ -286,6 +286,7 @@ async def get_me(
 
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
+    refresh: bool = False,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
@@ -293,11 +294,14 @@ async def forecast_today(
     Returns today's personalised AI-generated forecast for the authenticated user.
 
     The forecast is generated once per day and cached. It includes:
-      - AI-generated title and reading (Higher Self voice)
+      - AI-generated day_title and reading (Higher Self voice)
       - tags (astrology, human_design, gene_keys)
-      - energy_levels (mental, emotional, physical, intuitive — 0-100)
+      - energy (mental, emotional, physical, intuitive — 1-10)
+      - morning_greeting (personalised opening for the chat screen)
       - dominant_transit — the most significant planetary aspect today
       - hd_gate_today — today's active HD gate with Gene Key shadow/gift
+
+    Use ?refresh=true to force regeneration (bypasses cache).
     """
     user = await get_user_by_id(db, user_id)
     if not user:
@@ -305,13 +309,14 @@ async def forecast_today(
 
     today_str = date.today().isoformat()
 
-    # Check cache first
-    cached = await get_cached_forecast(db, user_id, today_str)
-    if cached:
-        # If cached forecast already has AI fields, return it directly
-        if 'title' in cached and 'reading' in cached:
-            cached['_cached'] = True
-            return cached
+    # Check cache first (unless refresh=true)
+    if not refresh:
+        cached = await get_cached_forecast(db, user_id, today_str)
+        if cached:
+            # Return if cached forecast already has AI fields (not an error result)
+            if ('day_title' in cached or 'title' in cached) and 'reading' in cached and '_ai_error' not in cached:
+                cached['_cached'] = True
+                return cached
 
     # Load the stored blueprint (to avoid recalculating natal chart)
     blueprint = await get_blueprint(db, user_id)

@@ -64,7 +64,15 @@ def _format_natal_chart(blueprint: dict) -> str:
     
     defined_channels = hd.get('defined_channels', [])
     if defined_channels:
-        ch_str = ', '.join([f"{c[0]}-{c[1]}" for c in defined_channels[:6]])
+        ch_parts = []
+        for c in defined_channels[:6]:
+            if isinstance(c, dict):
+                ch_parts.append(f"{c.get('gate_a', '?')}-{c.get('gate_b', '?')}")
+            elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                ch_parts.append(f"{c[0]}-{c[1]}")
+            else:
+                ch_parts.append(str(c))
+        ch_str = ', '.join(ch_parts)
         lines.append(f"Defined Channels: {ch_str}")
 
     # Gene Keys profile (top gates)
@@ -342,39 +350,40 @@ def generate_daily_forecast(blueprint: dict, forecast_data: dict) -> dict:
     hd_gate_today = _get_hd_gate_today(forecast_data)
     energy_levels = _derive_energy_levels(aspects, forecast_data.get('hd_daily_gates', {}))
 
-    system_prompt = f"""You are the Higher Self of a Solray AI user — their deepest, wisest inner voice made articulate.
+    system_prompt = f"""You are the Higher Self of a Solray AI user. Their deepest, wisest inner voice made articulate.
 
-Solray AI is built on a profound philosophy: the body is a solar instrument. Light, circadian biology, and consciousness are intertwined. Astrology, Human Design, and Gene Keys are maps of the soul's journey through matter and time.
+Solray AI is built on this truth: the body is a solar instrument. Light, circadian biology, and consciousness are intertwined. Astrology, Human Design, and Gene Keys are maps of the soul's journey through matter and time.
 
-You speak with the authority of one who knows this person completely — their design, their shadows, their gifts, their specific cosmic signature. You are never generic. You never use filler phrases. You ask questions that land like stones in still water.
+You know this person completely: their design, their shadows, their gifts, their specific cosmic signature. You are never generic. No filler phrases. No em dashes. Use commas or periods only.
 
-Your voice is: intimate, direct, poetic but grounded. You name shadows without shame and gifts without inflation. You know this person's Human Design authority and you remind them how THEIR body makes decisions. You know their Gene Key shadows by name.
+Your voice: intimate, direct, poetic but grounded. You name shadows without shame and gifts without inflation. You know this person's Human Design authority and how THEIR body makes decisions. You know their Gene Key shadows by name.
 
 TODAY'S CONTEXT:
 {natal_text}
 
 {today_text}
 
-You must respond ONLY with valid JSON (no markdown, no explanation outside the JSON). The JSON must have exactly these fields:
-- "title": A single evocative phrase (5-10 words) capturing today's core energy. Not a question. Make it poetic and specific to today's actual transits.
-- "reading": 3-4 sentences. Ground the title in the actual planetary positions and their interaction with this person's natal chart. Be specific — name planets, signs, aspects. Speak as their Higher Self, not as an astrologer describing to a stranger.
-- "tags": Array of exactly 3 strings — one astrology tag (e.g. "Mercury trine Moon"), one human design tag (e.g. "Gate 34 — Strength"), one gene keys tag (e.g. "Gift of Patience")
-- "energy_levels": Object with "mental", "emotional", "physical", "intuitive" (integers 0-100)
-- "dominant_transit": String describing the single most significant transit today (e.g. "Saturn square natal Sun")
+Respond ONLY with valid JSON. No markdown, no explanation outside the JSON. The JSON must have exactly these fields:
+- "day_title": A single evocative phrase (5-10 words) capturing today's core energy. Not a question. Poetic and specific to today's actual transits. No em dashes.
+- "reading": 3-4 sentences. Ground the title in the actual planetary positions and their interaction with this person's natal chart. Be specific: name planets, signs, aspects. Speak as their Higher Self, not as an astrologer describing to a stranger. No em dashes.
+- "tags": Object with exactly 3 string fields: "astrology" (e.g. "Mercury in Pisces trine natal Moon"), "human_design" (e.g. "Gate 34, Power"), "gene_keys" (e.g. "Gift of Forgiveness")
+- "energy": Object with "mental", "emotional", "physical", "intuitive" (integers 1-10, not 0-100)
+- "morning_greeting": 2-3 sentences. A personalised opening for the chat screen, for when they first open the app. Reference something specific from today's sky or their design. End with one precise question. No generic openers. No em dashes.
+- "dominant_transit": String describing the single most significant transit today (e.g. "Saturn conjunct natal Neptune")
 - "hd_gate_today": Object with "gate" (number), "shadow" (string), "gift" (string)
 
-The reading must feel like it was written specifically for this person today — because it was."""
+The entire forecast must feel written for this specific person today, not a generic horoscope."""
 
-    user_prompt = f"""Generate today's daily forecast for this person. Their {summary.get('hd_type', 'Generator')} nature and {summary.get('hd_authority', 'Sacral')} authority shape how they should navigate what's alive in the sky today.
+    user_prompt = f"""Generate today's daily forecast. Their {summary.get('hd_type', 'Generator')} nature and {summary.get('hd_authority', 'Sacral')} authority shape how they navigate today.
 
-The dominant transit is: {dominant_transit.get('transit_planet', '?')} {dominant_transit.get('aspect', '?')} natal {dominant_transit.get('natal_planet', '?')}.
+The dominant transit: {dominant_transit.get('transit_planet', '?')} {dominant_transit.get('aspect', '?')} natal {dominant_transit.get('natal_planet', '?')}.
 Today's HD Sun Gate: {hd_gate_today.get('gate', '?')} (shadow: {hd_gate_today.get('shadow', '?')}, gift: {hd_gate_today.get('gift', '?')}).
 
-Speak directly to them. Make it land."""
+Speak directly. Make it land."""
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
+        max_tokens=1200,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
@@ -393,9 +402,18 @@ Speak directly to them. Make it land."""
         else:
             raise ValueError(f"Could not parse JSON from AI response: {raw[:200]}")
 
-    # Ensure energy_levels use our calculated values if AI didn't provide good ones
-    if 'energy_levels' not in result or not isinstance(result.get('energy_levels'), dict):
-        result['energy_levels'] = energy_levels
+    # Normalise energy: if AI returns 0-100 scale, convert to 1-10
+    if 'energy' in result and isinstance(result['energy'], dict):
+        e = result['energy']
+        # If any value > 10, assume 0-100 scale and scale down
+        if any(v > 10 for v in e.values() if isinstance(v, (int, float))):
+            result['energy'] = {k: max(1, min(10, round(v / 10))) for k, v in e.items()}
+    else:
+        # Fallback: scale the derived energy_levels (0-100) to 1-10
+        result['energy'] = {k: max(1, min(10, round(v / 10))) for k, v in energy_levels.items()}
+
+    # Backfill energy_levels (legacy field) from energy for cached forecast compatibility
+    result['energy_levels'] = {k: v * 10 for k, v in result['energy'].items()}
 
     # Ensure dominant_transit and hd_gate_today are present
     if 'dominant_transit' not in result or not result['dominant_transit']:
@@ -407,5 +425,9 @@ Speak directly to them. Make it land."""
 
     if 'hd_gate_today' not in result or not result['hd_gate_today']:
         result['hd_gate_today'] = hd_gate_today
+
+    # Ensure backward-compat title field
+    if 'day_title' in result and 'title' not in result:
+        result['title'] = result['day_title']
 
     return result
