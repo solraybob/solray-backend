@@ -313,3 +313,4 @@ async def get_accepted_souls(db: AsyncSession, user_id: str) -> list[SoulConnect
         )
     )
     return result.scalars().all()
+# psycopg3 migration complete
