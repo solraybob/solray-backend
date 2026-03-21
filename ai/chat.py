@@ -119,6 +119,7 @@ No generic horoscopes. Everything must feel tailored to this specific person.
 
 MODALITIES YOU USE:
 Traditional astrology: signs, houses, aspects, elements, modalities. Ceres rules Virgo. Earth rules Taurus.
+Important: Earth is always exactly opposite the Sun. If Sun is in Virgo, Earth is in Pisces. Never say Earth is near the Sun or in the same sign. They are always 180 degrees apart.
 Nodes, Saturn, Pluto, and angles (ASC, DSC, MC, IC) as structural pillars of life themes.
 Transits and progressions when provided.
 Human Design: Type, Authority, Strategy, Profile, defined centres, key gates and channels.
@@ -160,14 +161,28 @@ GENE KEYS, their shadow and gift map:
 
 def _format_key_planets(planets: dict) -> str:
     """Format key planetary placements concisely."""
-    key_planets = ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Chiron']
+    key_planets = ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Chiron']
     lines = []
+
+    # Earth is always opposite the Sun
+    sun_data = planets.get('Sun', {})
+    if sun_data and sun_data.get('sign'):
+        sun_lon = sun_data.get('longitude', 0)
+        earth_lon = (sun_lon + 180) % 360
+        signs = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
+        earth_sign = signs[int(earth_lon // 30)]
+        earth_deg = earth_lon % 30
+        sun_house = sun_data.get('house', '?')
+        earth_house = 13 - sun_house if isinstance(sun_house, int) and sun_house > 0 else '?'
+        lines.append(f"  Earth: {earth_sign} {earth_deg:.1f}° (house {earth_house}) — always opposite the Sun")
+
     for planet in key_planets:
         data = planets.get(planet, {})
-        if data:
+        if data and data.get('sign') and data.get('sign') != 'Unknown':
             sign = data.get('sign', '?')
             house = data.get('house', '?')
-            lines.append(f"  {planet}: {sign} (house {house})")
+            deg = data.get('degree', 0)
+            lines.append(f"  {planet}: {sign} {deg:.1f}° (house {house})")
     return "\n".join(lines) if lines else "  (Planets not yet calculated)"
 
 
