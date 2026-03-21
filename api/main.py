@@ -691,3 +691,16 @@ async def root():
         'version': '0.2.0',
         'docs': '/docs',
     }
+
+
+# Admin: delete user (for testing only — remove before public launch)
+@app.delete('/admin/users/{email}', summary="Delete user by email (admin only)")
+async def delete_user(email: str, db: AsyncSession = Depends(get_db)):
+    """Delete a user and all their data."""
+    from sqlalchemy import text
+    await db.execute(text("DELETE FROM daily_forecasts WHERE user_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
+    await db.execute(text("DELETE FROM blueprints WHERE user_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
+    await db.execute(text("DELETE FROM soul_connections WHERE requester_id IN (SELECT id FROM users WHERE email = :email) OR recipient_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
+    await db.execute(text("DELETE FROM users WHERE email = :email"), {"email": email})
+    await db.commit()
+    return {"deleted": email}
