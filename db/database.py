@@ -30,33 +30,21 @@ from sqlalchemy.sql import func
 
 # Default: SQLite in the project directory. Override via DATABASE_URL env var.
 _DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
-_RAW_DATABASE_URL = os.environ.get(
-    'DATABASE_URL',
-    'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:6543/postgres'
-)
+_SUPABASE_URL = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:6543/postgres'
+_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', _SUPABASE_URL)
 
-# Supabase pooler requires prepared_statement_cache_size=0 to avoid conflicts
-if 'supabase.com' in _RAW_DATABASE_URL and 'prepared_statement_cache_size' not in _RAW_DATABASE_URL:
-    _RAW_DATABASE_URL = _RAW_DATABASE_URL + '?prepared_statement_cache_size=0'
-
-# Convert PostgreSQL URLs to async-compatible format
 def _build_database_url(raw_url: str) -> str:
-    """
-    Convert DATABASE_URL to an async-compatible SQLAlchemy URL.
-    - postgresql:// or postgres:// → postgresql+asyncpg://
-    - sqlite:// stays or becomes sqlite+aiosqlite://
-    """
-    if raw_url.startswith('postgresql://') or raw_url.startswith('postgres://'):
-        # Replace scheme for asyncpg driver
-        return raw_url.replace('postgresql://', 'postgresql+asyncpg://', 1).replace('postgres://', 'postgresql+asyncpg://', 1)
-    elif raw_url.startswith('sqlite://'):
-        # Ensure aiosqlite driver
-        return raw_url.replace('sqlite://', 'sqlite+aiosqlite://', 1)
+    """Convert DATABASE_URL to an async-compatible SQLAlchemy URL."""
+    # Strip any query params for driver substitution
+    base = raw_url.split('?')[0]
+    if base.startswith('postgresql://') or base.startswith('postgres://'):
+        return base.replace('postgresql://', 'postgresql+asyncpg://', 1).replace('postgres://', 'postgresql+asyncpg://', 1)
+    elif base.startswith('sqlite://'):
+        return base.replace('sqlite://', 'sqlite+aiosqlite://', 1)
     return raw_url
 
 DATABASE_URL = _build_database_url(_RAW_DATABASE_URL)
 
-# Engine kwargs differ between SQLite and PostgreSQL
 _is_postgres = DATABASE_URL.startswith('postgresql')
 _engine_kwargs = {
     'echo': False,
@@ -64,10 +52,10 @@ _engine_kwargs = {
     'pool_pre_ping': True,
 }
 if not _is_postgres:
-    # SQLite requires connect_args for async
     _engine_kwargs['connect_args'] = {'check_same_thread': False}
 else:
-    # PostgreSQL pool settings for Supabase
+    # Supabase pooler: disable prepared statement cache to avoid conflicts
+    _engine_kwargs['connect_args'] = {'prepared_statement_cache_size': 0, 'statement_cache_size': 0}
     _engine_kwargs['pool_size'] = 5
     _engine_kwargs['max_overflow'] = 10
 
