@@ -8,8 +8,9 @@ uvicorn[standard]==0.29.0
 # Database (async SQLAlchemy + SQLite for local dev, PostgreSQL for prod)
 sqlalchemy[asyncio]==2.0.30
 aiosqlite==0.20.0
-asyncpg==0.29.0
 psycopg2-binary==2.9.9
+psycopg[binary]==3.2.4
+psycopg[pool]==3.2.4
 
 # Auth
 python-jose[cryptography]==3.3.0

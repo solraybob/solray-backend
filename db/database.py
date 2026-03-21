@@ -28,17 +28,23 @@ from sqlalchemy.sql import func
 # Config
 # ---------------------------------------------------------------------------
 
-# Default: SQLite in the project directory. Override via DATABASE_URL env var.
-_DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
-_DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
-_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', f'sqlite:///{os.path.abspath(_DB_PATH)}')
+# Default: Supabase PostgreSQL pooler. Override via DATABASE_URL env var.
+_SUPABASE_URL = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:5432/postgres'
+_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', _SUPABASE_URL)
 
 def _build_database_url(raw_url: str) -> str:
-    """Convert DATABASE_URL to an async-compatible SQLAlchemy URL."""
+    """Convert DATABASE_URL to an async-compatible SQLAlchemy URL.
+    
+    Uses psycopg (v3) for PostgreSQL — works reliably with Supabase poolers on Railway.
+    Falls back to aiosqlite for local SQLite dev.
+    """
     # Strip any query params for driver substitution
     base = raw_url.split('?')[0]
-    if base.startswith('postgresql://') or base.startswith('postgres://'):
-        return base.replace('postgresql://', 'postgresql+asyncpg://', 1).replace('postgres://', 'postgresql+asyncpg://', 1)
+    if base.startswith('postgresql+psycopg://') or base.startswith('postgresql+asyncpg://'):
+        # Already has a driver prefix — normalise to psycopg
+        return base.replace('postgresql+asyncpg://', 'postgresql+psycopg://', 1)
+    elif base.startswith('postgresql://') or base.startswith('postgres://'):
+        return base.replace('postgresql://', 'postgresql+psycopg://', 1).replace('postgres://', 'postgresql+psycopg://', 1)
     elif base.startswith('sqlite://'):
         return base.replace('sqlite://', 'sqlite+aiosqlite://', 1)
     return raw_url
@@ -46,16 +52,16 @@ def _build_database_url(raw_url: str) -> str:
 DATABASE_URL = _build_database_url(_RAW_DATABASE_URL)
 
 _is_postgres = DATABASE_URL.startswith('postgresql')
-_engine_kwargs = {
+_engine_kwargs: dict = {
     'echo': False,
     'future': True,
     'pool_pre_ping': True,
 }
 if not _is_postgres:
+    # SQLite requires check_same_thread=False for async use
     _engine_kwargs['connect_args'] = {'check_same_thread': False}
-else:
-    _engine_kwargs['pool_size'] = 5
-    _engine_kwargs['max_overflow'] = 10
+# Note: do NOT set pool_size/max_overflow for psycopg3 with asyncpg-style pooling;
+# psycopg3 handles its own connection pool settings separately.
 
 # ---------------------------------------------------------------------------
 # Engine + Session Factory
