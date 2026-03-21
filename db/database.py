@@ -30,7 +30,7 @@ from sqlalchemy.sql import func
 
 # Default: SQLite in the project directory. Override via DATABASE_URL env var.
 _DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'solray.db')
-_SUPABASE_URL = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:6543/postgres'
+_SUPABASE_URL = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:5432/postgres'
 _RAW_DATABASE_URL = os.environ.get('DATABASE_URL', _SUPABASE_URL)
 
 def _build_database_url(raw_url: str) -> str:
