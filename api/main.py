@@ -244,7 +244,15 @@ async def login(
         )
 
     token = create_access_token(user_id=user.id, email=user.email)
-    return TokenResponse(token=token, user_id=user.id)
+    return {
+        "token": token,
+        "user_id": user.id,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
