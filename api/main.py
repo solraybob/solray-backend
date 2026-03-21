@@ -712,3 +712,10 @@ async def delete_user(email: str, db: AsyncSession = Depends(get_db)):
     await db.execute(text("DELETE FROM users WHERE email = :email"), {"email": email})
     await db.commit()
     return {"deleted": email}
+
+
+@app.get('/debug/db')
+async def debug_db():
+    import os
+    db_url = os.environ.get('DATABASE_URL', 'NOT_SET')
+    return {"db_set": db_url != 'NOT_SET', "db_type": "postgres" if "postgresql" in db_url else "sqlite", "prefix": db_url[:40]}
