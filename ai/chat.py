@@ -175,29 +175,37 @@ GENE KEYS, their shadow and gift map:
 
 
 def _format_key_planets(planets: dict) -> str:
-    """Format key planetary placements concisely."""
-    key_planets = ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Chiron']
+    """Format all planetary placements including nodes."""
+    key_planets = ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'NorthNode', 'Chiron', 'Ceres']
     lines = []
+    signs_list = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
 
     # Earth is always opposite the Sun
     sun_data = planets.get('Sun', {})
     if sun_data and sun_data.get('sign'):
         sun_lon = sun_data.get('longitude', 0)
         earth_lon = (sun_lon + 180) % 360
-        signs = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
-        earth_sign = signs[int(earth_lon // 30)]
+        earth_sign = signs_list[int(earth_lon // 30)]
         earth_deg = earth_lon % 30
         sun_house = sun_data.get('house', '?')
         earth_house = 13 - sun_house if isinstance(sun_house, int) and sun_house > 0 else '?'
-        lines.append(f"  Earth: {earth_sign} {earth_deg:.1f}° (house {earth_house}) — always opposite the Sun")
+        lines.append(f"  Earth: {earth_sign} {earth_deg:.1f} house {earth_house} (always opposite Sun)")
 
     for planet in key_planets:
         data = planets.get(planet, {})
-        if data and data.get('sign') and data.get('sign') != 'Unknown':
+        if data and data.get('sign') and data.get('sign') != 'Unknown' and data.get('longitude') is not None:
             sign = data.get('sign', '?')
             house = data.get('house', '?')
-            deg = data.get('degree', 0)
-            lines.append(f"  {planet}: {sign} {deg:.1f}° (house {house})")
+            deg = data.get('degree', 0) or 0
+            retro = " Rx" if data.get('retrograde') else ""
+            if planet == 'NorthNode':
+                lines.append(f"  North Node: {sign} {deg:.1f} house {house}{retro}")
+                south_lon = (data.get('longitude', 0) + 180) % 360
+                south_sign = signs_list[int(south_lon // 30)]
+                south_deg = south_lon % 30
+                lines.append(f"  South Node: {south_sign} {south_deg:.1f} (opposite North Node)")
+            else:
+                lines.append(f"  {planet}: {sign} {deg:.1f} house {house}{retro}")
     return "\n".join(lines) if lines else "  (Planets not yet calculated)"
 
 
