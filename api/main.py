@@ -53,7 +53,7 @@ from ai.chat import chat as higher_self_chat
 app = FastAPI(
     title='Solray AI',
     description='Personal astrology + Human Design + Gene Keys blueprint API',
-    version='0.2.0',
+    version='1.0.0',
     docs_url='/docs',
     redoc_url='/redoc',
 )
@@ -701,7 +701,7 @@ async def root():
     return {
         'status': 'ok',
         'service': 'Solray AI API',
-        'version': '0.2.0',
+        'version': '1.0.0',
         'docs': '/docs',
     }
 
