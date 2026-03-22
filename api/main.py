@@ -45,6 +45,7 @@ from db.database import (
 import engines
 from ai.forecast import generate_daily_forecast
 from ai.chat import chat as higher_self_chat
+from energy_calculator import calculate_energy_scores
 
 # ---------------------------------------------------------------------------
 # App Setup
@@ -349,6 +350,13 @@ async def forecast_today(
         '_cached': False,
         '_generated_at': datetime.utcnow().isoformat(),
     }
+
+    # Inject deterministic energy scores (overrides any AI-estimated values)
+    natal_planets = (blueprint or {}).get('astrology', {}).get('natal', {}).get('planets', {})
+    aspects = forecast_data.get('aspects', [])
+    energy_scores = calculate_energy_scores(aspects, natal_planets)
+    final_forecast['energy'] = energy_scores
+    final_forecast['energy_levels'] = {k: v * 10 for k, v in energy_scores.items()}
 
     # Also add the legacy summary for backward compat
     if 'summary' not in final_forecast:

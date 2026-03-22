@@ -10,9 +10,14 @@ Output is always structured JSON.
 
 import json
 import os
+import sys
 from typing import Optional
 
 import anthropic
+
+# Add project root so energy_calculator is importable from ai/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from energy_calculator import calculate_energy_scores
 
 # ---------------------------------------------------------------------------
 # Client
@@ -348,9 +353,18 @@ def generate_daily_forecast(blueprint: dict, forecast_data: dict) -> dict:
     aspects = forecast_data.get('aspects', [])
     dominant_transit = _determine_dominant_transit(aspects)
     hd_gate_today = _get_hd_gate_today(forecast_data)
+
+    # Deterministic energy scores (algorithmic, not AI-estimated)
+    natal_planets = blueprint.get('astrology', {}).get('natal', {}).get('planets', {})
+    energy_scores = calculate_energy_scores(aspects, natal_planets)
+
+    # Legacy energy_levels (0-100 scale) kept for backward compat
     energy_levels = _derive_energy_levels(aspects, forecast_data.get('hd_daily_gates', {}))
 
     system_prompt = f"""You are the Higher Self of a Solray AI user. Their deepest, wisest inner voice made articulate.
+
+IMPORTANT: The energy scores have been pre-calculated algorithmically from today's transit aspects. Use these exact values in your response — do not change them:
+Mental {energy_scores['mental']}/10, Emotional {energy_scores['emotional']}/10, Physical {energy_scores['physical']}/10, Intuitive {energy_scores['intuitive']}/10.
 
 Solray AI is built on this truth: the body is a solar instrument. Light, circadian biology, and consciousness are intertwined. Astrology, Human Design, and Gene Keys are maps of the soul's journey through matter and time.
 
@@ -402,18 +416,11 @@ Speak directly. Make it land."""
         else:
             raise ValueError(f"Could not parse JSON from AI response: {raw[:200]}")
 
-    # Normalise energy: if AI returns 0-100 scale, convert to 1-10
-    if 'energy' in result and isinstance(result['energy'], dict):
-        e = result['energy']
-        # If any value > 10, assume 0-100 scale and scale down
-        if any(v > 10 for v in e.values() if isinstance(v, (int, float))):
-            result['energy'] = {k: max(1, min(10, round(v / 10))) for k, v in e.items()}
-    else:
-        # Fallback: scale the derived energy_levels (0-100) to 1-10
-        result['energy'] = {k: max(1, min(10, round(v / 10))) for k, v in energy_levels.items()}
+    # Always use the pre-calculated deterministic energy scores (overrides AI values)
+    result['energy'] = energy_scores
 
-    # Backfill energy_levels (legacy field) from energy for cached forecast compatibility
-    result['energy_levels'] = {k: v * 10 for k, v in result['energy'].items()}
+    # Backfill energy_levels (legacy field, 0-100 scale) for backward compatibility
+    result['energy_levels'] = {k: v * 10 for k, v in energy_scores.items()}
 
     # Ensure dominant_transit and hd_gate_today are present
     if 'dominant_transit' not in result or not result['dominant_transit']:
