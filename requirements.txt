@@ -26,6 +26,10 @@ email-validator==2.1.1
 pyswisseph==2.10.3.2
 geopy==2.4.1
 
+# Timezone detection
+timezonefinder==6.5.2
+pytz==2024.1
+
 # AI
 anthropic==0.25.0
 

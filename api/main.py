@@ -25,6 +25,8 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
+from timezonefinder import TimezoneFinder
+import pytz
 
 # Add project root to path so engines.py is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -82,11 +84,18 @@ async def startup():
 class RegisterRequest(BaseModel):
     name:       str        = Field(..., example='Alice Sun')
     email:      EmailStr   = Field(..., example='alice@example.com')
-    password:   str        = Field(..., min_length=8, example='s3cr3tpass')
+    password:   str        = Field(..., min_length=6, example='s3cr3t')
     birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
     tz_offset:  float      = Field(0.0, example=1.0, description='UTC offset at birth (e.g. 1.0 for BST)')
+
+
+class SoulBlueprintRequest(BaseModel):
+    name:       str        = Field(..., example='Alice Sun')
+    birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
+    birth_time: str        = Field(..., example='14:30',      description='HH:MM')
+    birth_city: str        = Field(..., example='London')
 
 
 class LoginRequest(BaseModel):
@@ -125,6 +134,27 @@ class UserProfile(BaseModel):
     birth_lat:   Optional[float]
     birth_lon:   Optional[float]
     created_at:  datetime
+
+
+# ---------------------------------------------------------------------------
+# Helper: get timezone offset from lat/lon + birth datetime
+# ---------------------------------------------------------------------------
+
+def get_tz_offset(lat: float, lon: float, birth_date: str, birth_time: str) -> float:
+    """Get UTC offset in hours for a given location and datetime."""
+    tf = TimezoneFinder()
+    tz_name = tf.timezone_at(lat=lat, lng=lon)
+    if not tz_name:
+        return 0.0
+    tz = pytz.timezone(tz_name)
+    dt_str = f"{birth_date} {birth_time}"
+    try:
+        naive_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+        localized = tz.localize(naive_dt)
+        offset_seconds = localized.utcoffset().total_seconds()
+        return offset_seconds / 3600
+    except Exception:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +222,9 @@ async def register(
         'birth_lon':     birth_lon,
     })
 
+    # Auto-detect timezone from coordinates (ignores any client-supplied tz_offset)
+    tz_offset = get_tz_offset(birth_lat, birth_lon, req.birth_date, req.birth_time)
+
     # Build the full blueprint (this is the expensive calculation)
     try:
         blueprint = engines.build_blueprint(
@@ -200,7 +233,7 @@ async def register(
             birth_city=req.birth_city,
             birth_lat=birth_lat,
             birth_lon=birth_lon,
-            tz_offset=req.tz_offset,
+            tz_offset=tz_offset,
         )
     except Exception as e:
         # Blueprint calculation failed — user is created but without blueprint
@@ -423,6 +456,49 @@ def _build_forecast_summary(forecast: dict) -> dict:
         'gene_key_themes': gk_headlines,
         'resonance':       resonance_notes,
         'aspect_count':    len(aspects),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /souls/calculate-blueprint
+# ---------------------------------------------------------------------------
+
+@app.post('/souls/calculate-blueprint', summary='Calculate blueprint for a soul (no account needed)')
+async def calculate_soul_blueprint(req: SoulBlueprintRequest):
+    """Calculate a blueprint from birth data without creating a user account."""
+    # Geocode
+    try:
+        from astrology import geocode_city
+        lat, lon = geocode_city(req.birth_city)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Auto-detect timezone
+    tz_offset = get_tz_offset(lat, lon, req.birth_date, req.birth_time)
+
+    # Build blueprint
+    try:
+        blueprint = engines.build_blueprint(
+            birth_date=req.birth_date,
+            birth_time=req.birth_time,
+            birth_city=req.birth_city,
+            birth_lat=lat,
+            birth_lon=lon,
+            tz_offset=tz_offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Blueprint calculation failed: {str(e)}')
+
+    return {
+        'blueprint': blueprint,
+        'profile': {
+            'birth_date': req.birth_date,
+            'birth_time': req.birth_time,
+            'birth_city': req.birth_city,
+            'sun_sign': blueprint.get('astrology', {}).get('natal', {}).get('planets', {}).get('Sun', {}).get('sign'),
+            'hd_type': blueprint.get('human_design', {}).get('type'),
+            'hd_profile': blueprint.get('human_design', {}).get('profile'),
+        }
     }
 
 
