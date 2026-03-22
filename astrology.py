@@ -62,11 +62,17 @@ SIGN_RULERS = {
 }
 
 ASPECT_TYPES = {
-    'conjunction': (0,   8),
-    'opposition':  (180, 8),
-    'trine':       (120, 7),
-    'square':      (90,  7),
-    'sextile':     (60,  6),
+    'conjunction':   (0,   8),
+    'opposition':    (180, 8),
+    'trine':         (120, 7),
+    'square':        (90,  7),
+    'sextile':       (60,  6),
+    'quincunx':      (150, 3),
+    'semi_sextile':  (30,  2),
+    'semi_square':   (45,  2),
+    'sesquiquadrate':(135, 2),
+    'quintile':      (72,  2),
+    'bi_quintile':   (144, 2),
 }
 
 # --- Ephemeris path setup ---
@@ -602,6 +608,42 @@ def calc_aspects(transit_planets: dict, natal_planets: dict,
                         'natal_sign':     n_data['sign'],
                         'natal_house':    n_data.get('house'),
                     })
+    aspects.sort(key=lambda x: x['orb'])
+    return aspects
+
+
+def calc_natal_aspects(natal_planets: dict, orb_factor: float = 1.0) -> list:
+    """
+    Calculate aspects between natal planets (planet-to-planet in the birth chart).
+    Returns list of aspect dicts sorted by orb (tightest first).
+    """
+    planet_names = list(natal_planets.keys())
+    aspects = []
+    
+    for i, p1 in enumerate(planet_names):
+        d1 = natal_planets[p1]
+        lon1 = d1.get('longitude')
+        if lon1 is None:
+            continue
+        for p2 in planet_names[i+1:]:
+            d2 = natal_planets[p2]
+            lon2 = d2.get('longitude')
+            if lon2 is None:
+                continue
+            diff = abs(lon1 - lon2) % 360
+            if diff > 180:
+                diff = 360 - diff
+            for aspect_name, (exact_angle, max_orb) in ASPECT_TYPES.items():
+                orb = abs(diff - exact_angle)
+                if orb <= max_orb * orb_factor:
+                    aspects.append({
+                        'planet1':  p1,
+                        'planet2':  p2,
+                        'aspect':   aspect_name,
+                        'orb':      round(orb, 2),
+                        'applying': None,
+                    })
+                    break
     aspects.sort(key=lambda x: x['orb'])
     return aspects
 

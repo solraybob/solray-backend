@@ -8,7 +8,7 @@ a unified blueprint dict. Also supports date-specific forecast data.
 from datetime import date as date_cls
 from typing import Optional
 
-from astrology import get_natal_chart, get_transits_and_aspects, geocode_city
+from astrology import get_natal_chart, get_transits_and_aspects, geocode_city, calc_natal_aspects
 from human_design import calc_human_design
 from gene_keys import get_full_gene_keys_profile
 
@@ -57,6 +57,11 @@ def build_blueprint(
         birth_lon=birth_lon,
         tz_offset=tz_offset,
     )
+
+
+    # Calculate natal-to-natal aspects
+    natal_aspects = calc_natal_aspects(natal_chart['planets'])
+    natal_chart['aspects'] = natal_aspects
 
     transits = get_transits_and_aspects(
         natal_chart=natal_chart,

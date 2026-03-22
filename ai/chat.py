@@ -174,6 +174,26 @@ GENE KEYS, their shadow and gift map:
     return prompt
 
 
+def _format_natal_aspects(blueprint: dict) -> str:
+    """Format natal aspects for the system prompt."""
+    natal = blueprint.get('astrology', {}).get('natal', {})
+    aspects = natal.get('aspects', [])
+    if not aspects:
+        return "  (Aspects not calculated)"
+    lines = []
+    # Show top 20 tightest aspects
+    aspect_symbols = {
+        'conjunction': '☌', 'opposition': '☍', 'trine': '△',
+        'square': '□', 'sextile': '⚹', 'quincunx': 'Qx',
+        'semi_sextile': 'SxS', 'semi_square': 'SqS',
+        'sesquiquadrate': 'SQ', 'quintile': 'Q', 'bi_quintile': 'BQ',
+    }
+    for a in aspects[:20]:
+        sym = aspect_symbols.get(a['aspect'], a['aspect'])
+        lines.append(f"  {a['planet1']} {sym} {a['planet2']} (orb {a['orb']}°)")
+    return "\n".join(lines)
+
+
 def _format_key_planets(planets: dict) -> str:
     """Format all planetary placements including nodes."""
     key_planets = ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'NorthNode', 'Chiron', 'Ceres']
