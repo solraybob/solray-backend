@@ -174,6 +174,49 @@ GENE KEYS, their shadow and gift map:
     return prompt
 
 
+def _format_extended_points(blueprint: dict) -> str:
+    """Format extended chart points: Chiron, asteroids, BML, angles."""
+    natal = blueprint.get('astrology', {}).get('natal', {})
+    ext = natal.get('extended_points', {})
+    # Also check top-level extended_bodies if available
+    if not ext:
+        ext = blueprint.get('astrology', {}).get('extended_bodies', {})
+    lines = []
+    order = ['Chiron', 'Ceres', 'Vesta', 'Pallas', 'Juno', 'BlackMoonLilith', 'PartOfFortune', 'Vertex', 'EastPoint', 'Earth']
+    for key in order:
+        v = ext.get(key, {})
+        if v and v.get('sign') and v.get('sign') != 'Unknown' and (v.get('longitude') is not None or v.get('absolute_degree') is not None):
+            retro = " Rx" if v.get('retrograde') else ""
+            lines.append(f"  {key}: {v['sign']} {v.get('degree', 0):.1f} house {v.get('house', '?')}{retro}")
+    return "\n".join(lines) if lines else "  (Extended points not calculated)"
+
+
+def _format_stelliums(blueprint: dict) -> str:
+    """Detect stelliums (3+ planets in same sign or house)."""
+    natal = blueprint.get('astrology', {}).get('natal', {})
+    planets = natal.get('planets', {})
+    
+    from collections import defaultdict
+    by_sign = defaultdict(list)
+    by_house = defaultdict(list)
+    
+    for name, data in planets.items():
+        if data.get('sign') and data.get('sign') != 'Unknown':
+            by_sign[data['sign']].append(name)
+        if data.get('house'):
+            by_house[data['house']].append(name)
+    
+    lines = []
+    for sign, ps in by_sign.items():
+        if len(ps) >= 3:
+            lines.append(f"  Stellium in {sign}: {', '.join(ps)} ({len(ps)} planets)")
+    for house, ps in by_house.items():
+        if len(ps) >= 3:
+            lines.append(f"  Stellium in House {house}: {', '.join(ps)} ({len(ps)} planets)")
+    
+    return "\n".join(lines) if lines else "  No stelliums detected"
+
+
 def _format_natal_aspects(blueprint: dict) -> str:
     """Format natal aspects for the system prompt."""
     natal = blueprint.get('astrology', {}).get('natal', {})
