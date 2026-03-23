@@ -790,6 +790,36 @@ async def root():
     }
 
 
+@app.get('/dashboard', summary='Mission Control dashboard stats')
+async def dashboard_stats(db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+
+    # User stats
+    result = await db.execute(text("SELECT COUNT(*) FROM users"))
+    total_users = result.scalar()
+
+    result = await db.execute(text("SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'"))
+    new_users_7d = result.scalar()
+
+    try:
+        result = await db.execute(text("SELECT COUNT(*) FROM waitlist"))
+        total_waitlist = result.scalar()
+
+        result = await db.execute(text("SELECT COUNT(*) FROM waitlist WHERE created_at > NOW() - INTERVAL '7 days'"))
+        new_waitlist_7d = result.scalar()
+    except Exception:
+        total_waitlist = 0
+        new_waitlist_7d = 0
+
+    return {
+        "users": {"total": total_users, "new_7d": new_users_7d},
+        "waitlist": {"total": total_waitlist, "new_7d": new_waitlist_7d},
+        "backend_version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
 # Admin: delete user (for testing only — remove before public launch)
 @app.delete('/admin/users/{email}', summary="Delete user by email (admin only)")
 async def delete_user(email: str, db: AsyncSession = Depends(get_db)):
