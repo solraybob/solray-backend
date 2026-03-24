@@ -22,6 +22,27 @@ import uuid
 from datetime import date, datetime
 from typing import Optional, List
 
+# ---------------------------------------------------------------------------
+# Sentry — Error Monitoring (graceful: no-op if SENTRY_DSN not set)
+# ---------------------------------------------------------------------------
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+
+    _SENTRY_DSN = os.environ.get('SENTRY_DSN', '')
+    if _SENTRY_DSN:
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+            traces_sample_rate=0.1,
+            environment=os.environ.get('ENVIRONMENT', 'production'),
+            # Don't send PII by default
+            send_default_pii=False,
+        )
+except ImportError:
+    pass  # sentry-sdk not installed — monitoring disabled
+
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -237,7 +258,12 @@ async def register(
         )
     except Exception as e:
         # Blueprint calculation failed — user is created but without blueprint
-        # Return partial success; client can retry blueprint generation
+        # Capture to Sentry for debugging
+        try:
+            import sentry_sdk as _sentry
+            _sentry.capture_exception(e)
+        except Exception:
+            pass
         raise HTTPException(
             status_code=500,
             detail=f'User created but blueprint calculation failed: {str(e)}'
@@ -374,6 +400,11 @@ async def forecast_today(
             ai_forecast = generate_daily_forecast(blueprint, forecast_data)
         except Exception as e:
             # AI generation failed — fall back to raw forecast data
+            try:
+                import sentry_sdk as _sentry
+                _sentry.capture_exception(e)
+            except Exception:
+                pass
             ai_forecast = {'_ai_error': str(e)}
 
     # Merge: AI fields + raw data for richer access
@@ -863,4 +894,9 @@ async def chat_endpoint(
         response = higher_self_chat(blueprint=blueprint, forecast=forecast, conversation_history=history, user_message=req.message)
         return {"response": response}
     except Exception as e:
+        try:
+            import sentry_sdk as _sentry
+            _sentry.capture_exception(e)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
