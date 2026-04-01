@@ -1279,3 +1279,18 @@ async def chat_endpoint(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+
+@app.get('/debug/lunar')
+async def debug_lunar(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    try:
+        from lunar import get_upcoming_lunar_event
+        user = await get_user_by_id(db, user_id)
+        blueprint = await get_blueprint(db, user_id)
+        if not blueprint:
+            return {"error": "no blueprint"}
+        natal = blueprint.get('astrology', {}).get('natal', {})
+        result = get_upcoming_lunar_event(natal, days_window=3)
+        return {"lunar_event": result, "natal_keys": list(natal.keys())}
+    except Exception as e:
+        return {"error": str(e)}
