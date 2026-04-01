@@ -380,7 +380,7 @@ TODAY'S CONTEXT:
 Respond ONLY with valid JSON. No markdown, no explanation outside the JSON. The JSON must have exactly these fields:
 - "day_title": A single evocative phrase (5-10 words) capturing today's core energy. Not a question. Poetic and specific to today's actual transits. No em dashes.
 - "reading": 3-4 sentences. Ground the title in the actual planetary positions and their interaction with this person's natal chart. Be specific: name planets, signs, aspects. Speak as their Higher Self, not as an astrologer describing to a stranger. No em dashes.
-- "tags": Object with exactly 3 string fields: "astrology" (e.g. "Mercury in Pisces trine natal Moon"), "human_design" (e.g. "Gate 34, Power"), "gene_keys" (e.g. "Gift of Forgiveness")
+- "tags": Object with exactly 3 string fields: "astrology", "human_design", "gene_keys". Write all tags in plain human language, not astrological jargon. Instead of "Mercury retrograde in Pisces" write "Slow down before speaking." Instead of "Gate 57 shadow Opinion" write "Trust your gut over your analysis today." These tags should be immediately meaningful to someone who knows nothing about astrology or Human Design.
 - "energy": Object with "mental", "emotional", "physical", "intuitive" (integers 1-10, not 0-100)
 - "morning_greeting": 2-3 sentences. A personalised opening for the chat screen, for when they first open the app. Reference something specific from today's sky or their design. End with one precise question. No generic openers. No em dashes.
 - "dominant_transit": String describing the single most significant transit today (e.g. "Saturn conjunct natal Neptune")
