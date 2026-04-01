@@ -109,17 +109,22 @@ def _moon_sign_at(jd: float) -> tuple[str, float]:
 
 
 def _natal_house_for_longitude(moon_lon: float, house_cusps: list) -> int:
-    """Return the natal house (1-12) that contains moon_lon."""
+    """Return the natal house (1-12) that contains moon_lon.
+    house_cusps items can be dicts with longitude key or plain floats.
+    """
     if not house_cusps or len(house_cusps) < 12:
         return 1
 
+    def _lon(c):
+        return float(c["longitude"]) if isinstance(c, dict) else float(c)
+
     for i in range(12):
-        cusp_start = house_cusps[i]
-        cusp_end = house_cusps[(i + 1) % 12]
+        cusp_start = _lon(house_cusps[i])
+        cusp_end = _lon(house_cusps[(i + 1) % 12])
         if cusp_end > cusp_start:
             if cusp_start <= moon_lon < cusp_end:
                 return i + 1
-        else:  # wraps around 0°
+        else:
             if moon_lon >= cusp_start or moon_lon < cusp_end:
                 return i + 1
     return 1
