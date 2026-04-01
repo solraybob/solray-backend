@@ -342,3 +342,125 @@ def calc_long_range_transits(blueprint: dict, today: Optional[date] = None) -> l
     # Sort by orb (tightest first) — most significant cycles first
     active.sort(key=lambda x: x['orb'])
     return active
+
+
+# ---------------------------------------------------------------------------
+# Upcoming cycles (entering orb within the next N days)
+# ---------------------------------------------------------------------------
+
+def get_upcoming_cycles(blueprint: dict, today: Optional[date] = None, days_ahead: int = 500) -> list:
+    """
+    Scan the next `days_ahead` days for major cycles that are NOT yet in orb
+    but will enter orb within that window.
+
+    Checks the same transits as calc_long_range_transits:
+      - Saturn Return  (orb 10°)
+      - Jupiter Return (orb 8°)
+      - Nodal Return   (orb 8°)
+      - Outer planets (Pluto/Neptune/Uranus orb 5°, Saturn/Jupiter orb 8°)
+        conjunct natal Sun / Moon / Ascendant
+
+    Returns a list of upcoming transit dicts sorted by days_until_orb (soonest first).
+    Returns at most 2 entries.
+    """
+    if today is None:
+        today = date.today()
+
+    today_jd = _date_to_jd(today)
+
+    natal_planets = blueprint.get('astrology', {}).get('natal', {}).get('planets', {})
+    natal_asc     = blueprint.get('astrology', {}).get('natal', {}).get('ascendant', {})
+
+    # Build the candidate list: (planet_name, planet_id, natal_point_name, natal_lon, orb_threshold, title)
+    candidates = []
+
+    natal_saturn_lon = natal_planets.get('Saturn', {}).get('longitude')
+    if natal_saturn_lon is not None:
+        candidates.append(('Saturn', swe.SATURN, 'Saturn', natal_saturn_lon, 10.0, 'Your Saturn Return'))
+
+    natal_jupiter_lon = natal_planets.get('Jupiter', {}).get('longitude')
+    if natal_jupiter_lon is not None:
+        candidates.append(('Jupiter', swe.JUPITER, 'Jupiter', natal_jupiter_lon, 8.0, 'Your Jupiter Return'))
+
+    natal_node_lon = natal_planets.get('NorthNode', {}).get('longitude')
+    if natal_node_lon is not None:
+        candidates.append(('NorthNode', swe.TRUE_NODE, 'NorthNode', natal_node_lon, 8.0, 'Nodal Return'))
+
+    # Outer planet × natal point combos
+    natal_points_outer = []
+    sun_lon = natal_planets.get('Sun', {}).get('longitude')
+    if sun_lon is not None:
+        natal_points_outer.append(('Sun', sun_lon))
+    moon_lon = natal_planets.get('Moon', {}).get('longitude')
+    if moon_lon is not None:
+        natal_points_outer.append(('Moon', moon_lon))
+    asc_lon = natal_asc.get('longitude')
+    if asc_lon is not None:
+        natal_points_outer.append(('Ascendant', asc_lon))
+
+    outer_combos = [
+        ('Pluto',   swe.PLUTO,   5.0),
+        ('Neptune', swe.NEPTUNE, 5.0),
+        ('Uranus',  swe.URANUS,  5.0),
+        ('Saturn',  swe.SATURN,  8.0),
+        ('Jupiter', swe.JUPITER, 8.0),
+    ]
+
+    for transit_planet_name, planet_id, orb_thresh in outer_combos:
+        for natal_point_name, natal_lon in natal_points_outer:
+            candidates.append((
+                transit_planet_name, planet_id,
+                natal_point_name, natal_lon,
+                orb_thresh,
+                f'{transit_planet_name} meets your {natal_point_name}',
+            ))
+
+    upcoming = []
+
+    for planet_name, planet_id, natal_point, natal_lon, orb_thresh, title in candidates:
+        # Check: is it currently in orb? If yes, skip (it's active).
+        cur_lon, _ = _get_planet_lon(today_jd, planet_id)
+        if _angular_diff(cur_lon, natal_lon) <= orb_thresh:
+            continue  # already active
+
+        # Scan ahead in 3-day steps to find when it enters orb
+        entry_jd = None
+        step = 3
+        for i in range(0, days_ahead, step):
+            check_jd = today_jd + i
+            lon, _ = _get_planet_lon(check_jd, planet_id)
+            if _angular_diff(lon, natal_lon) <= orb_thresh:
+                # Refine: walk back day by day to find the exact entry day
+                for j in range(step + 1):
+                    refine_jd = check_jd - j
+                    lon2, _ = _get_planet_lon(refine_jd, planet_id)
+                    if _angular_diff(lon2, natal_lon) > orb_thresh:
+                        entry_jd = refine_jd + 1  # first day inside orb
+                        break
+                if entry_jd is None:
+                    entry_jd = check_jd
+                break
+
+        if entry_jd is None:
+            continue  # doesn't enter orb within days_ahead
+
+        days_until = round(entry_jd - today_jd)
+        if days_until < 0:
+            continue
+
+        enters_orb_date = _jd_to_date(entry_jd)
+
+        upcoming.append({
+            'transit_planet': planet_name,
+            'natal_point':    natal_point,
+            'aspect':         'conjunction',
+            'title':          title,
+            'status':         'upcoming',
+            'days_until_orb': days_until,
+            'enters_orb':     enters_orb_date.isoformat(),
+            'summary':        None,  # filled by AI caller if needed
+        })
+
+    # Sort by soonest first, return top 2
+    upcoming.sort(key=lambda x: x['days_until_orb'])
+    return upcoming[:2]

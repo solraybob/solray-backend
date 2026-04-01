@@ -1209,8 +1209,9 @@ async def long_range_transits(
         raise HTTPException(status_code=404, detail='Blueprint not found. Please regenerate.')
 
     try:
-        from long_range import calc_long_range_transits
+        from long_range import calc_long_range_transits, get_upcoming_cycles
         transits = calc_long_range_transits(blueprint)
+        upcoming = get_upcoming_cycles(blueprint)
     except Exception as e:
         try:
             import sentry_sdk as _sentry
@@ -1233,9 +1234,13 @@ async def long_range_transits(
                 pass
 
     return {
-        'cycles': transits,
-        'count':  len(transits),
-        'generated_at': datetime.utcnow().isoformat(),
+        'cycles':         transits,
+        'upcoming':       upcoming,
+        'total_active':   len(transits),
+        'total_upcoming': len(upcoming),
+        # legacy field kept for backward compatibility
+        'count':          len(transits),
+        'generated_at':   datetime.utcnow().isoformat(),
     }
 
 
