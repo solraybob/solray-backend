@@ -395,11 +395,115 @@ Begin."""
 # Main Chat Function
 # ---------------------------------------------------------------------------
 
+def _build_soul_compatibility_section(soul_blueprint: dict) -> str:
+    """
+    Build a COMPATIBILITY READING section to inject into the system prompt
+    when the user is asking about a soul connection.
+    """
+    soul_name = soul_blueprint.get('meta', {}).get('name', 'this soul')
+    summary = soul_blueprint.get('summary', {})
+    hd = soul_blueprint.get('human_design', {})
+    natal = soul_blueprint.get('astrology', {}).get('natal', {})
+    planets = natal.get('planets', {})
+    gk = soul_blueprint.get('gene_keys', {})
+
+    # Basic identity
+    sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign', '?')
+    moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign', '?')
+    asc = natal.get('ascendant', {})
+    rising = summary.get('ascendant') or (asc.get('sign') if isinstance(asc, dict) else '?')
+    hd_type = summary.get('hd_type') or hd.get('type', '?')
+    profile = summary.get('hd_profile') or hd.get('profile', '?')
+    authority = summary.get('hd_authority') or hd.get('authority', '?')
+
+    # Defined centres
+    dc_raw = hd.get('defined_centres', {})
+    if isinstance(dc_raw, dict):
+        defined_centres = [k for k, v in dc_raw.items() if v]
+    elif isinstance(dc_raw, list):
+        defined_centres = dc_raw
+    else:
+        defined_centres = []
+
+    # Key channels
+    channels = hd.get('defined_channels', [])
+    channel_strs = []
+    for ch in channels[:5]:
+        if isinstance(ch, (list, tuple)) and len(ch) == 2:
+            channel_strs.append(f"{ch[0]}-{ch[1]}")
+        elif isinstance(ch, str):
+            channel_strs.append(ch)
+
+    # Gene Keys highlights
+    natal_gk = gk.get('natal_gene_keys', {})
+    cc = hd.get('conscious_chart', {})
+    uc = hd.get('unconscious_chart', {})
+    gk_lines = []
+    profile_gates = [
+        ("Life's Work", str(cc.get('Sun', {}).get('gate', '')) if cc else ''),
+        ('Evolution', str(cc.get('Earth', {}).get('gate', '')) if cc else ''),
+        ('Radiance', str(cc.get('Moon', {}).get('gate', '')) if cc else ''),
+        ('Purpose', str(uc.get('Earth', {}).get('gate', '')) if uc else ''),
+    ]
+    for label, gate_key in profile_gates:
+        if gate_key and gate_key in natal_gk:
+            entry = natal_gk[gate_key]
+            shadow = entry.get('shadow', '?')
+            gift = entry.get('gift', '?')
+            siddhi = entry.get('siddhi', '?')
+            gk_lines.append(f"  {label}: Gate {gate_key} — shadow of {shadow}, gift of {gift}, siddhi of {siddhi}")
+
+    # Mercury, Venus, Mars for relational dynamics
+    extra_planets = []
+    for planet in ['Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn']:
+        data = planets.get(planet, {})
+        if data and data.get('sign') and data.get('sign') != 'Unknown':
+            extra_planets.append(f"  {planet}: {data['sign']} house {data.get('house', '?')}")
+
+    lines = [
+        "═══════════════════════════════",
+        f"COMPATIBILITY READING — SOUL: {soul_name}",
+        "═══════════════════════════════",
+        "",
+        "Their chart:",
+        f"  Sun in {sun_sign}, Moon in {moon_sign}, {rising} Rising",
+        f"  HD Type: {hd_type}, Profile {profile}, Authority {authority}",
+        f"  Defined centres: {', '.join(defined_centres) if defined_centres else 'None identified'}",
+        f"  Key channels: {', '.join(channel_strs) if channel_strs else 'None identified'}",
+        "",
+    ]
+
+    if extra_planets:
+        lines.append("Key relational planets:")
+        lines.extend(extra_planets)
+        lines.append("")
+
+    if gk_lines:
+        lines.append("Their Gene Keys profile:")
+        lines.extend(gk_lines)
+        lines.append("")
+
+    lines += [
+        "HOW TO READ THIS COMPATIBILITY:",
+        "Read the dynamic between these two charts directly.",
+        "How do their energies interact? Where do they complement? Where do they create friction?",
+        "Ground everything in the actual placements of both charts.",
+        "Do not be generic. Name the specific gates, signs, and types that create the dynamic.",
+        "Look for: defined/open centre interactions (where one person conditions the other),",
+        "  channel completions (where together they form a complete circuit),",
+        "  Gene Key shadow patterns that may activate each other,",
+        "  elemental and modal balance or imbalance between the two charts.",
+    ]
+
+    return "\n".join(lines)
+
+
 def chat(
     blueprint: dict,
     forecast: Optional[dict],
     conversation_history: list,
     user_message: Optional[str] = None,
+    soul_blueprint: Optional[dict] = None,
 ) -> str:
     """
     Generate a Higher Self chat response.
@@ -420,6 +524,11 @@ def chat(
         return _generate_morning_greeting(blueprint, forecast)
 
     system = _build_system_prompt(blueprint, forecast)
+
+    # If a soul blueprint is provided, inject the compatibility section
+    if soul_blueprint:
+        compat_section = _build_soul_compatibility_section(soul_blueprint)
+        system = system + "\n\n" + compat_section
 
     # Build messages list
     messages = []

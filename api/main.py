@@ -143,6 +143,9 @@ class ChatRequest(BaseModel):
     conversation_history: List[ChatMessage] = Field(
         default=[], description='Prior conversation turns'
     )
+    soul_blueprint: Optional[dict] = Field(
+        default=None, description='Optional soul blueprint for compatibility readings'
+    )
 
 
 class UserProfile(BaseModel):
@@ -891,7 +894,13 @@ async def chat_endpoint(
     forecast = await get_cached_forecast(db, user_id, date.today().isoformat())
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
     try:
-        response = higher_self_chat(blueprint=blueprint, forecast=forecast, conversation_history=history, user_message=req.message)
+        response = higher_self_chat(
+            blueprint=blueprint,
+            forecast=forecast,
+            conversation_history=history,
+            user_message=req.message,
+            soul_blueprint=req.soul_blueprint,
+        )
         return {"response": response}
     except Exception as e:
         try:
