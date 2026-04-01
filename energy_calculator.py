@@ -47,7 +47,7 @@ BENEFICS = {'Sun', 'Venus', 'Jupiter', 'Moon'}
 MALEFICS = {'Saturn', 'Mars', 'Pluto', 'Uranus'}
 
 DIMENSIONS = ('mental', 'emotional', 'physical', 'intuitive')
-BASE_SCORE = 5.0
+BASE_SCORE = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def _conjunction_modifier(transit_planet: str) -> float:
 # Main Calculator
 # ---------------------------------------------------------------------------
 
-def calculate_energy_scores(transit_aspects: List[dict], natal_planets: dict) -> dict:
+def calculate_energy_scores(transit_aspects: List[dict], natal_planets: dict, natal_chart: dict = None) -> dict:
     """
     Calculate energy scores from transit aspects.
 
