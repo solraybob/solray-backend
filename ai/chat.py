@@ -173,8 +173,33 @@ AUTHORITY, this is critical:
 GENE KEYS, their shadow and gift map:
 {chr(10).join(top_shadows) if top_shadows else 'See natal chart for active gates.'}
 
+{_format_numerology(blueprint)}
+
 {today_context}"""
     return prompt
+
+
+def _format_numerology(blueprint: dict) -> str:
+    """Format numerology context for the system prompt."""
+    num = blueprint.get('numerology')
+    if not num:
+        return ""
+    short = num.get('short_meanings', {})
+    lp = num.get('life_path')
+    ex = num.get('expression')
+    su = num.get('soul_urge')
+    py = num.get('personal_year')
+    yr = num.get('current_year', '')
+    lines = ["NUMEROLOGY:"]
+    if lp:
+        lines.append(f"  Life Path: {lp} — {short.get(str(lp), '')}")
+    if ex:
+        lines.append(f"  Expression: {ex} — {short.get(str(ex), '')}")
+    if su:
+        lines.append(f"  Soul Urge: {su} — {short.get(str(su), '')}")
+    if py:
+        lines.append(f"  Personal Year {yr}: {py} — {short.get(str(py), '')}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _format_extended_points(blueprint: dict) -> str:

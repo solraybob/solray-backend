@@ -388,6 +388,15 @@ async def get_me(
 
     blueprint = await get_blueprint(db, user_id)
 
+    # Inject numerology into blueprint if not already present
+    if blueprint and user.birth_date and user.name:
+        try:
+            from numerology import calculate_numerology
+            numerology = calculate_numerology(user.birth_date, user.name)
+            blueprint['numerology'] = numerology
+        except Exception:
+            pass  # Numerology is non-critical; don't fail the request
+
     return {
         'profile':   _user_profile(user),
         'blueprint': blueprint,
