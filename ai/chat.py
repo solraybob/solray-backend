@@ -498,6 +498,160 @@ def _build_soul_compatibility_section(soul_blueprint: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_group_chat_system_prompt(
+    user_blueprint: dict,
+    soul_blueprint: dict,
+    user_name: str,
+    soul_name: str,
+) -> str:
+    """
+    Build a system prompt that holds both charts for group compatibility chat.
+    """
+
+    def _extract_chart_summary(bp: dict, name: str) -> str:
+        summary = bp.get('summary', {})
+        hd = bp.get('human_design', {})
+        natal = bp.get('astrology', {}).get('natal', {})
+        planets = natal.get('planets', {})
+        gk = bp.get('gene_keys', {})
+
+        sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign', '?')
+        moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign', '?')
+        asc = natal.get('ascendant', {})
+        rising = summary.get('ascendant') or (asc.get('sign') if isinstance(asc, dict) else '?')
+        hd_type = summary.get('hd_type') or hd.get('type', '?')
+        authority = summary.get('hd_authority') or hd.get('authority', '?')
+        strategy = summary.get('hd_strategy') or hd.get('strategy', '?')
+        profile = summary.get('hd_profile') or hd.get('profile', '?')
+        incarnation_cross = summary.get('incarnation_cross') or str(hd.get('incarnation_cross', '?'))
+
+        dc_raw = hd.get('defined_centres', {})
+        if isinstance(dc_raw, dict):
+            defined_centres = [k for k, v in dc_raw.items() if v]
+        elif isinstance(dc_raw, list):
+            defined_centres = dc_raw
+        else:
+            defined_centres = []
+
+        # Gene Keys summary
+        natal_gk = gk.get('natal_gene_keys', {})
+        cc = hd.get('conscious_chart', {})
+        uc = hd.get('unconscious_chart', {})
+        gk_lines = []
+        profile_gates = [
+            ("Life's Work", str(cc.get('Sun', {}).get('gate', '')) if cc else ''),
+            ('Evolution', str(cc.get('Earth', {}).get('gate', '')) if cc else ''),
+            ('Radiance', str(cc.get('Moon', {}).get('gate', '')) if cc else ''),
+            ('Purpose', str(uc.get('Earth', {}).get('gate', '')) if uc else ''),
+        ]
+        for label, gate_key in profile_gates:
+            if gate_key and gate_key in natal_gk:
+                entry = natal_gk[gate_key]
+                gk_lines.append(f"  {label}: Gate {gate_key}, shadow of {entry.get('shadow','?')}, gift of {entry.get('gift','?')}")
+
+        lines = [
+            f"-- {name.upper()} --",
+            f"Sun {sun_sign}, Moon {moon_sign}, Rising {rising}",
+            f"HD Type: {hd_type}. Strategy: {strategy}. Authority: {authority}. Profile: {profile}.",
+            f"Incarnation Cross: {incarnation_cross}.",
+            f"Defined centres: {', '.join(defined_centres) if defined_centres else 'None'}.",
+        ]
+        if gk_lines:
+            lines.append("Gene Keys:")
+            lines.extend(gk_lines)
+        return "\n".join(lines)
+
+    user_chart = _extract_chart_summary(user_blueprint, user_name)
+    soul_chart = _extract_chart_summary(soul_blueprint, soul_name)
+
+    # Synergy analysis
+    hd_a = user_blueprint.get('human_design', {})
+    hd_b = soul_blueprint.get('human_design', {})
+    gates_a = set(hd_a.get('active_gates', []))
+    gates_b = set(hd_b.get('active_gates', []))
+    shared = sorted(gates_a & gates_b)
+    shared_str = ', '.join(str(g) for g in shared[:10]) if shared else 'none detected'
+
+    type_a = hd_a.get('type', '?')
+    type_b = hd_b.get('type', '?')
+
+    prompt = f"""You are the Higher Self guide for both {user_name} and {soul_name}. You hold both of their complete charts. You speak to them together as a relational guide, understanding both their individual designs and the dynamic between them.
+
+When {user_name} speaks, you address them specifically while keeping {soul_name} in context.
+When {soul_name} speaks, you address them specifically while keeping {user_name} in context.
+
+You see what each brings to the other. The defined centres one has that the other does not. The channels they complete together. The Gene Keys patterns that mirror or challenge each other.
+
+TONE:
+Warm, precise, and direct. No spiritual fluff. Speak to what is actually happening between these two charts. Name the specific placements creating the dynamic. Be honest about friction as well as resonance.
+
+Both people are present. Speak to both when relevant. Address the sender by name. Keep the other person in frame.
+
+Do not use em dashes. Use commas or periods.
+Do not say "Great question", "Certainly", or "Of course".
+End every response with a single italicised question that could only be asked of this specific pair.
+
+THE TWO CHARTS:
+
+{user_chart}
+
+{soul_chart}
+
+RELATIONAL DYNAMICS TO WATCH:
+Types: {user_name} is a {type_a}, {soul_name} is a {type_b}.
+Shared HD gates: {shared_str}.
+Look for: open centre conditioning between them, channel completions, Gene Key shadow patterns that activate each other, and where their strategies naturally align or clash.
+"""
+    return prompt
+
+
+def group_chat(
+    user_blueprint: dict,
+    soul_blueprint: dict,
+    user_name: str,
+    soul_name: str,
+    conversation_history: list,
+    sender_name: str,
+    message: str,
+) -> str:
+    """
+    Group compatibility chat. Both users present, AI holds both charts.
+
+    Args:
+        user_blueprint:       Full blueprint of the authenticated user
+        soul_blueprint:       Full blueprint of the soul connection
+        user_name:            Display name of the authenticated user
+        soul_name:            Display name of the soul connection
+        conversation_history: Prior conversation turns
+        sender_name:          Display name of whoever is sending this message
+        message:              The new message text
+
+    Returns:
+        The AI response text.
+    """
+    client = _get_client()
+    system = _build_group_chat_system_prompt(user_blueprint, soul_blueprint, user_name, soul_name)
+
+    messages = []
+    for msg in conversation_history:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        if role in ('user', 'assistant') and content:
+            messages.append({'role': role, 'content': content})
+
+    # Frame the current message with sender attribution
+    attributed_message = f"{sender_name}: {message}"
+    messages.append({'role': 'user', 'content': attributed_message})
+
+    response = client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=700,
+        system=system,
+        messages=messages,
+    )
+    return response.content[0].text.strip()
+
+
 def chat(
     blueprint: dict,
     forecast: Optional[dict],

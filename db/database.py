@@ -100,6 +100,7 @@ class User(Base):
 
     id            = Column(String(36), primary_key=True)  # UUID as string (SQLite compat)
     email         = Column(String(255), unique=True, nullable=False)
+    username      = Column(String(50),  unique=True, nullable=True)
     name          = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
     birth_date    = Column(String(10),  nullable=False)   # 'YYYY-MM-DD'
@@ -187,6 +188,28 @@ async def get_user_by_id(db: AsyncSession, user_id: str) -> Optional[User]:
 async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
     result = await db.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
+
+
+async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
+    result = await db.execute(select(User).where(User.username == username))
+    return result.scalar_one_or_none()
+
+
+async def search_users(db: AsyncSession, query: str, exclude_user_id: str) -> list:
+    """Search users by username prefix or exact email. Returns limited public fields."""
+    from sqlalchemy import or_
+    q = query.lstrip('@')
+    results = await db.execute(
+        select(User).where(
+            User.id != exclude_user_id
+        ).where(
+            or_(
+                User.username.ilike(f'{q}%'),
+                User.email == q,
+            )
+        ).limit(20)
+    )
+    return results.scalars().all()
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +324,26 @@ async def accept_soul_connection(db: AsyncSession, invite_id: str) -> Optional[S
     conn = await get_soul_connection(db, invite_id)
     if conn:
         conn.status = 'accepted'
+        await db.commit()
+        await db.refresh(conn)
+    return conn
+
+
+async def get_pending_invites_for_user(db: AsyncSession, user_id: str) -> list:
+    """Return all pending invites where this user is the recipient."""
+    result = await db.execute(
+        select(SoulConnection).where(
+            SoulConnection.status == 'pending',
+            SoulConnection.recipient_id == user_id,
+        )
+    )
+    return result.scalars().all()
+
+
+async def decline_soul_connection(db: AsyncSession, invite_id: str) -> Optional[SoulConnection]:
+    conn = await get_soul_connection(db, invite_id)
+    if conn:
+        conn.status = 'declined'
         await db.commit()
         await db.refresh(conn)
     return conn

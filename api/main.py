@@ -59,15 +59,17 @@ from api.auth import (
 from db.database import (
     get_db, init_db, AsyncSession,
     create_user, get_user_by_id, get_user_by_email,
+    get_user_by_username, search_users,
     upsert_blueprint, get_blueprint,
     get_cached_forecast, cache_forecast,
     create_soul_invite, get_soul_connection,
-    accept_soul_connection, get_accepted_souls,
+    accept_soul_connection, decline_soul_connection,
+    get_accepted_souls, get_pending_invites_for_user,
     User
 )
 import engines
 from ai.forecast import generate_daily_forecast
-from ai.chat import chat as higher_self_chat
+from ai.chat import chat as higher_self_chat, group_chat as group_higher_self_chat
 from energy_calculator import calculate_energy_scores
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,7 @@ class RegisterRequest(BaseModel):
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
     tz_offset:  float      = Field(0.0, example=1.0, description='UTC offset at birth (e.g. 1.0 for BST)')
+    username:   Optional[str] = Field(None, example='alicesun', description='Optional username (auto-generated if omitted)')
 
 
 class SoulBlueprintRequest(BaseModel):
@@ -129,13 +132,25 @@ class TokenResponse(BaseModel):
     user_id: str
 
 
-class InviteRequest(BaseModel):
-    email: EmailStr = Field(..., description='Email of the person to invite')
-
-
 class ChatMessage(BaseModel):
     role: str = Field(..., description='Either "user" or "assistant"')
     content: str = Field(..., description='Message content')
+
+
+class SoulInviteRequest(BaseModel):
+    identifier: str = Field(..., description='Username (@handle) or email of the person to invite')
+    message: Optional[str] = Field(None, description='Optional message to include with the invite')
+
+
+class InviteRequest(BaseModel):
+    email: EmailStr = Field(..., description='Email of the person to invite (legacy, use SoulInviteRequest)')
+
+
+class GroupChatRequest(BaseModel):
+    message: str = Field(..., description='The message sent in the group chat')
+    sender_username: str = Field(..., description='Username of whoever is sending this message')
+    soul_connection_id: str = Field(..., description='Accepted soul connection ID')
+    conversation_history: List[ChatMessage] = Field(default=[], description='Prior group conversation history')
 
 
 class ChatRequest(BaseModel):
@@ -158,6 +173,32 @@ class UserProfile(BaseModel):
     birth_lat:   Optional[float]
     birth_lon:   Optional[float]
     created_at:  datetime
+
+
+# ---------------------------------------------------------------------------
+# Helper: auto-generate username from name
+# ---------------------------------------------------------------------------
+
+import re
+
+def _generate_username_from_name(name: str) -> str:
+    """Generate a URL-safe lowercase username from a display name."""
+    base = name.lower()
+    base = re.sub(r'[^a-z0-9]', '', base)
+    base = base[:30] or 'user'
+    return base
+
+
+async def _find_unique_username(db, base: str) -> str:
+    """Append a number suffix until the username is unique."""
+    candidate = base
+    counter = 1
+    while True:
+        existing = await get_user_by_username(db, candidate)
+        if not existing:
+            return candidate
+        candidate = f"{base}{counter}"
+        counter += 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +230,7 @@ def _user_profile(user: User) -> dict:
     return {
         'id':         user.id,
         'email':      user.email,
+        'username':   user.username,
         'name':       user.name,
         'birth_date': user.birth_date,
         'birth_time': user.birth_time,
@@ -225,6 +267,14 @@ async def register(
             detail='An account with this email already exists',
         )
 
+    # Resolve username
+    if req.username:
+        desired = re.sub(r'[^a-z0-9_]', '', req.username.lower())[:30] or _generate_username_from_name(req.name)
+        username = await _find_unique_username(db, desired)
+    else:
+        base = _generate_username_from_name(req.name)
+        username = await _find_unique_username(db, base)
+
     # Geocode the birth city (raises ValueError if not found)
     try:
         from astrology import geocode_city
@@ -237,6 +287,7 @@ async def register(
     user = await create_user(db, {
         'id':            user_id,
         'email':         req.email,
+        'username':      username,
         'name':          req.name,
         'password_hash': hash_password(req.password),
         'birth_date':    req.birth_date,
@@ -341,6 +392,49 @@ async def get_me(
         'profile':   _user_profile(user),
         'blueprint': blueprint,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /users/search
+# ---------------------------------------------------------------------------
+
+@app.get('/users/search', summary='Search users by username or email')
+async def search_users_endpoint(
+    q: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Search for users by @username prefix or exact email.
+    Returns public-safe fields only: id, username, name, sun_sign, hd_type, hd_profile.
+    """
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail='Search query must be at least 2 characters')
+
+    users = await search_users(db, q.strip(), exclude_user_id=user_id)
+    results = []
+    for u in users:
+        bp = await get_blueprint(db, u.id)
+        sun_sign = None
+        hd_type = None
+        hd_profile = None
+        if bp:
+            summary = bp.get('summary', {})
+            hd = bp.get('human_design', {})
+            planets = bp.get('astrology', {}).get('natal', {}).get('planets', {})
+            sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
+            hd_type = summary.get('hd_type') or hd.get('type')
+            hd_profile = summary.get('hd_profile') or hd.get('profile')
+        results.append({
+            'id':         u.id,
+            'username':   u.username,
+            'name':       u.name,
+            'sun_sign':   sun_sign,
+            'hd_type':    hd_type,
+            'hd_profile': hd_profile,
+        })
+
+    return {'results': results, 'count': len(results)}
 
 
 # ---------------------------------------------------------------------------
@@ -542,26 +636,36 @@ async def calculate_soul_blueprint(req: SoulBlueprintRequest):
 
 @app.post('/souls/invite', summary='Invite someone as a soul connection', status_code=201)
 async def invite_soul(
-    req: InviteRequest,
+    req: SoulInviteRequest,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Send a soul connection invite to another user by email.
+    Send a soul connection invite to another user by @username or email.
     The invited user must already have a Solray account.
     Creates a pending soul_connection record.
     """
-    # Can't invite yourself
     requester = await get_user_by_id(db, user_id)
-    if requester and requester.email == req.email:
-        raise HTTPException(status_code=400, detail='Cannot invite yourself')
 
-    recipient = await get_user_by_email(db, req.email)
+    # Resolve identifier to a user
+    identifier = req.identifier.strip()
+    if '@' in identifier and '.' in identifier.split('@')[-1]:
+        # Looks like an email
+        recipient = await get_user_by_email(db, identifier)
+    else:
+        # Treat as username (strip leading @)
+        uname = identifier.lstrip('@')
+        recipient = await get_user_by_username(db, uname)
+
     if not recipient:
         raise HTTPException(
             status_code=404,
-            detail='No Solray account found with that email. Ask them to sign up first!'
+            detail='No Solray account found. Ask them to sign up first!',
         )
+
+    # Can't invite yourself
+    if recipient.id == user_id:
+        raise HTTPException(status_code=400, detail='Cannot invite yourself')
 
     # Check for existing invite
     from sqlalchemy import select
@@ -578,11 +682,11 @@ async def invite_soul(
     invite = await create_soul_invite(db, requester_id=user_id, recipient_id=recipient.id)
 
     return {
-        'invite_id':     invite.id,
-        'recipient_name': recipient.name,
-        'recipient_email': recipient.email,
-        'status':        invite.status,
-        'created_at':    invite.created_at.isoformat(),
+        'invite_id':       invite.id,
+        'recipient_name':  recipient.name,
+        'recipient_username': recipient.username,
+        'status':          invite.status,
+        'created_at':      invite.created_at.isoformat(),
     }
 
 
@@ -621,8 +725,74 @@ async def accept_invite(
     return {
         'invite_id': accepted.id,
         'status':    accepted.status,
-        'message':   'Soul connection accepted! ✨',
+        'message':   'Soul connection accepted!',
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /souls/decline/{invite_id}
+# ---------------------------------------------------------------------------
+
+@app.post('/souls/decline/{invite_id}', summary='Decline a soul connection invite')
+async def decline_invite(
+    invite_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    invite = await get_soul_connection(db, invite_id)
+    if not invite:
+        raise HTTPException(status_code=404, detail='Invite not found')
+
+    if invite.recipient_id != user_id:
+        raise HTTPException(status_code=403, detail='You can only decline invites sent to you')
+
+    if invite.status != 'pending':
+        raise HTTPException(status_code=409, detail=f'Invite is already {invite.status}')
+
+    declined = await decline_soul_connection(db, invite_id)
+    return {'invite_id': declined.id, 'status': declined.status}
+
+
+# ---------------------------------------------------------------------------
+# GET /souls/pending
+# ---------------------------------------------------------------------------
+
+@app.get('/souls/pending', summary='List pending incoming soul connection requests')
+async def list_pending_invites(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns pending connection requests sent TO the authenticated user."""
+    invites = await get_pending_invites_for_user(db, user_id)
+    result = []
+    for inv in invites:
+        requester = await get_user_by_id(db, inv.requester_id)
+        if not requester:
+            continue
+        bp = await get_blueprint(db, inv.requester_id)
+        sun_sign = None
+        hd_type = None
+        hd_profile = None
+        if bp:
+            summary = bp.get('summary', {})
+            hd = bp.get('human_design', {})
+            planets = bp.get('astrology', {}).get('natal', {}).get('planets', {})
+            sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
+            hd_type = summary.get('hd_type') or hd.get('type')
+            hd_profile = summary.get('hd_profile') or hd.get('profile')
+        result.append({
+            'invite_id':   inv.id,
+            'requester': {
+                'id':         requester.id,
+                'username':   requester.username,
+                'name':       requester.name,
+                'sun_sign':   sun_sign,
+                'hd_type':    hd_type,
+                'hd_profile': hd_profile,
+            },
+            'created_at': inv.created_at.isoformat(),
+        })
+    return {'pending': result, 'count': len(result)}
 
 
 # ---------------------------------------------------------------------------
@@ -648,19 +818,31 @@ async def list_souls(
         if not other_user:
             continue
 
-        # Get their blueprint summary (not full JSON — keep response lean)
+        # Get summary chart fields (not full blueprint, privacy)
         bp = await get_blueprint(db, other_id)
-        summary = bp.get('summary') if bp else None
+        sun_sign = None
+        moon_sign = None
+        hd_type = None
+        hd_profile = None
+        if bp:
+            summary = bp.get('summary', {})
+            hd = bp.get('human_design', {})
+            planets = bp.get('astrology', {}).get('natal', {}).get('planets', {})
+            sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
+            moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign')
+            hd_type = summary.get('hd_type') or hd.get('type')
+            hd_profile = summary.get('hd_profile') or hd.get('profile')
 
         result.append({
             'connection_id': conn.id,
             'soul': {
                 'id':         other_user.id,
+                'username':   other_user.username,
                 'name':       other_user.name,
-                'email':      other_user.email,
-                'birth_date': other_user.birth_date,
-                'birth_city': other_user.birth_city,
-                'summary':    summary,
+                'sun_sign':   sun_sign,
+                'moon_sign':  moon_sign,
+                'hd_type':    hd_type,
+                'hd_profile': hd_profile,
             },
             'connected_since': conn.created_at.isoformat(),
         })
@@ -725,6 +907,109 @@ async def soul_synergy(
         },
         'synergy': synergy,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /souls/{connection_id}/blueprint
+# ---------------------------------------------------------------------------
+
+@app.get('/souls/{connection_id}/blueprint', summary="Get a soul connection's full blueprint (for chat only)")
+async def soul_blueprint_for_chat(
+    connection_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the full blueprint for a soul connection.
+    Only accessible by either party in the accepted connection.
+    """
+    conn = await get_soul_connection(db, connection_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    if conn.status != 'accepted':
+        raise HTTPException(status_code=403, detail='Connection is not accepted')
+
+    if user_id not in (conn.requester_id, conn.recipient_id):
+        raise HTTPException(status_code=403, detail='Access denied')
+
+    other_id = conn.recipient_id if conn.requester_id == user_id else conn.requester_id
+    other_user = await get_user_by_id(db, other_id)
+    bp = await get_blueprint(db, other_id)
+
+    if not bp:
+        raise HTTPException(status_code=404, detail='Blueprint not found for this soul')
+
+    return {
+        'connection_id': connection_id,
+        'soul': {
+            'id':       other_user.id if other_user else other_id,
+            'username': other_user.username if other_user else None,
+            'name':     other_user.name if other_user else 'Unknown',
+        },
+        'blueprint': bp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /chat/group
+# ---------------------------------------------------------------------------
+
+@app.post('/chat/group', summary='Group compatibility chat with a soul connection')
+async def group_chat_endpoint(
+    req: GroupChatRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Group chat where both users are in the same thread.
+    The AI holds both blueprints and responds as a shared Higher Self guide.
+    """
+    # Validate the connection
+    conn = await get_soul_connection(db, req.soul_connection_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    if conn.status != 'accepted':
+        raise HTTPException(status_code=403, detail='Connection is not accepted')
+
+    if user_id not in (conn.requester_id, conn.recipient_id):
+        raise HTTPException(status_code=403, detail='You are not part of this connection')
+
+    # Load both blueprints
+    my_bp = await get_blueprint(db, user_id)
+    other_id = conn.recipient_id if conn.requester_id == user_id else conn.requester_id
+    soul_bp = await get_blueprint(db, other_id)
+
+    if not my_bp or not soul_bp:
+        raise HTTPException(status_code=404, detail='Blueprint not found for one or both users')
+
+    me = await get_user_by_id(db, user_id)
+    other_user = await get_user_by_id(db, other_id)
+
+    user_name = me.name if me else 'You'
+    soul_name = other_user.name if other_user else 'Soul'
+
+    history = [{'role': m.role, 'content': m.content} for m in req.conversation_history]
+
+    try:
+        response = group_higher_self_chat(
+            user_blueprint=my_bp,
+            soul_blueprint=soul_bp,
+            user_name=user_name,
+            soul_name=soul_name,
+            conversation_history=history,
+            sender_name=req.sender_username,
+            message=req.message,
+        )
+        return {'response': response}
+    except Exception as e:
+        try:
+            import sentry_sdk as _sentry
+            _sentry.capture_exception(e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f'Group chat error: {str(e)}')
 
 
 def _compute_synergy(bp_a: dict, bp_b: dict) -> dict:
