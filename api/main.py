@@ -1169,6 +1169,66 @@ async def debug_db():
 
 
 # ---------------------------------------------------------------------------
+# GET /transits/long-range
+# ---------------------------------------------------------------------------
+
+@app.get('/transits/long-range', summary="Get the user's active long-range astrological cycles")
+async def long_range_transits(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns major multi-month/multi-year astrological cycles currently active for the user.
+
+    Includes:
+      - Saturn Return (transit Saturn conjunct natal Saturn, orb 10°)
+      - Jupiter Return (transit Jupiter conjunct natal Jupiter, orb 8°)
+      - Nodal Return (transit North Node conjunct natal North Node, orb 8°)
+      - Outer planet transits (Pluto/Neptune/Uranus/Saturn/Jupiter) over natal Sun/Moon/Ascendant
+
+    Each active transit includes title, summary, start/peak/end dates, orb, and phase.
+    Results are suitable for monthly caching on the client side.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    blueprint = await get_blueprint(db, user_id)
+    if not blueprint:
+        raise HTTPException(status_code=404, detail='Blueprint not found. Please regenerate.')
+
+    try:
+        from long_range import calc_long_range_transits
+        transits = calc_long_range_transits(blueprint)
+    except Exception as e:
+        try:
+            import sentry_sdk as _sentry
+            _sentry.capture_exception(e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f'Long-range transit calculation failed: {str(e)}')
+
+    # Generate AI summaries if we have transits
+    if transits:
+        try:
+            from ai.long_range_ai import generate_transit_summaries
+            transits = generate_transit_summaries(transits, blueprint)
+        except Exception as e:
+            # AI summaries failed — return transits without summaries
+            try:
+                import sentry_sdk as _sentry
+                _sentry.capture_exception(e)
+            except Exception:
+                pass
+
+    return {
+        'cycles': transits,
+        'count':  len(transits),
+        'generated_at': datetime.utcnow().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /chat
 # ---------------------------------------------------------------------------
 
