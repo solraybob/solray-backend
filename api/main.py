@@ -71,6 +71,7 @@ import engines
 from ai.forecast import generate_daily_forecast
 from ai.chat import chat as higher_self_chat, group_chat as group_higher_self_chat
 from energy_calculator import calculate_energy_scores
+from lunar import get_upcoming_lunar_event
 
 # ---------------------------------------------------------------------------
 # App Setup
@@ -531,6 +532,16 @@ async def forecast_today(
     # Also add the legacy summary for backward compat
     if 'summary' not in final_forecast:
         final_forecast['summary'] = _build_forecast_summary(forecast_data)
+
+    # Inject lunar phase event if within 3-day window
+    natal_chart = (blueprint or {}).get('astrology', {}).get('natal', {})
+    try:
+        lunar_event = get_upcoming_lunar_event(natal_chart, days_window=3)
+        if lunar_event:
+            final_forecast['lunar_event'] = lunar_event
+    except Exception as _lunar_err:
+        # Lunar detection failure should never block the forecast
+        pass
 
     # Cache the full result
     await cache_forecast(db, user_id, today_str, final_forecast)
