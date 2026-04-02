@@ -405,6 +405,37 @@ async def get_me(
 
 
 # ---------------------------------------------------------------------------
+# PATCH /users/profile
+# ---------------------------------------------------------------------------
+
+class ProfileUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    username: Optional[str] = None
+
+@app.patch('/users/profile', summary='Update user profile')
+async def update_profile(
+    req: ProfileUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    if req.name:
+        user.name = req.name
+    if req.username:
+        # Check uniqueness
+        existing = await get_user_by_username(db, req.username)
+        if existing and existing.id != user_id:
+            raise HTTPException(status_code=400, detail='Username already taken')
+        user.username = req.username
+
+    await db.commit()
+    await db.refresh(user)
+    return {'name': user.name, 'username': user.username}
+
+# ---------------------------------------------------------------------------
 # GET /users/search
 # ---------------------------------------------------------------------------
 
