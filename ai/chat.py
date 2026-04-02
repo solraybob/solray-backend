@@ -93,6 +93,9 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     # Name for personalization
     name_hint = blueprint.get('meta', {}).get('name', '') or 'this person'
 
+    # --- Natal aspects ---
+    natal_aspects_section = _format_natal_aspects(blueprint)
+
     # --- Today's context ---
     today_context = ""
     if forecast:
@@ -177,6 +180,12 @@ GENE KEYS, their shadow and gift map:
 {chr(10).join(top_shadows) if top_shadows else 'See natal chart for active gates.'}
 
 {_format_numerology(blueprint)}
+
+NATAL ASPECTS (tightest orbs):
+{natal_aspects_section}
+
+IMPORTANT — NATAL ASPECTS INSTRUCTION:
+You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you don't know their aspects — you have them all. Name the actual planets involved.
 
 {today_context}"""
     return prompt
