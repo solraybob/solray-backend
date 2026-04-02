@@ -385,6 +385,7 @@ Respond ONLY with valid JSON. No markdown, no explanation outside the JSON. The 
 - "morning_greeting": 2-3 sentences. A personalised opening for the chat screen, for when they first open the app. Reference something specific from today's sky or their design. End with one precise question. No generic openers. No em dashes.
 - "dominant_transit": String describing the single most significant transit today (e.g. "Saturn conjunct natal Neptune")
 - "hd_gate_today": Object with "gate" (number), "shadow" (string), "gift" (string)
+- "tag_details": Object with exactly 3 string fields: "astrology", "human_design", "gene_keys". Each is 3-4 sentences. These are expanded readings for each dimension. Astrology: a deeper reading on today's planetary picture and what it means for this person specifically. Human Design: specific guidance for today based on their type, authority, and active gates. Gene Keys: insight on the shadow and gift dynamic most active today and how to move from one to the other. No em dashes in any field.
 
 The entire forecast must feel written for this specific person today, not a generic horoscope."""
 
@@ -397,7 +398,7 @@ Speak directly. Make it land."""
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1200,
+        max_tokens=1800,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
