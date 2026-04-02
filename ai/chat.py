@@ -258,22 +258,28 @@ def _format_stelliums(blueprint: dict) -> str:
 
 
 def _format_natal_aspects(blueprint: dict) -> str:
-    """Format natal aspects for the system prompt."""
+    """Format natal aspects for the system prompt, sorted by tightest orb."""
     natal = blueprint.get('astrology', {}).get('natal', {})
     aspects = natal.get('aspects', [])
     if not aspects:
         return "  (Aspects not calculated)"
     lines = []
-    # Show top 20 tightest aspects
     aspect_symbols = {
         'conjunction': '☌', 'opposition': '☍', 'trine': '△',
         'square': '□', 'sextile': '⚹', 'quincunx': 'Qx',
         'semi_sextile': 'SxS', 'semi_square': 'SqS',
         'sesquiquadrate': 'SQ', 'quintile': 'Q', 'bi_quintile': 'BQ',
     }
-    for a in aspects[:20]:
-        sym = aspect_symbols.get(a['aspect'], a['aspect'])
-        lines.append(f"  {a['planet1']} {sym} {a['planet2']} (orb {a['orb']}°)")
+    # Sort by tightest orb so the most exact aspects come first
+    sorted_aspects = sorted(aspects, key=lambda a: float(a.get('orb', 99)))
+    # Show up to 30 aspects to ensure all major aspect types (incl. quincunxes) are included
+    for a in sorted_aspects[:30]:
+        sym = aspect_symbols.get(a.get('aspect', ''), a.get('aspect', '?'))
+        planet1 = a.get('planet1', '?')
+        planet2 = a.get('planet2', '?')
+        orb = a.get('orb', '?')
+        aspect_name = a.get('aspect', '?')
+        lines.append(f"  {planet1} {sym} {planet2} ({aspect_name}, orb {orb}°)")
     return "\n".join(lines)
 
 
