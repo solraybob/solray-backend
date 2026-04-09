@@ -23,6 +23,69 @@ def _get_client() -> anthropic.Anthropic:
 
 
 # ---------------------------------------------------------------------------
+# Advisor Pattern — Haiku asks Opus for help on complex questions
+# ---------------------------------------------------------------------------
+
+COMPLEXITY_KEYWORDS = [
+    # Multi-system synthesis
+    'incarnation cross', 'channel', 'definition', 'split', 'profile line',
+    'gene key', 'shadow', 'siddhi', 'hologenomic',
+    # Deep astrology
+    'synastry', 'composite', 'transit', 'progression', 'solar return',
+    'aspect pattern', 'stellium', 'grand trine', 'grand cross', 'yod',
+    'mutual reception', 'out of bounds', 'stationary', 'retrograde cycle',
+    # Deep HD
+    'not-self', 'deconditioning', 'experiment', 'aura', 'circuitry',
+    'collective', 'tribal', 'individual circuit', 'format channel',
+    # Existential / complex personal
+    'karmic', 'past life', 'dharma', 'shadow work', 'integration',
+    'life purpose', 'soul contract', 'sacred wound', 'transformation',
+    # Relationship depth
+    'electromagnetic', 'dominance', 'compromise', 'conditioning field',
+    'defined meets undefined', 'channel completion',
+]
+
+def _is_complex_question(message: str) -> bool:
+    """
+    Determine if a question needs Opus-level depth.
+    Returns True if the message contains complexity indicators.
+    """
+    msg_lower = message.lower()
+    # Check keyword matches
+    keyword_matches = sum(1 for kw in COMPLEXITY_KEYWORDS if kw in msg_lower)
+    if keyword_matches >= 2:
+        return True
+    # Check question depth — long questions with 'why', 'how', 'explain', 'difference between'
+    is_deep = any(w in msg_lower for w in ['why does', 'how does', 'explain', 'difference between', 'relationship between', 'what does it mean when'])
+    is_long = len(message.split()) > 25
+    if is_deep and is_long:
+        return True
+    return False
+
+
+def _get_opus_insight(question: str, system: str, context_messages: list) -> str:
+    """
+    Consult Opus for a deep insight on a complex question.
+    Returns a concise advisory response that Haiku will synthesize.
+    """
+    client = _get_client()
+    advisor_prompt = f"""You are a master astrologer and Human Design analyst being consulted by a peer AI for a single complex question. 
+Be precise, deep, and specific. No fluff. Your answer will be synthesized by another AI into a conversational response.
+Give the core insight in 150 words or less. Name exact mechanisms, not vague principles."""
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=300,
+            system=advisor_prompt,
+            messages=context_messages + [{"role": "user", "content": f"Complex question to analyze: {question}"}],
+        )
+        return response.content[0].text.strip()
+    except Exception:
+        return ""  # Fail silently — Haiku handles it alone
+
+
+# ---------------------------------------------------------------------------
 # System Prompt Builder
 # ---------------------------------------------------------------------------
 
@@ -745,10 +808,20 @@ def chat(
     if not messages:
         return _generate_morning_greeting(blueprint, forecast)
 
+    # Advisor pattern: if question is complex, consult Opus first
+    opus_insight = ""
+    if user_message and _is_complex_question(user_message):
+        opus_insight = _get_opus_insight(user_message, system, messages[:-1])
+
+    # If Opus provided insight, inject it into the system prompt
+    final_system = system
+    if opus_insight:
+        final_system = system + f"\n\nADVISOR INSIGHT (integrate this into your response naturally):\n{opus_insight}"
+
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=600,
-        system=system,
+        system=final_system,
         messages=messages,
     )
 
