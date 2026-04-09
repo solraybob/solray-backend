@@ -861,10 +861,17 @@ async def list_souls(
     """
     connections = await get_accepted_souls(db, user_id)
     result = []
+    seen_other_ids = set()  # Deduplicate: prevent same person appearing twice
 
     for conn in connections:
         # Determine which side is the "other" person
         other_id = conn.recipient_id if conn.requester_id == user_id else conn.requester_id
+
+        # Skip if we've already included this person (mutual invites create 2 records)
+        if other_id in seen_other_ids:
+            continue
+        seen_other_ids.add(other_id)
+
         other_user = await get_user_by_id(db, other_id)
         if not other_user:
             continue
