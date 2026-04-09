@@ -1240,6 +1240,39 @@ async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.get('/astrocartography', summary="Get astrocartography lines for the authenticated user")
+async def astrocartography(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns astrocartography (astrogeography) lines for the user's natal chart.
+    Each line shows where a planet was on the MC, IC, ASC, or DSC at birth.
+    Results are cached in the blueprint and rarely change.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    try:
+        from astrocartography import calc_astrocartography, get_line_meaning
+        tz_offset = get_tz_offset(user.birth_lat, user.birth_lon, user.birth_date, user.birth_time)
+        result = calc_astrocartography(
+            birth_date=user.birth_date,
+            birth_time=user.birth_time,
+            birth_lat=user.birth_lat,
+            birth_lon=user.birth_lon,
+            tz_offset=tz_offset,
+            lat_step=5.0,
+        )
+        # Add interpretations to each line
+        for line in result['lines']:
+            line['meaning'] = get_line_meaning(line['planet'], line['type'])
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Astrocartography calculation failed: {str(e)}')
+
+
 @app.get('/debug/db')
 async def debug_db():
     import os
