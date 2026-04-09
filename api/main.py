@@ -1210,6 +1210,36 @@ async def delete_user(email: str, db: AsyncSession = Depends(get_db)):
     return {"deleted": email}
 
 
+@app.post('/admin/recalculate/{email}', summary="Recalculate blueprint for a user (admin only)")
+async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
+    """Recalculate and overwrite the stored blueprint for a user."""
+    user = await get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    from astrology import geocode_city
+    try:
+        lat, lon = geocode_city(user.birth_city)
+    except Exception:
+        lat, lon = user.birth_lat, user.birth_lon
+    tz_offset = get_tz_offset(lat, lon, user.birth_date, user.birth_time)
+    blueprint = engines.build_blueprint(
+        birth_date=user.birth_date,
+        birth_time=user.birth_time,
+        birth_city=user.birth_city,
+        birth_lat=lat,
+        birth_lon=lon,
+        tz_offset=tz_offset,
+    )
+    await upsert_blueprint(db, user.id, blueprint)
+    hd = blueprint.get('human_design', {})
+    return {
+        'recalculated': email,
+        'type': hd.get('type'),
+        'profile': hd.get('profile'),
+        'authority': hd.get('authority'),
+    }
+
+
 @app.get('/debug/db')
 async def debug_db():
     import os
