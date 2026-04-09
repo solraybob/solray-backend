@@ -48,7 +48,7 @@ LINE_SPAN = GATE_SPAN / 6  # 0.9375°
 #     variations between calculation methods, not errors)
 # Formula: adjusted_lon = (planet_longitude + 58.177269) % 360
 # ---------------------------------------------------------------------------
-HD_WHEEL_OFFSET = -58.177269
+HD_WHEEL_OFFSET = -58.077269  # Calibrated: fixes profile 4/1 vs 5/1 boundary errors
 
 
 def longitude_to_gate_and_line(longitude: float) -> tuple:
