@@ -250,8 +250,81 @@ NATAL ASPECTS (tightest orbs):
 IMPORTANT. NATAL ASPECTS INSTRUCTION:
 You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you don't know their aspects — you have them all. Name the actual planets involved.
 
+{_format_astrocartography(blueprint)}
+
 {today_context}"""
     return prompt
+
+
+def _format_astrocartography(blueprint: dict) -> str:
+    """
+    Calculate and format astrocartography context for the system prompt.
+    Returns the most significant planetary lines and power spots.
+    """
+    meta = blueprint.get('meta', {})
+    birth_date = meta.get('birth_date') or blueprint.get('birth_data', {}).get('date')
+    birth_time = meta.get('birth_time') or blueprint.get('birth_data', {}).get('time')
+    birth_lat = meta.get('birth_lat') or blueprint.get('birth_data', {}).get('lat')
+    birth_lon = meta.get('birth_lon') or blueprint.get('birth_data', {}).get('lon')
+
+    if not all([birth_date, birth_time, birth_lat, birth_lon]):
+        return ""
+
+    try:
+        from astrocartography import calc_astrocartography, get_line_meaning
+
+        # Use a large step for speed (we just need MC lines for context)
+        result = calc_astrocartography(
+            birth_date=birth_date,
+            birth_time=birth_time,
+            birth_lat=float(birth_lat),
+            birth_lon=float(birth_lon),
+            tz_offset=0.0,
+            lat_step=15.0,
+        )
+
+        # Get MC lines for key planets — most interpretively meaningful
+        KEY_PLANETS = ['Sun', 'Jupiter', 'Venus', 'Saturn', 'Mars', 'Moon']
+        mc_lines = [l for l in result['lines'] if l['type'] == 'MC' and l['planet'] in KEY_PLANETS]
+
+        lines = ["ASTROCARTOGRAPHY (geographic energy lines):"]
+        for l in mc_lines:
+            lon = l.get('lon', 0)
+            meaning = get_line_meaning(l['planet'], 'MC')
+            # Convert longitude to a rough region
+            if -180 <= lon < -120:
+                region = "West Pacific/New Zealand"
+            elif -120 <= lon < -90:
+                region = "Western North America"
+            elif -90 <= lon < -60:
+                region = "Eastern North America"
+            elif -60 <= lon < -30:
+                region = "South America/Atlantic"
+            elif -30 <= lon < 0:
+                region = "West Africa/Atlantic"
+            elif 0 <= lon < 30:
+                region = "Western Europe/West Africa"
+            elif 30 <= lon < 60:
+                region = "Eastern Europe/East Africa"
+            elif 60 <= lon < 90:
+                region = "Middle East/Central Asia"
+            elif 90 <= lon < 120:
+                region = "South Asia/India"
+            elif 120 <= lon < 150:
+                region = "East Asia"
+            else:
+                region = "East Pacific/Australia"
+            lines.append(f"  {l['planet']} MC at {lon:.1f}° ({region}): {meaning}")
+
+        lines.append("")
+        lines.append("When the person asks about travel, relocation, or where to live, reference these lines.")
+        lines.append("A person thrives where their Jupiter or Venus MC/ASC lines run — these areas amplify their gifts.")
+        lines.append("Saturn MC areas bring discipline and achievement but also restriction.")
+        lines.append("Mars MC areas are high-energy but can bring conflict.")
+
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 def _format_numerology(blueprint: dict) -> str:
