@@ -118,7 +118,7 @@ class RegisterRequest(BaseModel):
 
 
 class SoulBlueprintRequest(BaseModel):
-    name:       str        = Field(..., example='Alice Sun')
+    name:       Optional[str] = Field(None, example='Alice Sun')
     birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
