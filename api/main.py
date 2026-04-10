@@ -1413,3 +1413,128 @@ async def clear_memory(
     await update_user_memories(db, user_id, [])
     return {'cleared': True}
 
+
+
+# ---------------------------------------------------------------------------
+# GET /forecast/week — 7-day transit preview
+# ---------------------------------------------------------------------------
+
+@app.get('/forecast/week', summary="Get the 3 most significant transits for the next 7 days")
+async def forecast_week(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns a week-ahead summary with the 3 most significant transits."""
+    from datetime import date, timedelta
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    blueprint = await get_blueprint(db, user_id)
+    if not blueprint:
+        raise HTTPException(status_code=404, detail='Blueprint not found')
+
+    today = date.today().isoformat()
+    cached = await get_cached_forecast(db, user_id, f"week_{today}")
+    if cached:
+        return cached
+
+    try:
+        # Collect aspects from next 3 days (lightweight)
+        significant = []
+        for i in range(1, 4):
+            day = (date.today() + timedelta(days=i)).isoformat()
+            try:
+                day_data = engines.get_daily_forecast(
+                    birth_date=user.birth_date,
+                    birth_time=user.birth_time,
+                    birth_city=user.birth_city,
+                    birth_lat=user.birth_lat,
+                    birth_lon=user.birth_lon,
+                )
+                for asp in (day_data.get('aspects', []))[:1]:
+                    significant.append({
+                        'date': day,
+                        'day_offset': i,
+                        'transit_planet': asp.get('transit_planet'),
+                        'aspect': asp.get('aspect'),
+                        'natal_planet': asp.get('natal_planet'),
+                        'orb': asp.get('orb', 99),
+                    })
+            except Exception:
+                continue
+
+        significant.sort(key=lambda x: x.get('orb', 99))
+        top_3 = significant[:3]
+
+        from ai.chat import _get_client, _build_system_prompt
+        client = _get_client()
+        transit_lines = "\n".join([
+            f"- {t['date']}: {t['transit_planet']} {t['aspect']} natal {t['natal_planet']} (orb {t['orb']}°)"
+            for t in top_3
+        ]) if top_3 else "No major transits this week."
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=_build_system_prompt(blueprint, None),
+            messages=[{"role": "user", "content": f"In 1-2 sentences, what is the main theme of the coming days based on these transits:\n{transit_lines}\nSpeak directly to this person. Be specific."}]
+        )
+
+        result = {
+            'week_summary': response.content[0].text.strip(),
+            'top_transits': top_3,
+            'generated_for': today,
+        }
+        await cache_forecast(db, user_id, f"week_{today}", result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Weekly forecast failed: {str(e)}')
+
+
+# ---------------------------------------------------------------------------
+# POST /push/subscribe — Store Web Push subscription
+# ---------------------------------------------------------------------------
+
+@app.post('/push/subscribe', summary='Register push notification subscription')
+async def push_subscribe(
+    subscription_data: dict,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store a Web Push subscription endpoint for sending transit alerts."""
+    from sqlalchemy import text
+    import uuid
+
+    # Create table if not exists (non-blocking)
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                endpoint TEXT NOT NULL,
+                p256dh TEXT,
+                auth TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await db.commit()
+    except Exception:
+        pass
+
+    sub = subscription_data.get('subscription', subscription_data)
+    endpoint = sub.get('endpoint', '')
+    keys = sub.get('keys', {})
+
+    if not endpoint:
+        return {'subscribed': False, 'error': 'No endpoint provided'}
+
+    try:
+        await db.execute(
+            text("INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth) VALUES (:id, :uid, :ep, :p256, :auth) ON CONFLICT DO NOTHING"),
+            {"id": str(uuid.uuid4()), "uid": user_id, "ep": endpoint, "p256": keys.get('p256dh', ''), "auth": keys.get('auth', '')}
+        )
+        await db.commit()
+    except Exception:
+        pass
+
+    return {'subscribed': True}
