@@ -1198,18 +1198,6 @@ async def dashboard_stats(db: AsyncSession = Depends(get_db)):
     }
 
 
-# Admin: delete user (for testing only — remove before public launch)
-@app.delete('/admin/users/{email}', summary="Delete user by email (admin only)")
-async def delete_user(email: str, db: AsyncSession = Depends(get_db)):
-    """Delete a user and all their data."""
-    from sqlalchemy import text
-    await db.execute(text("DELETE FROM daily_forecasts WHERE user_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
-    await db.execute(text("DELETE FROM blueprints WHERE user_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
-    await db.execute(text("DELETE FROM soul_connections WHERE requester_id IN (SELECT id FROM users WHERE email = :email) OR recipient_id IN (SELECT id FROM users WHERE email = :email)"), {"email": email})
-    await db.execute(text("DELETE FROM users WHERE email = :email"), {"email": email})
-    await db.commit()
-    return {"deleted": email}
-
 
 @app.post('/admin/recalculate/{email}', summary="Recalculate blueprint for a user (admin only)")
 async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
@@ -1273,12 +1261,6 @@ async def astrocartography(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Astrocartography calculation failed: {str(e)}')
 
-
-@app.get('/debug/db')
-async def debug_db():
-    import os
-    db_url = os.environ.get('DATABASE_URL', 'NOT_SET')
-    return {"db_set": db_url != 'NOT_SET', "db_type": "postgres" if "postgresql" in db_url else "sqlite", "prefix": db_url[:40]}
 
 
 # ---------------------------------------------------------------------------
@@ -1431,17 +1413,3 @@ async def clear_memory(
     await update_user_memories(db, user_id, [])
     return {'cleared': True}
 
-
-@app.get('/debug/lunar')
-async def debug_lunar(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
-    try:
-        from lunar import get_upcoming_lunar_event
-        user = await get_user_by_id(db, user_id)
-        blueprint = await get_blueprint(db, user_id)
-        if not blueprint:
-            return {"error": "no blueprint"}
-        natal = blueprint.get('astrology', {}).get('natal', {})
-        result = get_upcoming_lunar_event(natal, days_window=3)
-        return {"lunar_event": result, "natal_keys": list(natal.keys())}
-    except Exception as e:
-        return {"error": str(e)}
