@@ -143,6 +143,23 @@ class DailyForecast(Base):
     user = relationship('User', back_populates='forecasts')
 
 
+class UserMemory(Base):
+    """Persistent memory of a user's life context across chat sessions.
+    
+    The Higher Self reads this at the start of every chat to feel continuous.
+    Entries are written by the AI after each chat session — key facts, themes,
+    and insights worth remembering long-term.
+    """
+    __tablename__ = 'user_memory'
+
+    id         = Column(String(36), primary_key=True)
+    user_id    = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    category   = Column(String(50), nullable=False)   # e.g. 'life_event', 'theme', 'insight', 'preference'
+    content    = Column(Text, nullable=False)           # The memory itself
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SoulConnection(Base):
     __tablename__ = 'soul_connections'
     __table_args__ = (
@@ -359,4 +376,51 @@ async def get_accepted_souls(db: AsyncSession, user_id: str) -> list[SoulConnect
         )
     )
     return result.scalars().all()
-# psycopg3 migration complete
+
+
+# ---------------------------------------------------------------------------
+# CRUD — User Memory
+# ---------------------------------------------------------------------------
+
+async def get_user_memories(db: AsyncSession, user_id: str) -> list[UserMemory]:
+    """Get all memories for a user, sorted by most recent."""
+    result = await db.execute(
+        select(UserMemory)
+        .where(UserMemory.user_id == user_id)
+        .order_by(UserMemory.updated_at.desc())
+        .limit(20)  # Cap at 20 memories to keep system prompt manageable
+    )
+    return result.scalars().all()
+
+
+async def add_user_memory(db: AsyncSession, user_id: str, category: str, content: str) -> UserMemory:
+    """Add a new memory for a user."""
+    import uuid
+    memory = UserMemory(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        category=category,
+        content=content,
+    )
+    db.add(memory)
+    await db.commit()
+    await db.refresh(memory)
+    return memory
+
+
+async def update_user_memories(db: AsyncSession, user_id: str, memories: list[dict]) -> None:
+    """Replace all memories for a user with a new set. Called after AI synthesizes a chat session."""
+    # Delete old memories
+    await db.execute(delete(UserMemory).where(UserMemory.user_id == user_id))
+    # Add new ones
+    import uuid
+    for m in memories[:20]:  # Cap at 20
+        memory = UserMemory(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            category=m.get('category', 'general'),
+            content=m.get('content', ''),
+        )
+        db.add(memory)
+    await db.commit()
+

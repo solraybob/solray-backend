@@ -65,6 +65,7 @@ from db.database import (
     create_soul_invite, get_soul_connection,
     accept_soul_connection, decline_soul_connection,
     get_accepted_souls, get_pending_invites_for_user,
+    get_user_memories, update_user_memories, add_user_memory,
     User
 )
 import engines
@@ -1364,6 +1365,11 @@ async def chat_endpoint(
     from datetime import date
     forecast = await get_cached_forecast(db, user_id, date.today().isoformat())
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
+
+    # Load persistent user memories for continuity across sessions
+    from db.database import get_user_memories, update_user_memories
+    memories = await get_user_memories(db, user_id)
+
     try:
         response = higher_self_chat(
             blueprint=blueprint,
@@ -1371,7 +1377,23 @@ async def chat_endpoint(
             conversation_history=history,
             user_message=req.message,
             soul_blueprint=req.soul_blueprint,
+            memories=memories,
         )
+
+        # After every 5 user messages, synthesize memories in background
+        user_message_count = sum(1 for m in history if m.get('role') == 'user')
+        if user_message_count > 0 and user_message_count % 5 == 0:
+            import asyncio
+            from ai.chat import synthesize_memories
+            async def _synthesize():
+                try:
+                    new_memories = synthesize_memories(blueprint, history, memories)
+                    if new_memories:
+                        await update_user_memories(db, user_id, new_memories)
+                except Exception:
+                    pass
+            asyncio.create_task(_synthesize())
+
         return {"response": response}
     except Exception as e:
         try:
@@ -1380,6 +1402,34 @@ async def chat_endpoint(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+
+@app.get('/memory', summary='Get user memory entries')
+async def get_memory(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the current persistent memories the Higher Self holds about this user."""
+    from db.database import get_user_memories
+    memories = await get_user_memories(db, user_id)
+    return {
+        'memories': [
+            {'category': m.category, 'content': m.content, 'updated_at': m.updated_at.isoformat()}
+            for m in memories
+        ],
+        'count': len(memories)
+    }
+
+
+@app.delete('/memory', summary='Clear user memory')
+async def clear_memory(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear all persistent memories for fresh start."""
+    from db.database import update_user_memories
+    await update_user_memories(db, user_id, [])
+    return {'cleared': True}
 
 
 @app.get('/debug/lunar')

@@ -89,6 +89,21 @@ Give the core insight in 150 words or less. Name exact mechanisms, not vague pri
 # System Prompt Builder
 # ---------------------------------------------------------------------------
 
+def _format_user_memory(memories: list) -> str:
+    """Format persistent user memories for the system prompt."""
+    if not memories:
+        return ""
+    
+    lines = ["RELATIONSHIP MEMORY (what you know about this person from past sessions):"]
+    for m in memories:
+        category = m.category if hasattr(m, 'category') else m.get('category', 'general')
+        content = m.content if hasattr(m, 'content') else m.get('content', '')
+        lines.append(f"  [{category}] {content}")
+    lines.append("")
+    lines.append("Use this memory naturally — don't reference it explicitly unless relevant. It shapes how you know them.")
+    return "\n".join(lines)
+
+
 def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     """
     Build the rich system prompt that grounds the Higher Self in the user's
@@ -254,6 +269,16 @@ You have the user's complete natal aspect list above. When they ask about a spec
 
 {today_context}"""
     return prompt
+
+
+def build_system_prompt_with_memory(blueprint: dict, forecast: Optional[dict], memories: list) -> str:
+    """Build system prompt including persistent user memory."""
+    base = _build_system_prompt(blueprint, forecast)
+    memory_section = _format_user_memory(memories)
+    if memory_section:
+        # Insert memory right after the blueprint section, before today's context
+        return base + f"\n\n{memory_section}"
+    return base
 
 
 def _format_astrocartography(blueprint: dict) -> str:
@@ -831,12 +856,80 @@ def group_chat(
     return response.content[0].text.strip()
 
 
+def synthesize_memories(
+    blueprint: dict,
+    conversation_history: list,
+    existing_memories: list,
+) -> list[dict]:
+    """
+    After a chat session, synthesize key memories to persist.
+    Returns a list of {category, content} dicts representing updated memories.
+    Called asynchronously — doesn't block the user.
+    """
+    client = _get_client()
+    
+    # Format existing memories
+    existing = "\n".join([
+        f"[{m.category if hasattr(m, 'category') else m.get('category', '')}] {m.content if hasattr(m, 'content') else m.get('content', '')}"
+        for m in existing_memories
+    ])
+    
+    # Format conversation
+    convo = "\n".join([
+        f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
+        for msg in conversation_history[-20:]  # Last 20 messages
+    ])
+    
+    prompt = f"""You are analyzing a chat session between a user and their Higher Self guide to extract key memories worth preserving long-term.
+
+EXISTING MEMORIES:
+{existing or "None yet"}
+
+RECENT CONVERSATION:
+{convo}
+
+Extract 0-5 new or updated memories worth remembering for future sessions. Focus on:
+- Life events or major changes mentioned ("going through divorce", "started new job", "moving to Bali")
+- Emotional themes and struggles they're working through
+- Key insights or breakthroughs from this conversation
+- Preferences or patterns the AI noticed
+- Specific questions or topics they want to return to
+
+Return ONLY a JSON array like:
+[
+  {{"category": "life_event", "content": "Going through a breakup, reflecting on relationship patterns"}},
+  {{"category": "theme", "content": "Struggling with self-worth, connects to Gene Key 20 shadow perfectionism"}},
+  {{"category": "insight", "content": "Realized their Saturn in 7th house explains commitment fears"}}
+]
+
+Categories: life_event, theme, insight, preference, question, pattern
+Return [] if nothing significant to remember. Return ONLY valid JSON, no explanation."""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        import json
+        text = response.content[0].text.strip()
+        # Extract JSON array
+        start = text.find('[')
+        end = text.rfind(']') + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+        return []
+    except Exception:
+        return []
+
+
 def chat(
     blueprint: dict,
     forecast: Optional[dict],
     conversation_history: list,
     user_message: Optional[str] = None,
     soul_blueprint: Optional[dict] = None,
+    memories: Optional[list] = None,
 ) -> str:
     """
     Generate a Higher Self chat response.
@@ -856,7 +949,7 @@ def chat(
     if not conversation_history and not user_message:
         return _generate_morning_greeting(blueprint, forecast)
 
-    system = _build_system_prompt(blueprint, forecast)
+    system = build_system_prompt_with_memory(blueprint, forecast, memories or [])
 
     # If a soul blueprint is provided, inject the compatibility section
     if soul_blueprint:
