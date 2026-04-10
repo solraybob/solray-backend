@@ -1639,3 +1639,94 @@ async def push_subscribe(
     db.add(sub)
     await db.commit()
     return {'subscribed': True}
+
+
+# ---------------------------------------------------------------------------
+# GET /forecast/week — 7-day transit preview
+# ---------------------------------------------------------------------------
+
+@app.get('/forecast/week', summary="Get the 3 most significant transits for the next 7 days")
+async def forecast_week(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the 3 most significant transits for the next 7 days.
+    Used for weekly push notifications and the week-ahead card.
+    """
+    from datetime import date, timedelta
+
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    blueprint = await get_blueprint(db, user_id)
+    if not blueprint:
+        raise HTTPException(status_code=404, detail='Blueprint not found')
+
+    # Check cache (refreshes daily)
+    today = date.today().isoformat()
+    cached = await get_cached_forecast(db, user_id, f"week_{today}")
+    if cached:
+        return cached
+
+    try:
+        # Get forecasts for next 7 days and surface the tightest aspects
+        significant = []
+        natal_planets = blueprint.get('astrology', {}).get('natal', {}).get('planets', {})
+
+        for i in range(7):
+            day = (date.today() + timedelta(days=i)).isoformat()
+            try:
+                day_forecast = engines.get_daily_forecast(
+                    birth_date=user.birth_date,
+                    birth_time=user.birth_time,
+                    birth_city=user.birth_city,
+                    birth_lat=user.birth_lat,
+                    birth_lon=user.birth_lon,
+                )
+                aspects = day_forecast.get('aspects', [])
+                for asp in aspects[:2]:  # Top 2 per day
+                    significant.append({
+                        'date': day,
+                        'day_offset': i,
+                        'transit_planet': asp.get('transit_planet'),
+                        'aspect': asp.get('aspect'),
+                        'natal_planet': asp.get('natal_planet'),
+                        'orb': asp.get('orb', 99),
+                    })
+            except Exception:
+                continue
+
+        # Sort by orb (tightest = most significant)
+        significant.sort(key=lambda x: x.get('orb', 99))
+        top_3 = significant[:3]
+
+        # Generate AI interpretation for the week
+        from ai.chat import _get_client, _build_system_prompt
+        client = _get_client()
+
+        transit_lines = "\n".join([
+            f"- {t['date']}: {t['transit_planet']} {t['aspect']} natal {t['natal_planet']} (orb {t['orb']}°)"
+            for t in top_3
+        ])
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=_build_system_prompt(blueprint, None),
+            messages=[{
+                "role": "user",
+                "content": f"Summarize the week ahead in 2-3 sentences based on these upcoming transits:\n{transit_lines}\n\nSpeak directly to this person. No generic astrology. Reference their specific chart."
+            }]
+        )
+
+        result = {
+            'week_summary': response.content[0].text.strip(),
+            'top_transits': top_3,
+            'generated_for': today,
+        }
+        await cache_forecast(db, user_id, f"week_{today}", result)
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Weekly forecast failed: {str(e)}')
