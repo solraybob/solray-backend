@@ -108,6 +108,7 @@ class User(Base):
     birth_city    = Column(String(255), nullable=True)
     birth_lat     = Column(Float,       nullable=True)
     birth_lon     = Column(Float,       nullable=True)
+    sex           = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
     created_at    = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
     blueprint     = relationship('Blueprint', back_populates='user', uselist=False, cascade='all, delete-orphan')
@@ -179,9 +180,30 @@ class SoulConnection(Base):
 # ---------------------------------------------------------------------------
 
 async def init_db():
-    """Create all tables. Safe to call on startup (CREATE IF NOT EXISTS)."""
+    """Create all tables. Safe to call on startup (CREATE IF NOT EXISTS).
+
+    Also runs idempotent column-adds for schema evolution so deploys don't
+    require manual migrations. New columns should be added here with
+    `ADD COLUMN IF NOT EXISTS`.
+    """
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight schema evolution — safe on both Postgres and SQLite
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS sex VARCHAR(10)"
+                ))
+            else:
+                # SQLite: ALTER ADD COLUMN has no IF NOT EXISTS, check pragma
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'sex' not in cols:
+                    await conn.execute(text("ALTER TABLE users ADD COLUMN sex VARCHAR(10)"))
+        except Exception as e:
+            # Don't block startup if migration fails — log and continue
+            print(f"[init_db] sex column migration note: {e}")
 
 
 # ---------------------------------------------------------------------------

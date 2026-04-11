@@ -113,6 +113,7 @@ class RegisterRequest(BaseModel):
     birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
+    sex:        Optional[str] = Field(None, example='female', description="'male' or 'female'")
     tz_offset:  float      = Field(0.0, example=1.0, description='UTC offset at birth (e.g. 1.0 for BST)')
     username:   Optional[str] = Field(None, example='alicesun', description='Optional username (auto-generated if omitted)')
 
@@ -122,6 +123,7 @@ class SoulBlueprintRequest(BaseModel):
     birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
+    sex:        Optional[str] = Field(None, example='female', description="'male' or 'female'")
 
 
 class LoginRequest(BaseModel):
@@ -239,6 +241,7 @@ def _user_profile(user: User) -> dict:
         'birth_city': user.birth_city,
         'birth_lat':  user.birth_lat,
         'birth_lon':  user.birth_lon,
+        'sex':        getattr(user, 'sex', None),
         'created_at': user.created_at.isoformat() if user.created_at else None,
     }
 
@@ -284,6 +287,15 @@ async def register(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Normalize sex to 'male' | 'female' | None
+    sex_clean: Optional[str] = None
+    if req.sex:
+        s = req.sex.strip().lower()
+        if s in ('male', 'm'):
+            sex_clean = 'male'
+        elif s in ('female', 'f'):
+            sex_clean = 'female'
+
     # Create user row
     user_id = str(uuid.uuid4())
     user = await create_user(db, {
@@ -297,6 +309,7 @@ async def register(
         'birth_city':    req.birth_city,
         'birth_lat':     birth_lat,
         'birth_lon':     birth_lon,
+        'sex':           sex_clean,
     })
 
     # Auto-detect timezone from coordinates (ignores any client-supplied tz_offset)
