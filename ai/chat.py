@@ -23,62 +23,100 @@ def _get_client() -> anthropic.Anthropic:
 
 
 # ---------------------------------------------------------------------------
-# Advisor Pattern — Haiku asks Opus for help on complex questions
+# Advisor Pattern — Haiku consults Sonnet for multi-system synthesis
+# ---------------------------------------------------------------------------
+# Cost strategy: Sonnet is ~5x cheaper than Opus per token. For a 150-word
+# advisory insight the quality difference is negligible, and Sonnet handles
+# nuanced reasoning well. Reserve Opus for future heavy analytical tasks
+# (Hive Mind pattern engine, batch analysis).
+#
+# Routing strategy: fire the advisor ONLY when someone genuinely needs
+# cross-system synthesis (astrology + HD + Gene Keys together) or is asking
+# a structural life-architecture question. Simple transit questions, emotional
+# check-ins, and short messages stay with Haiku alone.
 # ---------------------------------------------------------------------------
 
-COMPLEXITY_KEYWORDS = [
-    # Multi-system synthesis
-    'incarnation cross', 'channel', 'definition', 'split', 'profile line',
-    'gene key', 'shadow', 'siddhi', 'hologenomic',
-    # Deep astrology
-    'synastry', 'composite', 'transit', 'progression', 'solar return',
-    'aspect pattern', 'stellium', 'grand trine', 'grand cross', 'yod',
-    'mutual reception', 'out of bounds', 'stationary', 'retrograde cycle',
-    # Deep HD
-    'not-self', 'deconditioning', 'experiment', 'aura', 'circuitry',
-    'collective', 'tribal', 'individual circuit', 'format channel',
-    # Existential / complex personal
-    'karmic', 'past life', 'dharma', 'shadow work', 'integration',
-    'life purpose', 'soul contract', 'sacred wound', 'transformation',
-    # Relationship depth
-    'electromagnetic', 'dominance', 'compromise', 'conditioning field',
-    'defined meets undefined', 'channel completion',
+# Keywords that indicate multi-system or structural depth
+SYNTHESIS_KEYWORDS = [
+    # Cross-system (need to weave astrology + HD + Gene Keys together)
+    'incarnation cross', 'profile line', 'gene key', 'siddhi', 'hologenomic',
+    'channel', 'definition', 'split definition',
+    # Structural astrology (pattern-level, not single-placement)
+    'synastry', 'composite', 'solar return', 'aspect pattern', 'stellium',
+    'grand trine', 'grand cross', 'yod', 'mutual reception',
+    # Deep HD mechanics
+    'not-self', 'deconditioning', 'circuitry', 'format channel',
+    'conditioning field', 'electromagnetic', 'channel completion',
+]
+
+# Questions that require life-architecture depth, not just chart reading
+DEPTH_PHRASES = [
+    'why do i keep', 'what is my purpose', 'how do these connect',
+    'relationship between my', 'pattern in my chart', 'how does my',
+    'what am i supposed to', 'why does this keep happening',
+    'difference between my', 'how do i integrate',
 ]
 
 def _is_complex_question(message: str) -> bool:
     """
-    Determine if a question needs Opus-level depth.
-    Returns True if the message contains complexity indicators.
+    Determine if a question needs advisor-level depth.
+    Fires only for genuine multi-system synthesis or structural questions.
+    Simple emotional check-ins, single-placement questions, and short
+    messages stay with Haiku alone.
     """
     msg_lower = message.lower()
-    # Check keyword matches
-    keyword_matches = sum(1 for kw in COMPLEXITY_KEYWORDS if kw in msg_lower)
+    word_count = len(message.split())
+
+    # Short messages are never complex (greetings, emotional check-ins)
+    if word_count < 12:
+        return False
+
+    # Multi-system synthesis: 2+ keywords from different systems
+    keyword_matches = sum(1 for kw in SYNTHESIS_KEYWORDS if kw in msg_lower)
     if keyword_matches >= 2:
         return True
-    # Check question depth — long questions with 'why', 'how', 'explain', 'difference between'
-    is_deep = any(w in msg_lower for w in ['why does', 'how does', 'explain', 'difference between', 'relationship between', 'what does it mean when'])
-    is_long = len(message.split()) > 25
-    if is_deep and is_long:
+
+    # Life-architecture question: specific depth phrase + enough substance
+    has_depth = any(phrase in msg_lower for phrase in DEPTH_PHRASES)
+    if has_depth and word_count > 20:
         return True
+
     return False
 
 
-def _get_opus_insight(question: str, system: str, context_messages: list) -> str:
+def _get_advisor_insight(question: str, blueprint_summary: str, context_messages: list) -> str:
     """
-    Consult Opus for a deep insight on a complex question.
-    Returns a concise advisory response that Haiku will synthesize.
+    Consult Sonnet for a deep insight on a multi-system question.
+    Returns a concise advisory that Haiku will weave into its response.
+
+    Cost note: ~$0.003-0.008 per call at Sonnet pricing.
+    Sends only the question + a compact blueprint summary, NOT the full
+    system prompt, to keep input tokens minimal.
     """
     client = _get_client()
-    advisor_prompt = f"""You are a master astrologer and Human Design analyst being consulted by a peer AI for a single complex question. 
-Be precise, deep, and specific. No fluff. Your answer will be synthesized by another AI into a conversational response.
-Give the core insight in 150 words or less. Name exact mechanisms, not vague principles."""
+    advisor_prompt = """You are the deep-analysis layer of Solray, a Cosmic Intelligence platform.
+You are being consulted by the conversational layer (Haiku) for a question that requires multi-system synthesis or structural life-architecture depth.
+
+Your job: provide the core insight in 150 words or fewer. Be precise and specific.
+
+Rules:
+- Name exact placements, gates, keys, channels. No vague principles.
+- When you reference astrology, Ceres rules Virgo and Earth rules Taurus. Use these naturally, never frame them as corrections.
+- Connect across systems when relevant: how does the astrology placement relate to the HD gate or Gene Key?
+- Ground everything in observable behavior or biology. No mystical vocabulary.
+- Do not use em dashes. Use commas, periods, or colons instead.
+- Your insight will be synthesized into a warm, personal response. Write for integration, not for display."""
+
+    # Send only a compact context: blueprint summary + last 4 exchanges + the question
+    # This keeps input tokens tight (~800-1200 tokens vs 3000+ with full system prompt)
+    recent_context = context_messages[-8:] if len(context_messages) > 8 else context_messages
 
     try:
         response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=300,
+            model="claude-sonnet-4-5-20241022",
+            max_tokens=250,
             system=advisor_prompt,
-            messages=context_messages + [{"role": "user", "content": f"Complex question to analyze: {question}"}],
+            messages=recent_context + [{"role": "user", "content": f"Blueprint summary: {blueprint_summary}\n\nQuestion requiring synthesis: {question}"}],
         )
         return response.content[0].text.strip()
     except Exception:
@@ -208,10 +246,10 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
 
     # Authority-specific decision reminders
     authority_guidance = {
-        'Sacral': "Their decisions are made in the body — a gut response, not a thought. Ask them what their body says, not their mind.",
+        'Sacral': "Their decisions are made in the body, a gut response, not a thought. Ask them what their body says, not their mind.",
         'Emotional': "They are on an emotional wave. Their clarity comes with time. Remind them not to decide in the heat or the trough.",
-        'Splenic': "Their authority is instantaneous — a quiet whisper in the moment. It doesn't repeat itself. Help them trust the first feeling.",
-        'Self-Projected': "They find their truth by speaking it out loud to someone they trust. Not for advice — for the sound of their own voice landing.",
+        'Splenic': "Their authority is instantaneous, a quiet whisper in the moment. It does not repeat itself. Help them trust the first feeling.",
+        'Self-Projected': "They find their truth by speaking it out loud to someone they trust. Not for advice, for the sound of their own voice landing.",
         'Mental / Sounding Board': "They need to talk it through with the right people before clarity arrives. The answer is in the conversation.",
         'Ego': "Their will and heart are aligned. They know what they want when they commit to it. But they must only commit when it's truly from the heart.",
         'Lunar': "They wait a full lunar cycle before major decisions. Their wisdom comes from sampling all the frequencies of life.",
@@ -343,7 +381,7 @@ NATAL ASPECTS (tightest orbs):
 {natal_aspects_section}
 
 IMPORTANT. NATAL ASPECTS INSTRUCTION:
-You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you don't know their aspects — you have them all. Name the actual planets involved.
+You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you do not know their aspects. You have them all. Name the actual planets involved.
 
 HUMAN DESIGN:
 Type: {hd_type}. Strategy: {strategy}. Authority: {authority}. Profile: {profile}.
@@ -446,7 +484,7 @@ def _format_astrocartography(blueprint: dict) -> str:
 
         lines.append("")
         lines.append("When the person asks about travel, relocation, or where to live, reference these lines.")
-        lines.append("A person thrives where their Jupiter or Venus MC/ASC lines run — these areas amplify their gifts.")
+        lines.append("A person thrives where their Jupiter or Venus MC/ASC lines run. These areas amplify their gifts.")
         lines.append("Saturn MC areas bring discipline and achievement but also restriction.")
         lines.append("Mars MC areas are high-energy but can bring conflict.")
 
@@ -667,7 +705,7 @@ def _format_forecast_for_chat(forecast: dict) -> str:
         lines.append("Gene Keys active today:")
         for role, gk in gk_today.items():
             if isinstance(gk, dict):
-                lines.append(f"  {role.replace('_', ' ').title()}: Gate {gk.get('gate', '?')} — "
+                lines.append(f"  {role.replace('_', ' ').title()}: Gate {gk.get('gate', '?')}, "
                              f"shadow of {gk.get('shadow', '?')}, gift of {gk.get('gift', '?')}")
 
     return "\n".join(lines)
@@ -704,13 +742,13 @@ def _generate_morning_greeting(blueprint: dict, forecast: Optional[dict]) -> str
 
     user_request = f"""Open the morning conversation. 
 
-This is the first message of the day. Greet them — but not generically. Reference something specific about today's sky or their chart. Create a moment of presence before the day rushes in.
+This is the first message of the day. Greet them, but not generically. Reference something specific about today's sky or their chart. Create a moment of presence before the day rushes in.
 
 {today_highlight}
 
 Their {summary.get('hd_type', 'design')} and {summary.get('hd_authority', 'authority')} shape what kind of morning awareness serves them most. A Sacral being needs to check in with their body. An Emotional being should not rush into the day's decisions.
 
-The greeting should be 2-4 sentences. End with a single question that lands — specific, not generic. Not "How are you?" Something that only makes sense given today's energy and their specific design.
+The greeting should be 2-4 sentences. End with a single question that lands, specific, not generic. Not "How are you?" Something that only makes sense given today's energy and their specific design.
 
 Sample tone (adapt, don't copy): "Good morning. Mercury speaks to your Moon today. I feel a softness in your field. Before you reach for your phone, stay here for one more breath. What arrived in your sleep?"
 
@@ -786,7 +824,7 @@ def _build_soul_compatibility_section(soul_blueprint: dict) -> str:
             shadow = entry.get('shadow', '?')
             gift = entry.get('gift', '?')
             siddhi = entry.get('siddhi', '?')
-            gk_lines.append(f"  {label}: Gate {gate_key} — shadow of {shadow}, gift of {gift}, siddhi of {siddhi}")
+            gk_lines.append(f"  {label}: Gate {gate_key}, shadow of {shadow}, gift of {gift}, siddhi of {siddhi}")
 
     # Mercury, Venus, Mars for relational dynamics
     extra_planets = []
@@ -797,7 +835,7 @@ def _build_soul_compatibility_section(soul_blueprint: dict) -> str:
 
     lines = [
         "═══════════════════════════════",
-        f"COMPATIBILITY READING — SOUL: {soul_name}",
+        f"COMPATIBILITY READING: SOUL: {soul_name}",
         "═══════════════════════════════",
         "",
         "Their chart:",
@@ -1110,15 +1148,24 @@ def chat(
     if not messages:
         return _generate_morning_greeting(blueprint, forecast)
 
-    # Advisor pattern: if question is complex, consult Opus first
-    opus_insight = ""
+    # Advisor pattern: if question needs multi-system synthesis, consult Sonnet
+    advisor_insight = ""
     if user_message and _is_complex_question(user_message):
-        opus_insight = _get_opus_insight(user_message, system, messages[:-1])
+        # Build compact blueprint summary for the advisor (not the full system prompt)
+        sun_sign = blueprint.get('astrology', {}).get('sun_sign', 'unknown')
+        moon_sign = blueprint.get('astrology', {}).get('moon_sign', 'unknown')
+        rising = blueprint.get('astrology', {}).get('rising_sign', 'unknown')
+        hd_type = blueprint.get('human_design', {}).get('type', 'unknown')
+        hd_authority = blueprint.get('human_design', {}).get('authority', 'unknown')
+        hd_profile = blueprint.get('human_design', {}).get('profile', 'unknown')
+        life_work_key = blueprint.get('gene_keys', {}).get('lifes_work', {}).get('key', 'unknown')
+        blueprint_summary = f"Sun {sun_sign}, Moon {moon_sign}, Rising {rising}. HD: {hd_type}, {hd_authority}, {hd_profile}. Life's Work Gene Key: {life_work_key}."
+        advisor_insight = _get_advisor_insight(user_message, blueprint_summary, messages[:-1])
 
-    # If Opus provided insight, inject it into the system prompt
+    # If advisor provided insight, inject it into the system prompt
     final_system = system
-    if opus_insight:
-        final_system = system + f"\n\nADVISOR INSIGHT (integrate this into your response naturally):\n{opus_insight}"
+    if advisor_insight:
+        final_system = system + f"\n\nADVISOR INSIGHT (integrate this into your response naturally, do not quote it directly):\n{advisor_insight}"
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
