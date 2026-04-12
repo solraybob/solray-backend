@@ -232,15 +232,15 @@ def get_tz_offset(lat: float, lon: float, birth_date: str, birth_time: str) -> f
 
 def _user_profile(user: User) -> dict:
     return {
-        'id':         user.id,
-        'email':      user.email,
-        'username':   user.username,
-        'name':       user.name,
-        'birth_date': user.birth_date,
-        'birth_time': user.birth_time,
-        'birth_city': user.birth_city,
-        'birth_lat':  user.birth_lat,
-        'birth_lon':  user.birth_lon,
+        'id':            user.id,
+        'email':         user.email,
+        'username':      user.username,
+        'name':          user.name,
+        'birth_date':    user.birth_date,
+        'birth_time':    user.birth_time,
+        'birth_city':    user.birth_city,
+        'birth_lat':     user.birth_lat,
+        'birth_lon':     user.birth_lon,
         'sex':           getattr(user, 'sex', None),
         'profile_photo': getattr(user, 'profile_photo', None),
         'created_at':    user.created_at.isoformat() if user.created_at else None,
@@ -450,6 +450,7 @@ async def update_profile(
     await db.refresh(user)
     return {'name': user.name, 'username': user.username}
 
+
 # ---------------------------------------------------------------------------
 # PATCH /users/photo
 # ---------------------------------------------------------------------------
@@ -468,9 +469,11 @@ async def update_photo(
     if not user:
         raise HTTPException(status_code=404, detail='User not found')
 
+    # Basic validation: must be a data URI image
     if not req.photo.startswith('data:image/'):
         raise HTTPException(status_code=400, detail='Photo must be a base64 image data URI')
 
+    # Limit size to ~2MB (base64 ~2.7MB raw max, which covers a reasonable profile photo)
     if len(req.photo) > 3_000_000:
         raise HTTPException(status_code=413, detail='Photo too large. Please use an image under 2MB.')
 
@@ -937,13 +940,14 @@ async def list_souls(
         result.append({
             'connection_id': conn.id,
             'soul': {
-                'id':         other_user.id,
-                'username':   other_user.username,
-                'name':       other_user.name,
-                'sun_sign':   sun_sign,
-                'moon_sign':  moon_sign,
-                'hd_type':    hd_type,
-                'hd_profile': hd_profile,
+                'id':            other_user.id,
+                'username':      other_user.username,
+                'name':          other_user.name,
+                'sun_sign':      sun_sign,
+                'moon_sign':     moon_sign,
+                'hd_type':       hd_type,
+                'hd_profile':    hd_profile,
+                'profile_photo': getattr(other_user, 'profile_photo', None),
             },
             'connected_since': conn.created_at.isoformat(),
         })
