@@ -84,6 +84,8 @@ def build_blueprint(
     gene_keys = get_full_gene_keys_profile(
         active_gates=hd_chart['active_gates'],
         todays_gates=hd_chart['todays_gates'],
+        conscious=hd_chart['conscious_chart'],
+        unconscious=hd_chart['unconscious_chart'],
     )
 
     # --- Assemble Blueprint ---

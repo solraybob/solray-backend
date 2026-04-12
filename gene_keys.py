@@ -133,16 +133,61 @@ def get_todays_gene_keys(sun_gate: int, earth_gate: int) -> dict:
     }
 
 
-def get_full_gene_keys_profile(active_gates: list, todays_gates: dict = None) -> dict:
+def get_hologenetic_profile(conscious: dict, unconscious: dict) -> dict:
+    """
+    Compute the Gene Keys Hologenetic Profile spheres from birth chart data.
+
+    Activation Sequence (4 core spheres — Richard Rudd's system):
+      Life's Work  = Conscious (Personality) Sun gate
+      Evolution    = Conscious (Personality) Earth gate
+      Radiance     = Unconscious (Design) Sun gate
+      Purpose      = Unconscious (Design) Earth gate
+
+    Venus Sequence (3 relational spheres):
+      Attraction   = Conscious Venus gate
+      IQ           = Conscious South Node gate
+      EQ           = Conscious Moon gate
+
+    Reference: Richard Rudd, "Gene Keys" (2013), Hologenetic Profile system.
+    """
+    def _sphere(planet: str, chart: dict):
+        gate = chart.get(planet, {}).get('gate') if chart else None
+        if not gate or gate not in GENE_KEYS:
+            return None
+        gk = GENE_KEYS[gate]
+        return {'gate': gate, 'shadow': gk['shadow'], 'gift': gk['gift'], 'siddhi': gk['siddhi']}
+
+    return {
+        # Activation Sequence
+        'lifes_work':  _sphere('Sun',       conscious),
+        'evolution':   _sphere('Earth',     conscious),
+        'radiance':    _sphere('Sun',       unconscious),   # Design Sun, NOT Conscious Moon
+        'purpose':     _sphere('Earth',     unconscious),   # Design Earth
+        # Venus Sequence
+        'attraction':  _sphere('Venus',     conscious),
+        'iq':          _sphere('SouthNode', conscious),
+        'eq':          _sphere('Moon',      conscious),
+    }
+
+
+def get_full_gene_keys_profile(
+    active_gates: list,
+    todays_gates: dict = None,
+    conscious: dict = None,
+    unconscious: dict = None,
+) -> dict:
     """
     Main entry point for Gene Keys engine.
-    
+
     Args:
-        active_gates: list of active gate numbers from Human Design chart
-        todays_gates: dict from human_design.get_today_active_gates()
-    
+        active_gates:  list of active gate numbers from Human Design chart
+        todays_gates:  dict from human_design.get_today_active_gates()
+        conscious:     conscious_chart dict from Human Design calculation
+        unconscious:   unconscious_chart dict from Human Design calculation
+
     Returns:
-        Full Gene Keys profile with natal activations + today's active keys.
+        Full Gene Keys profile with Hologenetic Profile spheres,
+        natal activations, and today's active keys.
     """
     natal_gene_keys = get_gene_keys_for_gates(active_gates)
 
@@ -150,6 +195,15 @@ def get_full_gene_keys_profile(active_gates: list, todays_gates: dict = None) ->
         'natal_gene_keys': natal_gene_keys,
         'natal_active_count': len(natal_gene_keys),
     }
+
+    # Hologenetic Profile spheres (requires conscious/unconscious chart data)
+    if conscious and unconscious:
+        result['hologenetic_profile'] = get_hologenetic_profile(conscious, unconscious)
+        # Flatten the 4 Activation Sequence spheres to top-level for easy access
+        hp = result['hologenetic_profile']
+        for key in ('lifes_work', 'evolution', 'radiance', 'purpose', 'attraction', 'iq', 'eq'):
+            if hp.get(key):
+                result[key] = hp[key]
 
     if todays_gates:
         today_sun = todays_gates.get('sun_gate')

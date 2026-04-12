@@ -192,14 +192,17 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     cc = hd.get('conscious_chart', {})
     uc = hd.get('unconscious_chart', {})
 
-    # Structure 1: direct keys (lifes_work, evolution, radiance, vocation, culture, pearl)
+    # Structure 1: Hologenetic Profile spheres (computed directly in gene_keys engine)
     sphere_map = [
-        ("Life's Work",  gk.get('lifes_work')  or gk.get('lifes_work')),
-        ("Evolution",    gk.get('evolution')),
-        ("Radiance",     gk.get('radiance')),
-        ("Vocation",     gk.get('vocation')),
-        ("Culture",      gk.get('culture')),
-        ("Pearl",        gk.get('pearl')),
+        # Activation Sequence
+        ("Life's Work", gk.get('lifes_work')),
+        ("Evolution",   gk.get('evolution')),
+        ("Radiance",    gk.get('radiance')),    # Design Sun
+        ("Purpose",     gk.get('purpose')),     # Design Earth
+        # Venus Sequence
+        ("Attraction",  gk.get('attraction')),  # Conscious Venus
+        ("IQ",          gk.get('iq')),          # Conscious South Node
+        ("EQ",          gk.get('eq')),          # Conscious Moon
     ]
     for label, entry in sphere_map:
         if entry and isinstance(entry, dict):
@@ -215,12 +218,15 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     # Structure 2: natal_gene_keys dict keyed by gate number (fallback)
     if not top_shadows and natal_gk:
         profile_gates = [
-            ("Life's Work", str(cc.get('Sun',     {}).get('gate', ''))),
-            ("Evolution",   str(cc.get('Earth',   {}).get('gate', ''))),
-            ("Radiance",    str(cc.get('Moon',    {}).get('gate', ''))),
-            ("Vocation",    str(uc.get('Earth',   {}).get('gate', '') if uc else '')),
-            ("Culture",     str(uc.get('Jupiter', {}).get('gate', '') if uc else '')),
-            ("Pearl",       str(uc.get('Moon',    {}).get('gate', '') if uc else '')),
+            # Activation Sequence (core 4)
+            ("Life's Work", str(cc.get('Sun',       {}).get('gate', ''))),
+            ("Evolution",   str(cc.get('Earth',     {}).get('gate', ''))),
+            ("Radiance",    str(uc.get('Sun',       {}).get('gate', '') if uc else '')),  # Design Sun
+            ("Purpose",     str(uc.get('Earth',     {}).get('gate', '') if uc else '')),  # Design Earth
+            # Venus Sequence
+            ("Attraction",  str(cc.get('Venus',     {}).get('gate', ''))),
+            ("IQ",          str(cc.get('SouthNode', {}).get('gate', ''))),
+            ("EQ",          str(cc.get('Moon',      {}).get('gate', ''))),
         ]
         for label, gate_key in profile_gates:
             if gate_key and gate_key in natal_gk:
@@ -327,7 +333,7 @@ Important: Earth is always exactly opposite the Sun. If Sun is in Virgo, Earth i
 Nodes, Saturn, Pluto, and angles (ASC, DSC, MC, IC) as structural pillars of life themes.
 Transits and progressions when provided.
 Human Design: Type, Authority, Strategy, Profile, defined centres, key gates and channels.
-Gene Keys: Sphere themes (Life's Work, Evolution, Radiance, Purpose, Culture, Pearl), Shadow, Gift, Siddhi.
+Gene Keys: Hologenetic Profile spheres. Activation Sequence: Life's Work (Conscious Sun), Evolution (Conscious Earth), Radiance (Design Sun), Purpose (Design Earth). Venus Sequence: Attraction (Venus), IQ (South Node), EQ (Moon). Each sphere has a Shadow, Gift, and Siddhi frequency.
 If a modality is not provided, say so and proceed with what you have.
 
 HOW TO ANSWER:
