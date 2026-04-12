@@ -136,24 +136,64 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     else:
         defined_centres = []
 
-    # Gene Keys profile
+    # Gene Keys profile — read from both blueprint structures
     top_shadows = []
     natal_gk = gk.get('natal_gene_keys', {})
     cc = hd.get('conscious_chart', {})
     uc = hd.get('unconscious_chart', {})
-    profile_gates = [
-        ('Life\'s Work', str(cc.get('Sun', {}).get('gate', ''))),
-        ('Evolution', str(cc.get('Earth', {}).get('gate', ''))),
-        ('Radiance', str(cc.get('Moon', {}).get('gate', ''))),
-        ('Purpose', str(uc.get('Earth', {}).get('gate', ''))),
-        ('Culture', str(uc.get('Jupiter', {}).get('gate', '') if uc else '')),
+
+    # Structure 1: direct keys (lifes_work, evolution, radiance, vocation, culture, pearl)
+    sphere_map = [
+        ("Life's Work",  gk.get('lifes_work')  or gk.get('lifes_work')),
+        ("Evolution",    gk.get('evolution')),
+        ("Radiance",     gk.get('radiance')),
+        ("Vocation",     gk.get('vocation')),
+        ("Culture",      gk.get('culture')),
+        ("Pearl",        gk.get('pearl')),
     ]
-    for label, gate_key in profile_gates:
-        if gate_key and gate_key in natal_gk:
-            entry = natal_gk[gate_key]
+    for label, entry in sphere_map:
+        if entry and isinstance(entry, dict):
+            gate   = entry.get('gate', '?')
             shadow = entry.get('shadow', '?')
-            gift = entry.get('gift', '?')
-            top_shadows.append(f"{label} Gate {gate_key}: shadow of {shadow}, gift of {gift}")
+            gift   = entry.get('gift',   '?')
+            siddhi = entry.get('siddhi', '')
+            line   = f"{label} Gate {gate}: shadow of {shadow}, gift of {gift}"
+            if siddhi:
+                line += f", siddhi of {siddhi}"
+            top_shadows.append(line)
+
+    # Structure 2: natal_gene_keys dict keyed by gate number (fallback)
+    if not top_shadows and natal_gk:
+        profile_gates = [
+            ("Life's Work", str(cc.get('Sun',     {}).get('gate', ''))),
+            ("Evolution",   str(cc.get('Earth',   {}).get('gate', ''))),
+            ("Radiance",    str(cc.get('Moon',    {}).get('gate', ''))),
+            ("Vocation",    str(uc.get('Earth',   {}).get('gate', '') if uc else '')),
+            ("Culture",     str(uc.get('Jupiter', {}).get('gate', '') if uc else '')),
+            ("Pearl",       str(uc.get('Moon',    {}).get('gate', '') if uc else '')),
+        ]
+        for label, gate_key in profile_gates:
+            if gate_key and gate_key in natal_gk:
+                entry  = natal_gk[gate_key]
+                shadow = entry.get('shadow', '?')
+                gift   = entry.get('gift',   '?')
+                siddhi = entry.get('siddhi', '')
+                line   = f"{label} Gate {gate_key}: shadow of {shadow}, gift of {gift}"
+                if siddhi:
+                    line += f", siddhi of {siddhi}"
+                top_shadows.append(line)
+
+    # HD defined channels
+    raw_channels = hd.get('defined_channels', [])
+    channel_lines = []
+    for ch in raw_channels:
+        if isinstance(ch, list) and len(ch) >= 3:
+            channel_lines.append(f"  Channel {ch[0]}-{ch[1]}: {ch[2]}")
+        elif isinstance(ch, dict):
+            channel_lines.append(f"  Channel {ch.get('gate_a',ch.get('gate_a','?'))}-{ch.get('gate_b','?')}: {ch.get('name','')}")
+        elif isinstance(ch, str):
+            channel_lines.append(f"  {ch}")
+    channels_text = "\n".join(channel_lines) if channel_lines else "  (No defined channels)"
 
     # Authority-specific decision reminders
     authority_guidance = {
@@ -248,24 +288,34 @@ ASTROLOGY:
 Sun in {sun_sign}. Moon in {moon_sign}. Rising {rising}.
 {_format_key_planets(planets)}
 
-HUMAN DESIGN:
-Type: {hd_type}. Strategy: {strategy}. Authority: {authority}. Profile: {profile}.
-Incarnation Cross: {incarnation_cross}.
-Defined centres: {', '.join(defined_centres) if defined_centres else 'None identified'}.
+EXTENDED CHART POINTS (asteroids, nodes, angles):
+{_format_extended_points(blueprint)}
 
-AUTHORITY, this is critical:
-{authority_note}
+{_format_house_signs(blueprint)}
 
-GENE KEYS, their shadow and gift map:
-{chr(10).join(top_shadows) if top_shadows else 'See natal chart for active gates.'}
-
-{_format_numerology(blueprint)}
+STELLIUMS AND CHART PATTERNS:
+{_format_stelliums(blueprint)}
 
 NATAL ASPECTS (tightest orbs):
 {natal_aspects_section}
 
 IMPORTANT. NATAL ASPECTS INSTRUCTION:
 You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you don't know their aspects — you have them all. Name the actual planets involved.
+
+HUMAN DESIGN:
+Type: {hd_type}. Strategy: {strategy}. Authority: {authority}. Profile: {profile}.
+Incarnation Cross: {incarnation_cross}.
+Defined centres: {', '.join(defined_centres) if defined_centres else 'None identified'}.
+Defined channels:
+{channels_text}
+
+AUTHORITY, this is critical:
+{authority_note}
+
+GENE KEYS, all six spheres with shadow, gift, and siddhi:
+{chr(10).join(top_shadows) if top_shadows else 'Gene Keys data not yet calculated for this user.'}
+
+{_format_numerology(blueprint)}
 
 {_format_astrocartography(blueprint)}
 
@@ -355,8 +405,15 @@ def _format_astrocartography(blueprint: dict) -> str:
 
 
 def _format_numerology(blueprint: dict) -> str:
-    """Format numerology context for the system prompt."""
-    num = blueprint.get('numerology')
+    """Format numerology context for the system prompt.
+
+    Handles both top-level 'numerology' key and nested structures.
+    Uses 'is not None' checks so a value of 0 is still displayed.
+    """
+    # Try top-level first, then nested under meta or user
+    num = (blueprint.get('numerology')
+           or blueprint.get('meta', {}).get('numerology')
+           or blueprint.get('user', {}).get('numerology'))
     if not num:
         return ""
     short = num.get('short_meanings', {})
@@ -366,14 +423,15 @@ def _format_numerology(blueprint: dict) -> str:
     py = num.get('personal_year')
     yr = num.get('current_year', '')
     lines = ["NUMEROLOGY:"]
-    if lp:
-        lines.append(f"  Life Path: {lp} — {short.get(str(lp), '')}")
-    if ex:
-        lines.append(f"  Expression: {ex} — {short.get(str(ex), '')}")
-    if su:
-        lines.append(f"  Soul Urge: {su} — {short.get(str(su), '')}")
-    if py:
-        lines.append(f"  Personal Year {yr}: {py} — {short.get(str(py), '')}")
+    # Use 'is not None' so a value of 0 doesn't silently disappear
+    if lp is not None:
+        lines.append(f"  Life Path {lp}: {short.get(str(lp), 'core life direction')}")
+    if ex is not None:
+        lines.append(f"  Expression {ex}: {short.get(str(ex), 'natural talents and abilities')}")
+    if su is not None:
+        lines.append(f"  Soul Urge {su}: {short.get(str(su), 'what the heart desires')}")
+    if py is not None:
+        lines.append(f"  Personal Year {py} (in {yr}): {short.get(str(py), 'current yearly energy')}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
@@ -479,6 +537,26 @@ def _format_key_planets(planets: dict) -> str:
             else:
                 lines.append(f"  {planet}: {sign} {deg:.1f} house {house}{retro}")
     return "\n".join(lines) if lines else "  (Planets not yet calculated)"
+
+
+def _format_house_signs(blueprint: dict) -> str:
+    """Format which zodiac sign sits on each house cusp."""
+    natal = blueprint.get('astrology', {}).get('natal', {})
+    signs_list = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+                  "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
+    # house_cusps may be list of longitudes or list of dicts
+    cusps_raw = natal.get('house_cusps', [])
+    if not cusps_raw:
+        return ""
+    lines = ["HOUSE SIGNS (sign on each house cusp):"]
+    for i, cusp in enumerate(cusps_raw[:12], start=1):
+        lon = cusp if isinstance(cusp, (int, float)) else cusp.get('longitude', cusp.get('cusp', None))
+        if lon is not None:
+            sign = signs_list[int(float(lon) // 30) % 12]
+            deg  = float(lon) % 30
+            label = {1: "ASC", 4: "IC", 7: "DSC", 10: "MC"}.get(i, f"H{i}")
+            lines.append(f"  {label} (House {i}): {sign} {deg:.1f}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _format_forecast_for_chat(forecast: dict) -> str:
