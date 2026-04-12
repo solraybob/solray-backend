@@ -174,7 +174,8 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     authority = summary.get('hd_authority') or hd.get('authority', '?')
     strategy = summary.get('hd_strategy') or hd.get('strategy', '?')
     profile = summary.get('hd_profile') or hd.get('profile', '?')
-    incarnation_cross = summary.get('incarnation_cross') or str(hd.get('incarnation_cross', '?'))
+    _ic_raw = hd.get('incarnation_cross', {})
+    incarnation_cross = (summary.get('incarnation_cross') or ((_ic_raw.get('name') or _ic_raw.get('label')) if isinstance(_ic_raw, dict) else str(_ic_raw)) or '?')
 
     # defined_centres can be dict or list
     dc_raw = hd.get('defined_centres', {})
@@ -896,7 +897,8 @@ def _build_group_chat_system_prompt(
         authority = summary.get('hd_authority') or hd.get('authority', '?')
         strategy = summary.get('hd_strategy') or hd.get('strategy', '?')
         profile = summary.get('hd_profile') or hd.get('profile', '?')
-        incarnation_cross = summary.get('incarnation_cross') or str(hd.get('incarnation_cross', '?'))
+        _ic_raw = hd.get('incarnation_cross', {})
+        incarnation_cross = (summary.get('incarnation_cross') or ((_ic_raw.get('name') or _ic_raw.get('label')) if isinstance(_ic_raw, dict) else str(_ic_raw)) or '?')
 
         dc_raw = hd.get('defined_centres', {})
         if isinstance(dc_raw, dict):

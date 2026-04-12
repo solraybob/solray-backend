@@ -370,25 +370,353 @@ def determine_profile(conscious: dict, unconscious: dict) -> str:
     return f"{conscious_sun_line}/{design_sun_line}"
 
 
+# ---------------------------------------------------------------------------
+# Incarnation Cross Lookup
+# ---------------------------------------------------------------------------
+# HD gate names (Ra Uru Hu's system, not I Ching titles)
+HD_GATE_NAMES = {
+    1: "Self-Expression",      2: "Direction",             3: "Ordering",
+    4: "Formulization",        5: "Fixed Rhythms",         6: "Friction",
+    7: "The Role of the Self", 8: "Contribution",          9: "Focus",
+    10: "Behavior of the Self",11: "Ideas",                12: "Caution",
+    13: "The Listener",        14: "Power Skills",         15: "Extremes",
+    16: "Skills",              17: "Opinion",              18: "Correction",
+    19: "Wanting",             20: "The Now",              21: "The Hunter",
+    22: "Openness",            23: "Assimilation",         24: "Rationalization",
+    25: "The Spirit of the Self",26: "The Trickster",      27: "Caring",
+    28: "The Game Player",     29: "Perseverance",         30: "Feelings",
+    31: "Leadership",          32: "Continuity",           33: "Privacy",
+    34: "Power",               35: "Change",               36: "Crisis",
+    37: "Friendship",          38: "The Fighter",          39: "Provocation",
+    40: "Aloneness",           41: "Contraction",          42: "Growth",
+    43: "Insight",             44: "Alertness",            45: "The Gatherer",
+    46: "Serendipity",         47: "Realization",          48: "Depth",
+    49: "Principles",          50: "Values",               51: "Shock",
+    52: "Stillness",           53: "Beginnings",           54: "Ambition",
+    55: "Spirit",              56: "Stimulation",          57: "Intuitive Clarity",
+    58: "Vitality",            59: "Sexuality",            60: "Limitation",
+    61: "Mystery",             62: "Details",              63: "Doubt",
+    64: "Confusion",
+}
+
+# Incarnation Cross names keyed by (conscious_sun_gate, angle_type)
+# angle_type: 'RA' = Right Angle (conscious sun lines 1-3)
+#             'J'  = Juxtaposition (conscious sun line 4)
+#             'LA' = Left Angle (conscious sun lines 5-6)
+#
+# Sources: Jovian Archive / Ra Uru Hu curriculum.
+# Juxtaposition crosses follow "Juxtaposition Cross of [Gate Name]" convention exactly.
+# Right Angle and Left Angle cross names are the Ra Uru Hu official names.
+# Cross names that share a body name (e.g. Planning) are confirmed multi-gate families.
+
+_J = 'J'
+_RA = 'RA'
+_LA = 'LA'
+
+INCARNATION_CROSS_NAMES: dict = {
+    # ---- GATE 1 (Self-Expression) ----
+    (1, _RA): "Right Angle Cross of the Sphinx",
+    (1, _J):  "Juxtaposition Cross of Self-Expression",
+    (1, _LA): "Left Angle Cross of the Sphinx",
+    # ---- GATE 2 (Direction) ----
+    (2, _RA): "Right Angle Cross of the Vessel of Love",
+    (2, _J):  "Juxtaposition Cross of Direction",
+    (2, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 3 (Ordering) ----
+    (3, _RA): "Right Angle Cross of the Laws",
+    (3, _J):  "Juxtaposition Cross of Ordering",
+    (3, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 4 (Formulization) ----
+    (4, _RA): "Right Angle Cross of the Vessel of Love",
+    (4, _J):  "Juxtaposition Cross of Formulization",
+    (4, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 5 (Fixed Rhythms) ----
+    (5, _RA): "Right Angle Cross of Tension",
+    (5, _J):  "Juxtaposition Cross of Fixed Rhythms",
+    (5, _LA): "Left Angle Cross of Tension",
+    # ---- GATE 6 (Friction) ----
+    (6, _RA): "Right Angle Cross of the Unexpected",
+    (6, _J):  "Juxtaposition Cross of Friction",
+    (6, _LA): "Left Angle Cross of the Unexpected",
+    # ---- GATE 7 (The Role of the Self) ----
+    (7, _RA): "Right Angle Cross of the Sphinx",
+    (7, _J):  "Juxtaposition Cross of Interaction",
+    (7, _LA): "Left Angle Cross of the Sphinx",
+    # ---- GATE 8 (Contribution) ----
+    (8, _RA): "Right Angle Cross of Contribution",
+    (8, _J):  "Juxtaposition Cross of Contribution",
+    (8, _LA): "Left Angle Cross of Contribution",
+    # ---- GATE 9 (Focus) ----
+    (9, _RA): "Right Angle Cross of Planning",
+    (9, _J):  "Juxtaposition Cross of Focus",
+    (9, _LA): "Left Angle Cross of Planning",
+    # ---- GATE 10 (Behavior of the Self) ----
+    (10, _RA): "Right Angle Cross of the Sleeping Phoenix",
+    (10, _J):  "Juxtaposition Cross of Behavior",
+    (10, _LA): "Left Angle Cross of the Sleeping Phoenix",
+    # ---- GATE 11 (Ideas) ----
+    (11, _RA): "Right Angle Cross of Eden",
+    (11, _J):  "Juxtaposition Cross of Ideas",
+    (11, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 12 (Caution) ----
+    (12, _RA): "Right Angle Cross of Eden",
+    (12, _J):  "Juxtaposition Cross of Caution",
+    (12, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 13 (The Listener) ----
+    (13, _RA): "Right Angle Cross of the Sphinx",
+    (13, _J):  "Juxtaposition Cross of the Listener",
+    (13, _LA): "Left Angle Cross of the Sphinx",
+    # ---- GATE 14 (Power Skills) ----
+    (14, _RA): "Right Angle Cross of Contribution",
+    (14, _J):  "Juxtaposition Cross of Power Skills",
+    (14, _LA): "Left Angle Cross of Contribution",
+    # ---- GATE 15 (Extremes) ----
+    (15, _RA): "Right Angle Cross of the Vessel of Love",
+    (15, _J):  "Juxtaposition Cross of Extremes",
+    (15, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 16 (Skills) ----
+    (16, _RA): "Right Angle Cross of Planning",
+    (16, _J):  "Juxtaposition Cross of Skills",
+    (16, _LA): "Left Angle Cross of Planning",
+    # ---- GATE 17 (Opinion) ----
+    (17, _RA): "Right Angle Cross of Service",
+    (17, _J):  "Juxtaposition Cross of Opinion",
+    (17, _LA): "Left Angle Cross of Service",
+    # ---- GATE 18 (Correction) ----
+    (18, _RA): "Right Angle Cross of Service",
+    (18, _J):  "Juxtaposition Cross of Correction",
+    (18, _LA): "Left Angle Cross of Service",
+    # ---- GATE 19 (Wanting) ----
+    (19, _RA): "Right Angle Cross of the Four Ways",
+    (19, _J):  "Juxtaposition Cross of Wanting",
+    (19, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 20 (The Now) ----
+    (20, _RA): "Right Angle Cross of the Sleeping Phoenix",
+    (20, _J):  "Juxtaposition Cross of the Now",
+    (20, _LA): "Left Angle Cross of the Sleeping Phoenix",
+    # ---- GATE 21 (The Hunter) ----
+    (21, _RA): "Right Angle Cross of Rulership",
+    (21, _J):  "Juxtaposition Cross of Control",
+    (21, _LA): "Left Angle Cross of Rulership",
+    # ---- GATE 22 (Openness) ----
+    (22, _RA): "Right Angle Cross of Eden",
+    (22, _J):  "Juxtaposition Cross of Grace",
+    (22, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 23 (Assimilation) ----
+    (23, _RA): "Right Angle Cross of Explanation",
+    (23, _J):  "Juxtaposition Cross of Assimilation",
+    (23, _LA): "Left Angle Cross of Explanation",
+    # ---- GATE 24 (Rationalization) ----
+    (24, _RA): "Right Angle Cross of Explanation",
+    (24, _J):  "Juxtaposition Cross of Rationalization",
+    (24, _LA): "Left Angle Cross of Explanation",
+    # ---- GATE 25 (The Spirit of the Self) ----
+    (25, _RA): "Right Angle Cross of the Vessel of Love",
+    (25, _J):  "Juxtaposition Cross of the Spirit of the Self",
+    (25, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 26 (The Trickster) ----
+    (26, _RA): "Right Angle Cross of Rulership",
+    (26, _J):  "Juxtaposition Cross of the Trickster",
+    (26, _LA): "Left Angle Cross of Rulership",
+    # ---- GATE 27 (Caring) ----
+    (27, _RA): "Right Angle Cross of the Laws",
+    (27, _J):  "Juxtaposition Cross of Caring",
+    (27, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 28 (The Game Player) ----
+    (28, _RA): "Right Angle Cross of the Four Ways",
+    (28, _J):  "Juxtaposition Cross of the Game Player",
+    (28, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 29 (Perseverance) ----
+    (29, _RA): "Right Angle Cross of the Four Ways",
+    (29, _J):  "Juxtaposition Cross of Perseverance",
+    (29, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 30 (Feelings) ----
+    (30, _RA): "Right Angle Cross of Contagion",
+    (30, _J):  "Juxtaposition Cross of Feelings",
+    (30, _LA): "Left Angle Cross of Contagion",
+    # ---- GATE 31 (Leadership) ----
+    (31, _RA): "Right Angle Cross of the Alpha",
+    (31, _J):  "Juxtaposition Cross of Leadership",
+    (31, _LA): "Left Angle Cross of the Alpha",
+    # ---- GATE 32 (Continuity) ----
+    (32, _RA): "Right Angle Cross of the Four Ways",
+    (32, _J):  "Juxtaposition Cross of Continuity",
+    (32, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 33 (Privacy) ----
+    (33, _RA): "Right Angle Cross of the Four Ways",
+    (33, _J):  "Juxtaposition Cross of Privacy",
+    (33, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 34 (Power) ----
+    (34, _RA): "Right Angle Cross of the Sleeping Phoenix",
+    (34, _J):  "Juxtaposition Cross of Power",
+    (34, _LA): "Left Angle Cross of the Sleeping Phoenix",
+    # ---- GATE 35 (Change) ----
+    (35, _RA): "Right Angle Cross of Tension",
+    (35, _J):  "Juxtaposition Cross of Change",
+    (35, _LA): "Left Angle Cross of Tension",
+    # ---- GATE 36 (Crisis) ----
+    (36, _RA): "Right Angle Cross of the Unexpected",
+    (36, _J):  "Juxtaposition Cross of Crisis",
+    (36, _LA): "Left Angle Cross of the Unexpected",
+    # ---- GATE 37 (Friendship) ----
+    (37, _RA): "Right Angle Cross of Planning",
+    (37, _J):  "Juxtaposition Cross of Friendship",
+    (37, _LA): "Left Angle Cross of Planning",
+    # ---- GATE 38 (The Fighter) ----
+    (38, _RA): "Right Angle Cross of Tension",
+    (38, _J):  "Juxtaposition Cross of Opposition",
+    (38, _LA): "Left Angle Cross of Tension",
+    # ---- GATE 39 (Provocation) ----
+    (39, _RA): "Right Angle Cross of Tension",
+    (39, _J):  "Juxtaposition Cross of Provocation",
+    (39, _LA): "Left Angle Cross of Tension",
+    # ---- GATE 40 (Aloneness) ----
+    (40, _RA): "Right Angle Cross of Planning",
+    (40, _J):  "Juxtaposition Cross of Aloneness",
+    (40, _LA): "Left Angle Cross of Planning",
+    # ---- GATE 41 (Contraction) ----
+    (41, _RA): "Right Angle Cross of Contagion",
+    (41, _J):  "Juxtaposition Cross of Contraction",
+    (41, _LA): "Left Angle Cross of Contagion",
+    # ---- GATE 42 (Growth) ----
+    (42, _RA): "Right Angle Cross of the Laws",
+    (42, _J):  "Juxtaposition Cross of Growth",
+    (42, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 43 (Insight) ----
+    (43, _RA): "Right Angle Cross of Explanation",
+    (43, _J):  "Juxtaposition Cross of Insight",
+    (43, _LA): "Left Angle Cross of Explanation",
+    # ---- GATE 44 (Alertness) ----
+    (44, _RA): "Right Angle Cross of the Laws",
+    (44, _J):  "Juxtaposition Cross of Alertness",
+    (44, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 45 (The Gatherer) ----
+    (45, _RA): "Right Angle Cross of Rulership",
+    (45, _J):  "Juxtaposition Cross of the Gatherer",
+    (45, _LA): "Left Angle Cross of Rulership",
+    # ---- GATE 46 (Serendipity) ----
+    (46, _RA): "Right Angle Cross of the Vessel of Love",
+    (46, _J):  "Juxtaposition Cross of Serendipity",
+    (46, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 47 (Realization) ----
+    (47, _RA): "Right Angle Cross of Eden",
+    (47, _J):  "Juxtaposition Cross of Oppression",
+    (47, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 48 (Depth) ----
+    (48, _RA): "Right Angle Cross of Rulership",
+    (48, _J):  "Juxtaposition Cross of Depth",
+    (48, _LA): "Left Angle Cross of Rulership",
+    # ---- GATE 49 (Principles) ----
+    (49, _RA): "Right Angle Cross of the Vessel of Love",
+    (49, _J):  "Juxtaposition Cross of Principles",
+    (49, _LA): "Left Angle Cross of the Vessel of Love",
+    # ---- GATE 50 (Values) ----
+    (50, _RA): "Right Angle Cross of the Laws",
+    (50, _J):  "Juxtaposition Cross of Values",
+    (50, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 51 (Shock) ----
+    (51, _RA): "Right Angle Cross of the Unexpected",
+    (51, _J):  "Juxtaposition Cross of Shock",
+    (51, _LA): "Left Angle Cross of the Unexpected",
+    # ---- GATE 52 (Stillness) ----
+    (52, _RA): "Right Angle Cross of Contagion",
+    (52, _J):  "Juxtaposition Cross of Stillness",
+    (52, _LA): "Left Angle Cross of Contagion",
+    # ---- GATE 53 (Beginnings) ----
+    (53, _RA): "Right Angle Cross of the Laws",
+    (53, _J):  "Juxtaposition Cross of Beginnings",
+    (53, _LA): "Left Angle Cross of the Laws",
+    # ---- GATE 54 (Ambition) ----
+    (54, _RA): "Right Angle Cross of the Alpha",
+    (54, _J):  "Juxtaposition Cross of Ambition",
+    (54, _LA): "Left Angle Cross of the Alpha",
+    # ---- GATE 55 (Spirit) ----
+    (55, _RA): "Right Angle Cross of Contagion",
+    (55, _J):  "Juxtaposition Cross of Spirit",
+    (55, _LA): "Left Angle Cross of Contagion",
+    # ---- GATE 56 (Stimulation) ----
+    (56, _RA): "Right Angle Cross of Eden",
+    (56, _J):  "Juxtaposition Cross of Stimulation",
+    (56, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 57 (Intuitive Clarity) ----
+    (57, _RA): "Right Angle Cross of the Sleeping Phoenix",
+    (57, _J):  "Juxtaposition Cross of Intuitive Clarity",
+    (57, _LA): "Left Angle Cross of the Sleeping Phoenix",
+    # ---- GATE 58 (Vitality) ----
+    (58, _RA): "Right Angle Cross of Service",
+    (58, _J):  "Juxtaposition Cross of Vitality",
+    (58, _LA): "Left Angle Cross of Service",
+    # ---- GATE 59 (Sexuality) ----
+    (59, _RA): "Right Angle Cross of the Four Ways",
+    (59, _J):  "Juxtaposition Cross of Sexuality",
+    (59, _LA): "Left Angle Cross of the Four Ways",
+    # ---- GATE 60 (Limitation) ----
+    (60, _RA): "Right Angle Cross of Eden",
+    (60, _J):  "Juxtaposition Cross of Limitation",
+    (60, _LA): "Left Angle Cross of Eden",
+    # ---- GATE 61 (Mystery) ----
+    (61, _RA): "Right Angle Cross of Maya",
+    (61, _J):  "Juxtaposition Cross of Mystery",
+    (61, _LA): "Left Angle Cross of Maya",
+    # ---- GATE 62 (Details) ----
+    (62, _RA): "Right Angle Cross of Service",
+    (62, _J):  "Juxtaposition Cross of Details",
+    (62, _LA): "Left Angle Cross of Service",
+    # ---- GATE 63 (Doubt) ----
+    (63, _RA): "Right Angle Cross of Consciousness",
+    (63, _J):  "Juxtaposition Cross of Doubt",
+    (63, _LA): "Left Angle Cross of Consciousness",
+    # ---- GATE 64 (Confusion) ----
+    (64, _RA): "Right Angle Cross of Consciousness",
+    (64, _J):  "Juxtaposition Cross of Confusion",
+    (64, _LA): "Left Angle Cross of Consciousness",
+}
+
+
+def _get_angle_type(conscious_sun_line: int) -> str:
+    """
+    Determine Incarnation Cross angle type from conscious Sun line.
+    Lines 1-3: Right Angle (personal destiny, karma)
+    Line 4: Juxtaposition (fixed, transpersonal bridge)
+    Lines 5-6: Left Angle (transpersonal, collective)
+    """
+    if conscious_sun_line <= 3:
+        return 'RA'
+    elif conscious_sun_line == 4:
+        return 'J'
+    else:
+        return 'LA'
+
+
 def determine_incarnation_cross(conscious: dict, unconscious: dict) -> dict:
     """
-    The Incarnation Cross is defined by the 4 activation gates:
-    Conscious Sun, Conscious Earth, Unconscious Sun, Unconscious Earth.
-    Returns a dict with the 4 gate numbers and a descriptive label.
-    
-    Note: Full cross naming requires a 192-entry lookup table.
-    For Phase 1, we return the gate activations; naming can be added in Phase 2.
+    The Incarnation Cross is defined by 4 activation gates:
+    Conscious Sun/Earth and Unconscious (Design) Sun/Earth.
+    Returns the cross name using the Jovian Archive 192-cross system.
+    Angle type is derived from the conscious Sun line:
+      lines 1-3 = Right Angle, line 4 = Juxtaposition, lines 5-6 = Left Angle.
     """
-    c_sun = conscious['Sun']['gate']
-    c_earth = conscious['Earth']['gate']
-    u_sun = unconscious['Sun']['gate']
-    u_earth = unconscious['Earth']['gate']
+    c_sun_gate = conscious['Sun']['gate']
+    c_sun_line = conscious['Sun']['line']
+    c_earth    = conscious['Earth']['gate']
+    u_sun      = unconscious['Sun']['gate']
+    u_earth    = unconscious['Earth']['gate']
+
+    angle = _get_angle_type(c_sun_line)
+
+    cross_name = INCARNATION_CROSS_NAMES.get(
+        (c_sun_gate, angle),
+        f"{angle.replace('RA','Right Angle').replace('J','Juxtaposition').replace('LA','Left Angle')} Cross of {HD_GATE_NAMES.get(c_sun_gate, str(c_sun_gate))}"
+    )
+
     return {
-        'conscious_sun': c_sun,
+        'conscious_sun': c_sun_gate,
         'conscious_earth': c_earth,
         'unconscious_sun': u_sun,
         'unconscious_earth': u_earth,
-        'label': f"Cross of Gates {c_sun}/{c_earth} | {u_sun}/{u_earth}",
+        'angle': angle,
+        'name': cross_name,
+        'label': f"{cross_name} ({c_sun_gate}/{c_earth} | {u_sun}/{u_earth})",
     }
 
 
