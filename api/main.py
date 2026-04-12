@@ -241,8 +241,9 @@ def _user_profile(user: User) -> dict:
         'birth_city': user.birth_city,
         'birth_lat':  user.birth_lat,
         'birth_lon':  user.birth_lon,
-        'sex':        getattr(user, 'sex', None),
-        'created_at': user.created_at.isoformat() if user.created_at else None,
+        'sex':           getattr(user, 'sex', None),
+        'profile_photo': getattr(user, 'profile_photo', None),
+        'created_at':    user.created_at.isoformat() if user.created_at else None,
     }
 
 
@@ -448,6 +449,34 @@ async def update_profile(
     await db.commit()
     await db.refresh(user)
     return {'name': user.name, 'username': user.username}
+
+# ---------------------------------------------------------------------------
+# PATCH /users/photo
+# ---------------------------------------------------------------------------
+
+class PhotoUpdateRequest(BaseModel):
+    photo: str  # base64 data URI, e.g. "data:image/jpeg;base64,..."
+
+@app.patch('/users/photo', summary='Upload or update profile photo')
+async def update_photo(
+    req: PhotoUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store the user's profile photo as a base64 data URI so it syncs across devices."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    if not req.photo.startswith('data:image/'):
+        raise HTTPException(status_code=400, detail='Photo must be a base64 image data URI')
+
+    if len(req.photo) > 3_000_000:
+        raise HTTPException(status_code=413, detail='Photo too large. Please use an image under 2MB.')
+
+    user.profile_photo = req.photo
+    await db.commit()
+    return {'ok': True}
 
 # ---------------------------------------------------------------------------
 # GET /users/search

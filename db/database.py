@@ -109,6 +109,7 @@ class User(Base):
     birth_lat     = Column(Float,       nullable=True)
     birth_lon     = Column(Float,       nullable=True)
     sex           = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
+    profile_photo = Column(Text,        nullable=True)    # base64 data URI
     created_at    = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
     blueprint     = relationship('Blueprint', back_populates='user', uselist=False, cascade='all, delete-orphan')
@@ -204,6 +205,20 @@ async def init_db():
         except Exception as e:
             # Don't block startup if migration fails — log and continue
             print(f"[init_db] sex column migration note: {e}")
+
+        # profile_photo column (TEXT) — syncs avatar across devices
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_photo TEXT"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'profile_photo' not in cols:
+                    await conn.execute(text("ALTER TABLE users ADD COLUMN profile_photo TEXT"))
+        except Exception as e:
+            print(f"[init_db] profile_photo column migration note: {e}")
 
 
 # ---------------------------------------------------------------------------
