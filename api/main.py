@@ -1242,6 +1242,47 @@ async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.post('/admin/recalculate-all', summary="Recalculate blueprints for every user (admin only)")
+async def recalculate_all_blueprints(db: AsyncSession = Depends(get_db)):
+    """
+    Recalculate and overwrite the stored blueprint for every user in the database.
+    Use after a calculation engine fix to flush stale cached blueprints.
+    """
+    from sqlalchemy import select as sa_select
+    results = []
+    users_result = await db.execute(sa_select(User))
+    users = users_result.scalars().all()
+    for user in users:
+        try:
+            from astrology import geocode_city
+            try:
+                lat, lon = geocode_city(user.birth_city)
+            except Exception:
+                lat, lon = user.birth_lat, user.birth_lon
+            tz_offset = get_tz_offset(lat, lon, user.birth_date, user.birth_time)
+            blueprint = engines.build_blueprint(
+                birth_date=user.birth_date,
+                birth_time=user.birth_time,
+                birth_city=user.birth_city,
+                birth_lat=lat,
+                birth_lon=lon,
+                tz_offset=tz_offset,
+            )
+            await upsert_blueprint(db, user.id, blueprint)
+            hd = blueprint.get('human_design', {})
+            results.append({
+                'email': user.email,
+                'name': user.name,
+                'type': hd.get('type'),
+                'profile': hd.get('profile'),
+                'incarnation_cross': blueprint.get('summary', {}).get('incarnation_cross'),
+                'status': 'ok',
+            })
+        except Exception as e:
+            results.append({'email': user.email, 'status': 'error', 'error': str(e)})
+    return {'recalculated': len(results), 'results': results}
+
+
 @app.get('/astrocartography', summary="Get astrocartography lines for the authenticated user")
 async def astrocartography(
     user_id: str = Depends(get_current_user_id),
