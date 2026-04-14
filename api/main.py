@@ -646,7 +646,7 @@ async def search_users_endpoint(
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
     refresh: bool = False,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),  # Force redeploy
     db: AsyncSession = Depends(get_db),
 ):
     """
