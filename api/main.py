@@ -1920,3 +1920,4 @@ async def push_subscribe(
         pass
 
     return {'subscribed': True}
+# Force redeploy Tue Apr 14 18:15:01 CEST 2026
