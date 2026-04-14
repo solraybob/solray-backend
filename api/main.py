@@ -19,8 +19,11 @@ Run with:
 import sys
 import os
 import uuid
+import logging
 from datetime import date, datetime
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Sentry — Error Monitoring (graceful: no-op if SENTRY_DSN not set)
@@ -74,6 +77,15 @@ from ai.chat import chat as higher_self_chat, group_chat as group_higher_self_ch
 from energy_calculator import calculate_energy_scores
 from lunar import get_upcoming_lunar_event
 
+# Payments
+from payments.subscription_manager import (
+    get_subscription, start_trial, attach_card,
+    convert_trial_to_active, cancel_subscription, has_premium_access,
+)
+from payments.teya_client import teya, TeyaError
+from payments.feature_gate import require_premium
+from email_service import generate_verification_token, send_verification_email
+
 # ---------------------------------------------------------------------------
 # App Setup
 # ---------------------------------------------------------------------------
@@ -86,10 +98,18 @@ app = FastAPI(
     redoc_url='/redoc',
 )
 
-# CORS — allow all origins in dev; tighten for production
+# Admin email list for authorization checks
+ADMIN_EMAILS = {"kristjangilbert@gmail.com"}
+
+# CORS — restrict to known frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=[
+        "https://app.solray.ai",
+        "https://solray.ai",
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ],
     allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
@@ -98,8 +118,34 @@ app.add_middleware(
 
 @app.on_event('startup')
 async def startup():
-    """Initialise DB tables on first start."""
+    """Initialise DB tables on first start, kick off billing scheduler."""
     await init_db()
+    # Start the background billing loop (checks every 60 min)
+    import asyncio
+    from payments.billing_scheduler import billing_loop
+    asyncio.create_task(billing_loop(interval_minutes=60))
+
+
+# ---------------------------------------------------------------------------
+# Admin Authorization Helper
+# ---------------------------------------------------------------------------
+
+async def require_admin(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> str:
+    """
+    Dependency for admin-only endpoints.
+    Verifies that the authenticated user has admin privileges.
+    Returns user_id if authorized, raises HTTPException 403 otherwise.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user or user.email not in ADMIN_EMAILS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Admin access required'
+        )
+    return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +343,9 @@ async def register(
         elif s in ('female', 'f'):
             sex_clean = 'female'
 
-    # Create user row
+    # Create user row with verification token
     user_id = str(uuid.uuid4())
+    v_token = generate_verification_token()
     user = await create_user(db, {
         'id':            user_id,
         'email':         req.email,
@@ -311,6 +358,8 @@ async def register(
         'birth_lat':     birth_lat,
         'birth_lon':     birth_lon,
         'sex':           sex_clean,
+        'email_verified': False,
+        'verification_token': v_token,
     })
 
     # Auto-detect timezone from coordinates (ignores any client-supplied tz_offset)
@@ -328,12 +377,13 @@ async def register(
         )
     except Exception as e:
         # Blueprint calculation failed — user is created but without blueprint
-        # Capture to Sentry for debugging
+        # Log the error and capture to Sentry for debugging
+        logger.exception(f"Blueprint calculation failed during registration for {req.email}")
         try:
             import sentry_sdk as _sentry
             _sentry.capture_exception(e)
         except Exception:
-            pass
+            logger.warning("Sentry not available for error reporting")
         raise HTTPException(
             status_code=500,
             detail=f'User created but blueprint calculation failed: {str(e)}'
@@ -341,6 +391,12 @@ async def register(
 
     # Store blueprint
     await upsert_blueprint(db, user_id, blueprint)
+
+    # Send verification email (non-blocking: don't fail registration if email fails)
+    try:
+        await send_verification_email(req.email, req.name, v_token)
+    except Exception as e:
+        logger.warning("[register] Verification email failed for %s: %s", req.email, e)
 
     # Issue JWT
     token = create_access_token(user_id=user_id, email=req.email)
@@ -350,6 +406,7 @@ async def register(
         'token':     token,
         'profile':   _user_profile(user),
         'blueprint': blueprint,
+        'email_verified': False,
     }
 
 
@@ -377,12 +434,69 @@ async def login(
     return {
         "token": token,
         "user_id": user.id,
+        "email_verified": bool(user.email_verified),
         "user": {
             "id": user.id,
             "email": user.email,
             "name": user.name,
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# Email Verification
+# ---------------------------------------------------------------------------
+
+@app.get('/users/verify-email', summary='Verify email address via token')
+async def verify_email(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Called when the user clicks the link in their verification email."""
+    from sqlalchemy import update as sql_update
+    from db.database import User as UserModel
+
+    result = await db.execute(
+        select(UserModel).where(UserModel.verification_token == token)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification link.")
+
+    if user.email_verified:
+        return {"message": "Email already verified.", "email_verified": True}
+
+    user.email_verified = True
+    user.verification_token = None
+    await db.commit()
+
+    return {"message": "Email verified successfully.", "email_verified": True}
+
+
+@app.post('/users/resend-verification', summary='Resend the verification email')
+async def resend_verification(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a fresh verification email. Generates a new token each time."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    if user.email_verified:
+        return {"message": "Email already verified.", "email_verified": True}
+
+    # Generate a fresh token
+    new_token = generate_verification_token()
+    user.verification_token = new_token
+    await db.commit()
+
+    sent = await send_verification_email(user.email, user.name, new_token)
+    if not sent:
+        raise HTTPException(status_code=502, detail="Could not send verification email. Please try again.")
+
+    return {"message": "Verification email sent."}
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +530,7 @@ async def get_me(
     return {
         'profile':   _user_profile(user),
         'blueprint': blueprint,
+        'email_verified': bool(user.email_verified),
     }
 
 
@@ -531,7 +646,7 @@ async def search_users_endpoint(
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
     refresh: bool = False,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -584,11 +699,12 @@ async def forecast_today(
             ai_forecast = generate_daily_forecast(blueprint, forecast_data)
         except Exception as e:
             # AI generation failed — fall back to raw forecast data
+            logger.exception(f"AI forecast generation failed for user {user_id}")
             try:
                 import sentry_sdk as _sentry
                 _sentry.capture_exception(e)
             except Exception:
-                pass
+                logger.warning("Sentry not available for error reporting")
             ai_forecast = {'_ai_error': str(e)}
 
     # Merge: AI fields + raw data for richer access
@@ -734,7 +850,7 @@ async def calculate_soul_blueprint(req: SoulBlueprintRequest):
 @app.post('/souls/invite', summary='Invite someone as a soul connection', status_code=201)
 async def invite_soul(
     req: SoulInviteRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -962,7 +1078,7 @@ async def list_souls(
 @app.get('/souls/{soul_id}/synergy', summary='Synergy reading between self and a soul connection')
 async def soul_synergy(
     soul_id: str,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1063,7 +1179,7 @@ async def soul_blueprint_for_chat(
 @app.post('/chat/group', summary='Group compatibility chat with a soul connection')
 async def group_chat_endpoint(
     req: GroupChatRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1109,11 +1225,12 @@ async def group_chat_endpoint(
         )
         return {'response': response}
     except Exception as e:
+        logger.exception(f"Group chat error for connection {req.soul_connection_id}")
         try:
             import sentry_sdk as _sentry
             _sentry.capture_exception(e)
         except Exception:
-            pass
+            logger.warning("Sentry not available for error reporting")
         raise HTTPException(status_code=500, detail=f'Group chat error: {str(e)}')
 
 
@@ -1201,6 +1318,171 @@ def _resonance_score(shared: int, total: int, shared_channels: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Payments & Subscription
+# ---------------------------------------------------------------------------
+
+class SubscribeRequest(BaseModel):
+    """Start a trial. Card details come later via SecurePay hosted flow."""
+    pass  # No fields needed: trial starts without card
+
+
+class AttachCardRequest(BaseModel):
+    """Attach a Teya card token after SecurePay callback."""
+    teya_token: str
+    card_last_four: str
+    card_brand: str
+
+
+@app.post('/subscribe', summary='Start a free trial')
+async def subscribe(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Start a 5-day free trial. No card required upfront."""
+    existing = await get_subscription(db, user_id)
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription already exists (status: {existing.status})"
+        )
+
+    sub = await start_trial(db, user_id)
+    return {
+        "status": sub.status,
+        "trial_end": sub.trial_end.isoformat() if sub.trial_end else None,
+        "message": "Your 5-day free trial has started.",
+    }
+
+
+@app.post('/subscribe/card', summary='Attach a payment card')
+async def attach_payment_card(
+    req: AttachCardRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Store a Teya multi-use token on the subscription.
+    Called after the user completes the SecurePay hosted card form.
+    """
+    sub = await get_subscription(db, user_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
+
+    sub = await attach_card(
+        db, user_id,
+        teya_token=req.teya_token,
+        card_last_four=req.card_last_four,
+        card_brand=req.card_brand,
+    )
+    return {
+        "status": sub.status,
+        "card_brand": sub.card_brand,
+        "card_last_four": sub.card_last_four,
+        "message": "Card attached successfully.",
+    }
+
+
+@app.post('/subscribe/activate', summary='Convert trial to paid (charge card now)')
+async def activate_subscription(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Skip remaining trial and start paid subscription immediately."""
+    try:
+        sub = await convert_trial_to_active(db, user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "status": sub.status,
+        "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "message": "Subscription activated." if sub.status == "active" else "Payment failed, will retry.",
+    }
+
+
+@app.post('/subscribe/cancel', summary='Cancel subscription')
+async def cancel_sub(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Cancel the subscription. Access continues until period end."""
+    try:
+        sub = await cancel_subscription(db, user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "status": sub.status,
+        "access_until": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "message": "Subscription cancelled.",
+    }
+
+
+@app.get('/subscribe/status', summary='Get subscription status')
+async def subscription_status(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return current subscription state and access level."""
+    sub = await get_subscription(db, user_id)
+    if not sub:
+        return {
+            "subscribed": False,
+            "status": None,
+            "has_access": False,
+        }
+
+    return {
+        "subscribed": True,
+        "status": sub.status,
+        "has_access": has_premium_access(sub),
+        "trial_end": sub.trial_end.isoformat() if sub.trial_end else None,
+        "current_period_end": sub.current_period_end.isoformat() if sub.current_period_end else None,
+        "card_brand": sub.card_brand,
+        "card_last_four": sub.card_last_four,
+        "price": f"${sub.price_amount / 100:.2f}",
+        "cancelled_at": sub.cancelled_at.isoformat() if sub.cancelled_at else None,
+    }
+
+
+@app.post('/subscribe/securepay', summary='Create a SecurePay session for card entry')
+async def create_securepay(
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Generate a Borgun SecurePay hosted page URL.
+    The frontend redirects the user there to enter card details.
+    On success, Borgun redirects back with a token.
+    """
+    sub = await get_subscription(db, user_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
+
+    try:
+        result = await teya.create_securepay_session(
+            return_url="https://app.solray.ai/subscribe/callback",
+            cancel_url="https://app.solray.ai/subscribe/cancelled",
+            amount=0,  # Tokenisation only, no charge yet
+        )
+        return {
+            "session_url": result.get("SessionUrl") or result.get("url"),
+            "session_token": result.get("SessionToken"),
+        }
+    except TeyaError as e:
+        logger.error("[payments] SecurePay session creation failed: %s", e.message)
+        raise HTTPException(status_code=502, detail="Could not create payment session. Please try again.")
+
+
+@app.post('/admin/billing-cycle', summary='Manually trigger a billing cycle (admin only)')
+async def trigger_billing_cycle(
+    admin_id: str = Depends(require_admin),
+):
+    """Run one billing cycle immediately. For debugging and manual intervention."""
+    from payments.billing_scheduler import run_billing_cycle
+    await run_billing_cycle()
+    return {"message": "Billing cycle complete."}
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
@@ -1246,7 +1528,11 @@ async def dashboard_stats(db: AsyncSession = Depends(get_db)):
 
 
 @app.post('/admin/recalculate/{email}', summary="Recalculate blueprint for a user (admin only)")
-async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
+async def recalculate_blueprint(
+    email: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """Recalculate and overwrite the stored blueprint for a user."""
     user = await get_user_by_email(db, email)
     if not user:
@@ -1276,7 +1562,10 @@ async def recalculate_blueprint(email: str, db: AsyncSession = Depends(get_db)):
 
 
 @app.post('/admin/recalculate-all', summary="Recalculate blueprints for every user (admin only)")
-async def recalculate_all_blueprints(db: AsyncSession = Depends(get_db)):
+async def recalculate_all_blueprints(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Recalculate and overwrite the stored blueprint for every user in the database.
     Use after a calculation engine fix to flush stale cached blueprints.
@@ -1318,7 +1607,7 @@ async def recalculate_all_blueprints(db: AsyncSession = Depends(get_db)):
 
 @app.get('/astrocartography', summary="Get astrocartography lines for the authenticated user")
 async def astrocartography(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1346,6 +1635,7 @@ async def astrocartography(
             line['meaning'] = get_line_meaning(line['planet'], line['type'])
         return result
     except Exception as e:
+        logger.exception(f"Astrocartography calculation failed for user {user_id}")
         raise HTTPException(status_code=500, detail=f'Astrocartography calculation failed: {str(e)}')
 
 
@@ -1356,7 +1646,7 @@ async def astrocartography(
 
 @app.get('/transits/long-range', summary="Get the user's active long-range astrological cycles")
 async def long_range_transits(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1384,11 +1674,12 @@ async def long_range_transits(
         transits = calc_long_range_transits(blueprint)
         upcoming = get_upcoming_cycles(blueprint)
     except Exception as e:
+        logger.exception(f"Long-range transit calculation failed for user {user_id}")
         try:
             import sentry_sdk as _sentry
             _sentry.capture_exception(e)
         except Exception:
-            pass
+            logger.warning("Sentry not available for error reporting")
         raise HTTPException(status_code=500, detail=f'Long-range transit calculation failed: {str(e)}')
 
     # Generate AI summaries if we have transits
@@ -1398,11 +1689,12 @@ async def long_range_transits(
             transits = generate_transit_summaries(transits, blueprint)
         except Exception as e:
             # AI summaries failed — return transits without summaries
+            logger.warning(f"AI summary generation failed for user {user_id}: {e}")
             try:
                 import sentry_sdk as _sentry
                 _sentry.capture_exception(e)
             except Exception:
-                pass
+                logger.warning("Sentry not available for error reporting")
 
     return {
         'cycles':         transits,
@@ -1422,7 +1714,7 @@ async def long_range_transits(
 @app.post('/chat', summary='Chat with your Higher Self')
 async def chat_endpoint(
     req: ChatRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     user = await get_user_by_id(db, user_id)
@@ -1459,17 +1751,18 @@ async def chat_endpoint(
                     new_memories = synthesize_memories(blueprint, history, memories)
                     if new_memories:
                         await update_user_memories(db, user_id, new_memories)
-                except Exception:
-                    pass
+                except Exception as err:
+                    logger.warning(f"Memory synthesis failed for user {user_id}: {err}")
             asyncio.create_task(_synthesize())
 
         return {"response": response}
     except Exception as e:
+        logger.exception(f"Chat endpoint error for user {user_id}")
         try:
             import sentry_sdk as _sentry
             _sentry.capture_exception(e)
         except Exception:
-            pass
+            logger.warning("Sentry not available for error reporting")
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
 
 
@@ -1508,7 +1801,7 @@ async def clear_memory(
 
 @app.get('/forecast/week', summary="Get the 3 most significant transits for the next 7 days")
 async def forecast_week(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """Returns a week-ahead summary with the 3 most significant transits."""
@@ -1547,7 +1840,8 @@ async def forecast_week(
                         'natal_planet': asp.get('natal_planet'),
                         'orb': asp.get('orb', 99),
                     })
-            except Exception:
+            except Exception as day_err:
+                logger.warning(f"Failed to fetch forecast for day offset {i}: {day_err}")
                 continue
 
         significant.sort(key=lambda x: x.get('orb', 99))
@@ -1575,6 +1869,7 @@ async def forecast_week(
         await cache_forecast(db, user_id, f"week_{today}", result)
         return result
     except Exception as e:
+        logger.exception(f"Weekly forecast failed for user {user_id}")
         raise HTTPException(status_code=500, detail=f'Weekly forecast failed: {str(e)}')
 
 

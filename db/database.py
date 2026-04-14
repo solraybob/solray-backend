@@ -17,7 +17,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Column, String, Float, Date, DateTime, Text, ForeignKey,
+    Column, String, Float, Date, DateTime, Text, ForeignKey, Boolean,
     UniqueConstraint, CheckConstraint, select, update, delete
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -28,11 +28,9 @@ from sqlalchemy.sql import func
 # Config
 # ---------------------------------------------------------------------------
 
-# Default to Supabase PostgreSQL pooler if DATABASE_URL is not set.
-# For local dev without env var, this still connects to Supabase.
-# Override DATABASE_URL to sqlite:///... for fully offline local dev.
-_SUPABASE_DEFAULT = 'postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:5432/postgres'
-_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', _SUPABASE_DEFAULT)
+# If DATABASE_URL is not set, default to local SQLite for development.
+# For production, DATABASE_URL must be explicitly set as an environment variable.
+_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./solray.db')
 
 def _build_database_url(raw_url: str) -> str:
     """Convert DATABASE_URL to an async-compatible SQLAlchemy URL.
@@ -108,9 +106,11 @@ class User(Base):
     birth_city    = Column(String(255), nullable=True)
     birth_lat     = Column(Float,       nullable=True)
     birth_lon     = Column(Float,       nullable=True)
-    sex           = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
-    profile_photo = Column(Text,        nullable=True)    # base64 data URI
-    created_at    = Column(DateTime,    nullable=False, default=datetime.utcnow)
+    sex              = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
+    profile_photo    = Column(Text,        nullable=True)    # base64 data URI
+    email_verified   = Column(Boolean,     nullable=False, default=False)
+    verification_token = Column(String(64), nullable=True)   # random token for email verify link
+    created_at       = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
     blueprint     = relationship('Blueprint', back_populates='user', uselist=False, cascade='all, delete-orphan')
     forecasts     = relationship('DailyForecast', back_populates='user', cascade='all, delete-orphan')
@@ -187,6 +187,9 @@ async def init_db():
     require manual migrations. New columns should be added here with
     `ADD COLUMN IF NOT EXISTS`.
     """
+    # Import payment models so their tables are registered with Base.metadata
+    from payments.models import Subscription, PaymentEvent  # noqa: F401
+
     from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -219,6 +222,29 @@ async def init_db():
                     await conn.execute(text("ALTER TABLE users ADD COLUMN profile_photo TEXT"))
         except Exception as e:
             print(f"[init_db] profile_photo column migration note: {e}")
+
+        # email_verified (BOOLEAN) + verification_token (VARCHAR) columns
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token VARCHAR(64)"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'email_verified' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT 0"
+                    ))
+                if 'verification_token' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN verification_token VARCHAR(64)"
+                    ))
+        except Exception as e:
+            print(f"[init_db] email_verified column migration note: {e}")
 
 
 # ---------------------------------------------------------------------------
