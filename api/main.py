@@ -646,7 +646,7 @@ async def search_users_endpoint(
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
     refresh: bool = False,
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -850,7 +850,7 @@ async def calculate_soul_blueprint(req: SoulBlueprintRequest):
 @app.post('/souls/invite', summary='Invite someone as a soul connection', status_code=201)
 async def invite_soul(
     req: SoulInviteRequest,
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1078,7 +1078,7 @@ async def list_souls(
 @app.get('/souls/{soul_id}/synergy', summary='Synergy reading between self and a soul connection')
 async def soul_synergy(
     soul_id: str,
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1179,7 +1179,7 @@ async def soul_blueprint_for_chat(
 @app.post('/chat/group', summary='Group compatibility chat with a soul connection')
 async def group_chat_endpoint(
     req: GroupChatRequest,
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1607,7 +1607,7 @@ async def recalculate_all_blueprints(
 
 @app.get('/astrocartography', summary="Get astrocartography lines for the authenticated user")
 async def astrocartography(
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1646,7 +1646,7 @@ async def astrocartography(
 
 @app.get('/transits/long-range', summary="Get the user's active long-range astrological cycles")
 async def long_range_transits(
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1714,7 +1714,7 @@ async def long_range_transits(
 @app.post('/chat', summary='Chat with your Higher Self')
 async def chat_endpoint(
     req: ChatRequest,
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     user = await get_user_by_id(db, user_id)
@@ -1801,7 +1801,7 @@ async def clear_memory(
 
 @app.get('/forecast/week', summary="Get the 3 most significant transits for the next 7 days")
 async def forecast_week(
-    user_id: str = Depends(require_premium),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """Returns a week-ahead summary with the 3 most significant transits."""
