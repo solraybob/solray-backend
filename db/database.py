@@ -232,6 +232,10 @@ async def init_db():
                 await conn.execute(text(
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token VARCHAR(64)"
                 ))
+                # Existing users pre-date email verification — mark them all as verified
+                await conn.execute(text(
+                    "UPDATE users SET email_verified = TRUE WHERE email_verified IS FALSE OR email_verified IS NULL"
+                ))
             else:
                 result = await conn.execute(text("PRAGMA table_info(users)"))
                 cols = [row[1] for row in result.fetchall()]
@@ -243,6 +247,10 @@ async def init_db():
                     await conn.execute(text(
                         "ALTER TABLE users ADD COLUMN verification_token VARCHAR(64)"
                     ))
+                # Existing users pre-date email verification — mark them all as verified
+                await conn.execute(text(
+                    "UPDATE users SET email_verified = 1 WHERE email_verified = 0 OR email_verified IS NULL"
+                ))
         except Exception as e:
             print(f"[init_db] email_verified column migration note: {e}")
 
