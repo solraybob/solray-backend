@@ -24,9 +24,12 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-TEYA_BASE_URL = os.environ.get("TEYA_BASE_URL", "https://greiðsluveita.is/rpg")
+TEYA_BASE_URL = os.environ.get("TEYA_BASE_URL", "https://securepay.borgun.is/rpg")
 TEYA_MERCHANT_ID = os.environ.get("TEYA_MERCHANT_ID", "")
+TEYA_PUBLIC_KEY = os.environ.get("TEYA_PUBLIC_KEY", "")
 TEYA_PRIVATE_KEY = os.environ.get("TEYA_PRIVATE_KEY", "")
+TEYA_VENDOR_ID = os.environ.get("TEYA_VENDOR_ID", "")
+TEYA_SECRET_KEY = os.environ.get("TEYA_SECRET_KEY", "")
 TEYA_CURRENCY = os.environ.get("TEYA_CURRENCY", "840")  # 840 = USD, 352 = ISK
 
 
@@ -46,11 +49,16 @@ class TeyaClient:
     def __init__(self):
         self.base_url = TEYA_BASE_URL.rstrip("/")
         self.merchant_id = TEYA_MERCHANT_ID
+        self.public_key = TEYA_PUBLIC_KEY
         self.private_key = TEYA_PRIVATE_KEY
+        self.vendor_id = TEYA_VENDOR_ID
 
     def _auth(self) -> tuple[str, str]:
-        """HTTP Basic auth credentials for Borgun RPG."""
-        return (self.merchant_id, self.private_key)
+        """HTTP Basic auth credentials for Borgun RPG.
+        Uses public key as username if available, falls back to merchant_id.
+        """
+        username = self.public_key or self.merchant_id
+        return (username, self.private_key)
 
     def _headers(self) -> dict:
         return {
@@ -215,6 +223,8 @@ class TeyaClient:
             "Currency": currency or TEYA_CURRENCY,
             "TokenType": "MultiUse",
         }
+        if self.vendor_id:
+            payload["VendorId"] = self.vendor_id
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
