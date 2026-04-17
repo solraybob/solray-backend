@@ -255,18 +255,20 @@ class TeyaClient:
         ).decode("utf-8")
 
         params = {
-            "merchantid":             self.merchant_id,
-            "paymentgatewayid":       gateway_id,
-            "currency":               currency_alpha,
-            "language":               language,
-            "amount":                 amount_str,
-            "orderid":                order_id,
-            "returnurlsuccess":       return_url,
-            "returnurlsuccessserver": server_url,
-            "returnurlcancel":        cancel_url,
-            "returnurlerror":         error_url,
-            "checkhash":              check_hash,
+            "merchantid":       self.merchant_id,
+            "paymentgatewayid": gateway_id,
+            "currency":         currency_alpha,
+            "language":         language,
+            "amount":           amount_str,
+            "orderid":          order_id,
+            "returnurlsuccess": return_url,
+            "returnurlcancel":  cancel_url,
+            "returnurlerror":   error_url,
+            "checkhash":        check_hash,
         }
+        # Only include server callback URL if explicitly set — empty string causes Borgun to error
+        if server_url:
+            params["returnurlsuccessserver"] = server_url
 
         session_url = (
             "https://securepay.borgun.is/securepay/default.aspx?"

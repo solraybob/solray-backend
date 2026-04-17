@@ -1367,24 +1367,40 @@ async def attach_payment_card(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Store a Teya multi-use token on the subscription.
+    """Store a Teya multi-use token on the subscription and activate it.
+
     Called after the user completes the SecurePay hosted card form.
+    SecurePay already charged the first month, so we activate immediately
+    without a second charge.
     """
     sub = await get_subscription(db, user_id)
     if not sub:
         raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
 
+    # Store the token and card details
     sub = await attach_card(
         db, user_id,
         teya_token=req.teya_token,
         card_last_four=req.card_last_four,
         card_brand=req.card_brand,
     )
+
+    # Activate the subscription — first month was already charged by SecurePay
+    from datetime import datetime, timedelta
+    from payments.subscription_manager import BILLING_CYCLE_DAYS
+    now = datetime.utcnow()
+    sub.status = "active"
+    sub.current_period_start = now
+    sub.current_period_end = now + timedelta(days=BILLING_CYCLE_DAYS)
+    sub.updated_at = now
+    await db.commit()
+    await db.refresh(sub)
+
     return {
         "status": sub.status,
         "card_brand": sub.card_brand,
         "card_last_four": sub.card_last_four,
-        "message": "Card attached successfully.",
+        "message": "Subscription activated.",
     }
 
 
@@ -1468,7 +1484,7 @@ async def create_securepay(
         result = await teya.create_securepay_session(
             return_url="https://app.solray.ai/subscribe/callback",
             cancel_url="https://app.solray.ai/subscribe/cancelled",
-            amount=0,  # Tokenisation only, no charge yet
+            amount=sub.price_amount,  # Charge first month via SecurePay hosted form
         )
         return {
             "session_url": result.get("SessionUrl") or result.get("url"),
