@@ -14,7 +14,12 @@ Auth: HTTP Basic with MerchantId (private key) provided via env vars.
 import os
 import json
 import logging
+import hashlib
+import hmac
+import base64
+import uuid
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -199,42 +204,77 @@ class TeyaClient:
         amount: int = 0,
         currency: Optional[str] = None,
     ) -> dict:
-        """Create a Borgun SecurePay session for hosted card entry.
+        """Generate a Borgun SecurePay hosted page URL for card entry.
 
-        The user is redirected to Borgun's hosted page where they enter
-        card details. On success, Borgun redirects back to return_url
-        with a single-use or multi-use token in the query params.
+        Borgun SecurePay is a separate hosted-page product from the RPG API.
+        No API call is needed: we build the redirect URL locally with a
+        CheckHash signature so Borgun can verify the request is authentic.
 
-        Args:
-            return_url: URL to redirect after successful tokenisation.
-            cancel_url: URL to redirect if user cancels.
-            amount: 0 for tokenisation-only, or a real amount for immediate charge.
-            currency: ISO 4217 numeric code.
+        The user is redirected to Borgun's page, enters card details there,
+        and Borgun redirects back to return_url with a multi-use token.
 
         Returns dict with:
           - SessionUrl: the URL to redirect the user to
-          - SessionToken: reference for this session
+          - SessionToken: the order reference for this session
         """
-        payload = {
-            "MerchantId": self.merchant_id,
-            "ReturnUrlSuccess": return_url,
-            "ReturnUrlCancel": cancel_url,
-            "Amount": amount,
-            "Currency": currency or TEYA_CURRENCY,
-            "TokenType": "MultiUse",
+        # Borgun SecurePay uses alphabetic currency codes, not ISO 4217 numeric.
+        # Map numeric codes to alphabetic if needed.
+        numeric_to_alpha = {"840": "USD", "978": "EUR", "352": "ISK", "826": "GBP"}
+        raw_currency = currency or TEYA_CURRENCY
+        currency_alpha = numeric_to_alpha.get(raw_currency, raw_currency)
+
+        gateway_id   = self.vendor_id or "1"
+        order_id     = uuid.uuid4().hex[:20]
+        language     = "EN"
+        amount_str   = str(amount)
+        server_url   = ""   # optional server-side callback; leave blank
+        error_url    = cancel_url
+
+        # CheckHash = Base64( MD5( fields joined with "|" including secret ) )
+        # Field order per Borgun SecurePay documentation.
+        hash_parts = [
+            self.merchant_id,
+            gateway_id,
+            return_url,
+            server_url,
+            cancel_url,
+            error_url,
+            currency_alpha,
+            language,
+            amount_str,
+            order_id,
+            TEYA_SECRET_KEY,
+        ]
+        hash_input  = "|".join(hash_parts)
+        check_hash  = base64.b64encode(
+            hashlib.md5(hash_input.encode("utf-8")).digest()
+        ).decode("utf-8")
+
+        params = {
+            "merchantid":             self.merchant_id,
+            "paymentgatewayid":       gateway_id,
+            "currency":               currency_alpha,
+            "language":               language,
+            "amount":                 amount_str,
+            "orderid":                order_id,
+            "returnurlsuccess":       return_url,
+            "returnurlsuccessserver": server_url,
+            "returnurlcancel":        cancel_url,
+            "returnurlerror":         error_url,
+            "checkhash":              check_hash,
         }
-        if self.vendor_id:
-            payload["VendorId"] = self.vendor_id
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{self.base_url}/api/securepay",
-                json=payload,
-                auth=self._auth(),
-                headers=self._headers(),
-            )
+        session_url = (
+            "https://securepay.borgun.is/securepay/default.aspx?"
+            + urlencode(params)
+        )
 
-        return self._handle_response(resp, "create_securepay_session")
+        logger.info(
+            "[Teya] SecurePay URL generated: orderid=%s merchant=%s currency=%s amount=%s",
+            order_id, self.merchant_id, currency_alpha, amount_str,
+        )
+
+        return {"SessionUrl": session_url, "SessionToken": order_id}
 
     # ------------------------------------------------------------------
     # Response handling
