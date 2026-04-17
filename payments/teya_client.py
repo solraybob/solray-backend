@@ -230,8 +230,9 @@ class TeyaClient:
         server_url   = ""   # optional server-side callback; leave blank
         error_url    = cancel_url
 
-        # CheckHash = Base64( MD5( fields joined with "|" including secret ) )
-        # Field order per Borgun SecurePay documentation.
+        # CheckHash = Base64( HMAC-SHA256( secret_key, fields joined with "|" ) )
+        # Borgun SecurePay v2+ uses HMAC-SHA256. The secret key is used raw
+        # (not base64-decoded) as the HMAC key. Field order per Borgun docs.
         hash_parts = [
             self.merchant_id,
             gateway_id,
@@ -243,11 +244,14 @@ class TeyaClient:
             language,
             amount_str,
             order_id,
-            TEYA_SECRET_KEY,
         ]
         hash_input  = "|".join(hash_parts)
         check_hash  = base64.b64encode(
-            hashlib.md5(hash_input.encode("utf-8")).digest()
+            hmac.new(
+                TEYA_SECRET_KEY.encode("utf-8"),
+                hash_input.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
         ).decode("utf-8")
 
         params = {
