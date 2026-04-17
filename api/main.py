@@ -155,7 +155,7 @@ async def require_admin(
 class RegisterRequest(BaseModel):
     name:       str        = Field(..., example='Alice Sun')
     email:      EmailStr   = Field(..., example='alice@example.com')
-    password:   str        = Field(..., min_length=6, example='s3cr3t')
+    password:   str        = Field(..., min_length=8, example='s3cr3t!!')
     birth_date: str        = Field(..., example='1990-06-15', description='YYYY-MM-DD')
     birth_time: str        = Field(..., example='14:30',      description='HH:MM')
     birth_city: str        = Field(..., example='London')
@@ -397,6 +397,12 @@ async def register(
         await send_verification_email(req.email, req.name, v_token)
     except Exception as e:
         logger.warning("[register] Verification email failed for %s: %s", req.email, e)
+
+    # Auto-start the 5-day free trial on registration
+    try:
+        await start_trial(db, user_id)
+    except Exception as e:
+        logger.warning("[register] Trial start failed for %s: %s", req.email, e)
 
     # Issue JWT
     token = create_access_token(user_id=user_id, email=req.email)
