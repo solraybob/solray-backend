@@ -231,19 +231,15 @@ class TeyaClient:
         error_url    = cancel_url
 
         # CheckHash = Base64( HMAC-SHA256( secret_key, fields joined with "|" ) )
-        # Borgun SecurePay v2+ uses HMAC-SHA256. The secret key is used raw
-        # (not base64-decoded) as the HMAC key. Field order per Borgun docs.
+        # Borgun SecurePay field order per spec:
+        #   MerchantId | ReturnUrlSuccess | ReturnUrlSuccessServer | OrderId | Amount | Currency
         hash_parts = [
             self.merchant_id,
-            gateway_id,
             return_url,
             server_url,
-            cancel_url,
-            error_url,
-            currency_alpha,
-            language,
-            amount_str,
             order_id,
+            amount_str,
+            currency_alpha,
         ]
         hash_input  = "|".join(hash_parts)
         check_hash  = base64.b64encode(
