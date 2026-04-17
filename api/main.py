@@ -69,6 +69,7 @@ from db.database import (
     accept_soul_connection, decline_soul_connection,
     get_accepted_souls, get_pending_invites_for_user,
     get_user_memories, update_user_memories, add_user_memory,
+    reset_surface_next_flags,
     User
 )
 import engines
@@ -1733,8 +1734,13 @@ async def chat_endpoint(
     forecast = await get_cached_forecast(db, user_id, date.today().isoformat())
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
 
-    # Load persistent user memories for continuity across sessions
-    from db.database import get_user_memories, update_user_memories
+    # Load persistent user memories for continuity across sessions.
+    # Reset surface_next flags if this is the first message of a new session
+    # (history is empty on the client side when a new session opens).
+    from db.database import get_user_memories, update_user_memories, reset_surface_next_flags
+    is_new_session = len(history) == 0
+    if is_new_session:
+        await reset_surface_next_flags(db, user_id)
     memories = await get_user_memories(db, user_id)
 
     try:
@@ -1747,14 +1753,24 @@ async def chat_endpoint(
             memories=memories,
         )
 
-        # After every 5 user messages, synthesize memories in background
+        # Synthesize memories in background at session checkpoints.
+        # Fire at message 4, 9, 14... (every 5 after the first) so we always
+        # capture a meaningful chunk of conversation, not just the opening.
+        # Also fire if this looks like a session-ending message (history is long
+        # and message is short, suggesting a closing exchange).
         user_message_count = sum(1 for m in history if m.get('role') == 'user')
-        if user_message_count > 0 and user_message_count % 5 == 0:
+        should_synthesize = (
+            (user_message_count > 0 and (user_message_count + 1) % 5 == 0)
+            or (user_message_count >= 8 and req.message and len(req.message.split()) < 6)
+        )
+        if should_synthesize:
             import asyncio
             from ai.chat import synthesize_memories
+            # Append the current user message so synthesis sees the full exchange
+            full_history = history + [{"role": "user", "content": req.message or ""}]
             async def _synthesize():
                 try:
-                    new_memories = synthesize_memories(blueprint, history, memories)
+                    new_memories = synthesize_memories(blueprint, full_history, memories)
                     if new_memories:
                         await update_user_memories(db, user_id, new_memories)
                 except Exception as err:
@@ -1770,6 +1786,52 @@ async def chat_endpoint(
         except Exception:
             logger.warning("Sentry not available for error reporting")
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+
+class SynthesizeRequest(BaseModel):
+    conversation_history: list[ChatMessage] = []
+
+
+@app.post('/chat/synthesize', summary='Synthesize session memories on session close')
+async def synthesize_session(
+    req: SynthesizeRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Called by the frontend when the user leaves the chat (tab close, navigation away).
+    Synthesizes the session into persistent memories so nothing is lost even if
+    the in-session message count checkpoints never fired.
+
+    Fires and forgets: returns immediately, synthesis runs as a background task.
+    Requires at least 3 user messages to be worth synthesizing.
+    """
+    history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
+    user_message_count = sum(1 for m in history if m.get('role') == 'user')
+
+    if user_message_count < 3:
+        return {"ok": True, "synthesized": False, "reason": "too short"}
+
+    blueprint = await get_blueprint(db, user_id)
+    if not blueprint:
+        return {"ok": True, "synthesized": False, "reason": "no blueprint"}
+
+    from db.database import get_user_memories, update_user_memories
+    memories = await get_user_memories(db, user_id)
+
+    import asyncio
+    from ai.chat import synthesize_memories
+
+    async def _synthesize():
+        try:
+            new_memories = synthesize_memories(blueprint, history, memories)
+            if new_memories:
+                await update_user_memories(db, user_id, new_memories)
+        except Exception as err:
+            logger.warning(f"Session-close synthesis failed for user {user_id}: {err}")
+
+    asyncio.create_task(_synthesize())
+    return {"ok": True, "synthesized": True}
 
 
 @app.get('/memory', summary='Get user memory entries')

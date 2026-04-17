@@ -147,19 +147,23 @@ class DailyForecast(Base):
 
 class UserMemory(Base):
     """Persistent memory of a user's life context across chat sessions.
-    
+
     The Higher Self reads this at the start of every chat to feel continuous.
     Entries are written by the AI after each chat session — key facts, themes,
     and insights worth remembering long-term.
+
+    surface_next: if True, this memory should be actively woven into the next
+    conversation (not just held as background). Reset to False after one session.
     """
     __tablename__ = 'user_memory'
 
-    id         = Column(String(36), primary_key=True)
-    user_id    = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    category   = Column(String(50), nullable=False)   # e.g. 'life_event', 'theme', 'insight', 'preference'
-    content    = Column(Text, nullable=False)           # The memory itself
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id           = Column(String(36), primary_key=True)
+    user_id      = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    category     = Column(String(50), nullable=False)   # life_event, theme, insight, preference, communication_style, etc.
+    content      = Column(Text, nullable=False)          # The memory itself
+    surface_next = Column(Boolean, nullable=False, default=False)  # actively reference in next session
+    created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at   = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class SoulConnection(Base):
@@ -253,6 +257,22 @@ async def init_db():
                 ))
         except Exception as e:
             print(f"[init_db] email_verified column migration note: {e}")
+
+        # surface_next column on user_memory (BOOLEAN) — flags memories to surface in next session
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE user_memory ADD COLUMN IF NOT EXISTS surface_next BOOLEAN DEFAULT FALSE"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(user_memory)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'surface_next' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE user_memory ADD COLUMN surface_next BOOLEAN DEFAULT 0"
+                    ))
+        except Exception as e:
+            print(f"[init_db] surface_next column migration note: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +484,7 @@ async def get_user_memories(db: AsyncSession, user_id: str) -> list[UserMemory]:
     return result.scalars().all()
 
 
-async def add_user_memory(db: AsyncSession, user_id: str, category: str, content: str) -> UserMemory:
+async def add_user_memory(db: AsyncSession, user_id: str, category: str, content: str, surface_next: bool = False) -> UserMemory:
     """Add a new memory for a user."""
     import uuid
     memory = UserMemory(
@@ -472,6 +492,7 @@ async def add_user_memory(db: AsyncSession, user_id: str, category: str, content
         user_id=user_id,
         category=category,
         content=content,
+        surface_next=surface_next,
     )
     db.add(memory)
     await db.commit()
@@ -480,18 +501,40 @@ async def add_user_memory(db: AsyncSession, user_id: str, category: str, content
 
 
 async def update_user_memories(db: AsyncSession, user_id: str, memories: list[dict]) -> None:
-    """Replace all memories for a user with a new set. Called after AI synthesizes a chat session."""
+    """Replace all memories for a user with a new synthesized set.
+
+    Called at the end of a chat session (or every N messages as a checkpoint).
+    Stores surface_next so the Oracle knows which memories to actively reference
+    in the next conversation. surface_next resets to False after one session
+    so the flag is consumed rather than sticky.
+    """
     # Delete old memories
     await db.execute(delete(UserMemory).where(UserMemory.user_id == user_id))
-    # Add new ones
+    # Write new set, capped at 20
     import uuid
-    for m in memories[:20]:  # Cap at 20
+    for m in memories[:20]:
         memory = UserMemory(
             id=str(uuid.uuid4()),
             user_id=user_id,
             category=m.get('category', 'general'),
             content=m.get('content', ''),
+            surface_next=bool(m.get('surface_next', False)),
         )
         db.add(memory)
+    await db.commit()
+
+
+async def reset_surface_next_flags(db: AsyncSession, user_id: str) -> None:
+    """Clear surface_next on all memories after a session starts.
+
+    Called at the beginning of a chat session so flagged memories are consumed
+    once and not re-surfaced every session indefinitely.
+    """
+    from sqlalchemy import update as sql_update
+    await db.execute(
+        sql_update(UserMemory)
+        .where(UserMemory.user_id == user_id, UserMemory.surface_next == True)  # noqa: E712
+        .values(surface_next=False)
+    )
     await db.commit()
 
