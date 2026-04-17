@@ -29,13 +29,21 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-TEYA_BASE_URL = os.environ.get("TEYA_BASE_URL", "https://securepay.borgun.is/rpg")
-TEYA_MERCHANT_ID = os.environ.get("TEYA_MERCHANT_ID", "")
-TEYA_PUBLIC_KEY = os.environ.get("TEYA_PUBLIC_KEY", "")
-TEYA_PRIVATE_KEY = os.environ.get("TEYA_PRIVATE_KEY", "")
-TEYA_VENDOR_ID = os.environ.get("TEYA_VENDOR_ID", "")
-TEYA_SECRET_KEY = os.environ.get("TEYA_SECRET_KEY", "")
-TEYA_CURRENCY = os.environ.get("TEYA_CURRENCY", "840")  # 840 = USD, 352 = ISK
+TEYA_BASE_URL     = os.environ.get("TEYA_BASE_URL", "https://securepay.borgun.is/rpg")
+TEYA_MERCHANT_ID  = os.environ.get("TEYA_MERCHANT_ID", "")
+TEYA_PUBLIC_KEY   = os.environ.get("TEYA_PUBLIC_KEY", "")
+TEYA_PRIVATE_KEY  = os.environ.get("TEYA_PRIVATE_KEY", "")
+TEYA_VENDOR_ID    = os.environ.get("TEYA_VENDOR_ID", "")
+TEYA_SECRET_KEY   = os.environ.get("TEYA_SECRET_KEY", "")
+TEYA_CURRENCY     = os.environ.get("TEYA_CURRENCY", "840")  # 840 = USD, 352 = ISK
+
+# SecurePay hosted page base URL — override to switch between test and production.
+# Test:  https://test.borgun.is/securepay/default.aspx
+# Live:  https://securepay.borgun.is/securepay/default.aspx
+TEYA_SECUREPAY_URL = os.environ.get(
+    "TEYA_SECUREPAY_URL",
+    "https://securepay.borgun.is/securepay/default.aspx",
+)
 
 
 class TeyaError(Exception):
@@ -266,10 +274,7 @@ class TeyaClient:
         if server_url:
             params["returnurlsuccessserver"] = server_url
 
-        session_url = (
-            "https://securepay.borgun.is/securepay/default.aspx?"
-            + urlencode(params)
-        )
+        session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
         logger.info(
             "[Teya] SecurePay URL generated: orderid=%s merchant=%s currency=%s amount=%s",
