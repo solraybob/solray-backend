@@ -7,9 +7,19 @@ Calculates the four core numerology numbers from birth date and name:
   - Soul Urge Number (vowels in name)
   - Personal Year Number (birth month + day + current year)
 
-Master numbers 11, 22, 33 are preserved and not reduced further.
+Master numbers 11, 22, 33 are preserved through a component-reduction
+scheme: month, day, and year are reduced individually before summing,
+so a 29th-of-the-month (29 -> 11) or a 1993 year (1993 -> 22) keeps its
+master status instead of being dissolved by a naive all-digits sum.
+
+Names are normalised before scoring so Icelandic and other European
+diacritics resolve to the correct Pythagorean letter: á -> a, ö -> o,
+ð -> d, þ -> th, æ -> ae, ø -> o. Without this step an Icelandic name
+like "Kristján Ólafsson" would silently drop its accented letters and
+produce a different number from "Kristjan Olafsson".
 """
 
+import unicodedata
 from datetime import date
 from typing import Optional
 
@@ -28,6 +38,39 @@ _VOWELS = set('AEIOU')
 # For simplicity and consistency, we exclude Y from vowels (most common approach).
 
 _MASTER_NUMBERS = {11, 22, 33}
+
+# Nordic and other letters NFD does not decompose. These are transliterated to
+# their closest Pythagorean-scorable Latin equivalent before the chart is
+# applied. Thorn (þ) and eth (ð) follow the modern Icelandic convention where
+# they transliterate to "th" and "d". Scharfes S -> ss, slashed O -> o,
+# slashed L -> l, ash -> ae.
+_TRANSLITERATION = {
+    'ð': 'd',  'Ð': 'D',
+    'þ': 'th', 'Þ': 'Th',
+    'æ': 'ae', 'Æ': 'Ae',
+    'œ': 'oe', 'Œ': 'Oe',
+    'ø': 'o',  'Ø': 'O',
+    'ß': 'ss',
+    'ł': 'l',  'Ł': 'L',
+}
+
+
+def _normalise_name(name: str) -> str:
+    """Fold a name down to its Pythagorean-scorable Latin form.
+
+    Accented vowels and consonants are NFD-decomposed and their combining
+    marks are dropped, so "Kristján" becomes "Kristjan". Nordic letters that
+    NFD cannot decompose (ð, þ, æ, ø) are transliterated via the table above.
+    """
+    out = []
+    for ch in name:
+        if ch in _TRANSLITERATION:
+            out.append(_TRANSLITERATION[ch])
+            continue
+        for d in unicodedata.normalize('NFD', ch):
+            if unicodedata.category(d) != 'Mn':  # Mn = non-spacing combining mark
+                out.append(d)
+    return ''.join(out)
 
 # ---------------------------------------------------------------------------
 # Meanings dictionary
@@ -85,10 +128,17 @@ def life_path(birth_date: str) -> int:
     """
     Calculate Life Path Number from birth date string "YYYY-MM-DD".
 
-    Example: 1989-09-05 → 1+9+8+9+0+9+0+5 = 41 → 4+1 = 5
+    Uses the component-reduction method: each of month, day, year is reduced
+    individually (preserving any 11 / 22 / 33 master that appears) before the
+    three are summed and reduced again. A naive "sum all eight digits" pass
+    would lose masters that live inside a component. For example, 1997-12-29:
+    component method gives 3 + 11 + 8 = 22 (master), all-digits gives 40 -> 4.
     """
-    digits = [int(d) for d in birth_date if d.isdigit()]
-    total = sum(digits)
+    parts = birth_date.split('-')  # ['YYYY', 'MM', 'DD']
+    year = int(parts[0])
+    month = int(parts[1])
+    day = int(parts[2])
+    total = _reduce(month) + _reduce(day) + _reduce(year)
     return _reduce(total)
 
 
@@ -99,9 +149,12 @@ def life_path(birth_date: str) -> int:
 def expression(name: str) -> int:
     """
     Calculate Expression (Destiny) Number from full name at birth.
-    Uses Pythagorean chart. Ignores non-alpha characters.
+    Uses Pythagorean chart. Diacritics are folded to base letters, so
+    "Kristján" and "Kristjan" score identically. Nordic ð, þ, æ, ø are
+    transliterated via _normalise_name before scoring.
     """
-    total = sum(_PYTHAGOREAN.get(c.upper(), 0) for c in name if c.isalpha())
+    folded = _normalise_name(name)
+    total = sum(_PYTHAGOREAN.get(c.upper(), 0) for c in folded if c.isalpha())
     return _reduce(total)
 
 
@@ -113,8 +166,10 @@ def soul_urge(name: str) -> int:
     """
     Calculate Soul Urge (Heart's Desire) Number from vowels in full name.
     Vowels: A, E, I, O, U (Y excluded in standard Pythagorean method).
+    Diacritics are folded first so á counts as A, ö as O, and so on.
     """
-    total = sum(_PYTHAGOREAN[c.upper()] for c in name if c.upper() in _VOWELS)
+    folded = _normalise_name(name)
+    total = sum(_PYTHAGOREAN[c.upper()] for c in folded if c.upper() in _VOWELS)
     return _reduce(total)
 
 
@@ -126,7 +181,10 @@ def personal_year(birth_date: str, year: Optional[int] = None) -> int:
     """
     Calculate Personal Year Number for a given year (defaults to current year).
 
-    Formula: birth_month + birth_day + year_digits, then reduce.
+    Formula: reduce(birth_month) + reduce(birth_day) + reduce(year), then
+    reduce the total. The component-reduction form is used for the same
+    reason as Life Path: to keep an 11 / 22 / 33 master from dissolving when
+    it lives inside the month, day, or universal year.
     """
     if year is None:
         year = date.today().year
@@ -135,7 +193,7 @@ def personal_year(birth_date: str, year: Optional[int] = None) -> int:
     month = int(parts[1])
     day = int(parts[2])
 
-    total = month + day + sum(int(d) for d in str(year))
+    total = _reduce(month) + _reduce(day) + _reduce(year)
     return _reduce(total)
 
 
