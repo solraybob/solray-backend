@@ -379,7 +379,7 @@ Nodes, Saturn, Pluto, and angles (ASC, DSC, MC, IC) as structural pillars of lif
 Transits and progressions when provided.
 Human Design: Type, Authority, Strategy, Profile, defined centres, key gates and channels.
 Gene Keys: Hologenetic Profile spheres. Activation Sequence: Life's Work (Conscious Sun), Evolution (Conscious Earth), Radiance (Design Sun), Purpose (Design Earth). Venus Sequence: Attraction (Venus), IQ (South Node), EQ (Moon). Each sphere has a Shadow, Gift, and Siddhi frequency.
-You always have the natal chart and the complete aspect list. You always have Human Design. You always have Gene Keys. If something more specific has not been calculated yet (astrocartography, numerology, certain asteroid positions), name that clearly and work from what you have. Do not pretend completeness you do not have. Do not apologize for what is absent. Just use what is there.
+You always have this person's complete profile loaded in this very prompt: natal chart with every planet and house, the full aspect list, extended points including Chiron and asteroids, Human Design type and authority and channels, all six Gene Keys spheres, numerology, and astrocartography lines showing where their planetary energies land on the map. When someone asks about any of these systems by name, you have the data. Never say you do not know their astrocartography, their asteroids, their numerology, or any part of their chart. Look at the sections below and answer specifically.
 
 HOW TO ANSWER:
 Translate every placement into behavior before you name it. Give the human meaning before the technical term. Say what it does to a person, how it shows up on a Tuesday, how it feels from the inside. Then, if helpful, name the placement.
@@ -396,7 +396,7 @@ NOT this: "You can be self-critical at times."
 Speak to what they experience privately, not what they show the world. The response should feel like talking to someone who has been watching them for years.
 
 DEPTH AND DENSITY:
-Match the depth of the response to the depth of the question. A short check-in gets 2-3 sentences and a question. A deep structural question about a life pattern gets 3-5 focused paragraphs. Never pad. Never explain more than what serves the person in this moment. The unsaid is not missing. It is held for when they are ready.
+Match the depth of the response to the depth of the question. A short check-in gets 2-3 sentences and a question. A deep structural question about a life pattern gets 3-5 focused paragraphs, and always stays under 1200 words so the thought completes and never truncates mid-sentence. Never pad. Never explain more than what serves the person in this moment. The unsaid is not missing. It is held for when they are ready. Finish every response with a complete final sentence and the italic closing question. Never leave a thought hanging.
 
 STRUCTURE:
 Use Markdown. Start each idea with a ## header.
@@ -483,14 +483,23 @@ def _format_astrocartography(blueprint: dict) -> str:
     Calculate and format astrocartography context for the system prompt.
     Returns the most significant planetary lines and power spots.
     """
+    import logging
+    log = logging.getLogger(__name__)
+
     meta = blueprint.get('meta', {})
     birth_date = meta.get('birth_date') or blueprint.get('birth_data', {}).get('date')
     birth_time = meta.get('birth_time') or blueprint.get('birth_data', {}).get('time')
     birth_lat = meta.get('birth_lat') or blueprint.get('birth_data', {}).get('lat')
     birth_lon = meta.get('birth_lon') or blueprint.get('birth_data', {}).get('lon')
 
-    if not all([birth_date, birth_time, birth_lat, birth_lon]):
-        return ""
+    header = "ASTROCARTOGRAPHY (geographic energy lines, already calculated, you have them):"
+
+    if not all([birth_date, birth_time, birth_lat is not None, birth_lon is not None]):
+        return (
+            f"{header}\n"
+            "  (Birth coordinates not on file. If the person asks about astrocartography, "
+            "say their birth location needs to be completed so the lines can be drawn.)"
+        )
 
     try:
         from astrocartography import calc_astrocartography, get_line_meaning
@@ -505,11 +514,11 @@ def _format_astrocartography(blueprint: dict) -> str:
             lat_step=15.0,
         )
 
-        # Get MC lines for key planets — most interpretively meaningful
+        # Get MC lines for key planets, most interpretively meaningful
         KEY_PLANETS = ['Sun', 'Jupiter', 'Venus', 'Saturn', 'Mars', 'Moon']
         mc_lines = [l for l in result['lines'] if l['type'] == 'MC' and l['planet'] in KEY_PLANETS]
 
-        lines = ["ASTROCARTOGRAPHY (geographic energy lines):"]
+        lines = [header]
         for l in mc_lines:
             lon = l.get('lon', 0)
             meaning = get_line_meaning(l['planet'], 'MC')
@@ -539,14 +548,19 @@ def _format_astrocartography(blueprint: dict) -> str:
             lines.append(f"  {l['planet']} MC at {lon:.1f}° ({region}): {meaning}")
 
         lines.append("")
-        lines.append("When the person asks about travel, relocation, or where to live, reference these lines.")
+        lines.append("When the person asks about travel, relocation, where to live, or astrocartography directly, reference these lines by name. You have them. Speak from them.")
         lines.append("A person thrives where their Jupiter or Venus MC/ASC lines run. These areas amplify their gifts.")
         lines.append("Saturn MC areas bring discipline and achievement but also restriction.")
         lines.append("Mars MC areas are high-energy but can bring conflict.")
 
         return "\n".join(lines)
-    except Exception:
-        return ""
+    except Exception as e:
+        log.warning(f"Astrocartography calc failed, returning placeholder: {e}")
+        return (
+            f"{header}\n"
+            "  (Calculation did not complete on this turn. Work from the birth location and chart angles, "
+            "and if they press for specifics, be honest that the geographic lines need to be refreshed.)"
+        )
 
 
 def _format_numerology(blueprint: dict) -> str:
@@ -1226,7 +1240,7 @@ def chat(
 
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=600,
+        max_tokens=1600,
         system=final_system,
         messages=messages,
     )

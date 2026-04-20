@@ -1770,14 +1770,17 @@ async def chat_endpoint(
         )
 
         # Synthesize memories in background at session checkpoints.
-        # Fire at message 4, 9, 14... (every 5 after the first) so we always
-        # capture a meaningful chunk of conversation, not just the opening.
+        # Fire at message 2, 5, 8, 11... so even short sessions (2-3 turns,
+        # the common case) still get captured. Memory between chats depends
+        # on synthesis actually firing often enough to be there next time.
         # Also fire if this looks like a session-ending message (history is long
         # and message is short, suggesting a closing exchange).
         user_message_count = sum(1 for m in history if m.get('role') == 'user')
+        next_count = user_message_count + 1
         should_synthesize = (
-            (user_message_count > 0 and (user_message_count + 1) % 5 == 0)
-            or (user_message_count >= 8 and req.message and len(req.message.split()) < 6)
+            next_count == 2
+            or (next_count >= 5 and (next_count - 2) % 3 == 0)
+            or (user_message_count >= 4 and req.message and len(req.message.split()) < 6)
         )
         if should_synthesize:
             import asyncio
@@ -1825,7 +1828,9 @@ async def synthesize_session(
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
     user_message_count = sum(1 for m in history if m.get('role') == 'user')
 
-    if user_message_count < 3:
+    # Lower bar: even a 2-message exchange holds something worth carrying
+    # forward, since short sessions are the norm.
+    if user_message_count < 2:
         return {"ok": True, "synthesized": False, "reason": "too short"}
 
     blueprint = await get_blueprint(db, user_id)
