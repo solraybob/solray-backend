@@ -28,9 +28,22 @@ from sqlalchemy.sql import func
 # Config
 # ---------------------------------------------------------------------------
 
-# If DATABASE_URL is not set, default to local SQLite for development.
-# For production, DATABASE_URL must be explicitly set as an environment variable.
-_RAW_DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./solray.db')
+# DATABASE_URL resolution order, from most durable to least:
+#   1. DATABASE_URL env (Postgres, e.g. Railway Postgres plugin or Supabase).
+#   2. SQLite inside a Railway volume if one is mounted (RAILWAY_VOLUME_MOUNT_PATH
+#      is set by Railway automatically when a volume is attached). This lets the
+#      database survive container redeploys without needing Postgres.
+#   3. Local SQLite in the current working directory (dev only, ephemeral on Railway).
+_RAW_DATABASE_URL = os.environ.get('DATABASE_URL')
+if not _RAW_DATABASE_URL:
+    _vol = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH')
+    if _vol:
+        # Railway sets this to e.g. "/data" when a volume is mounted. Put the
+        # SQLite file on the persistent volume so memories, blueprints, and
+        # forecast caches survive every redeploy.
+        _RAW_DATABASE_URL = f"sqlite:///{_vol.rstrip('/')}/solray.db"
+    else:
+        _RAW_DATABASE_URL = 'sqlite:///./solray.db'
 
 def _build_database_url(raw_url: str) -> str:
     """Convert DATABASE_URL to an async-compatible SQLAlchemy URL.
@@ -191,6 +204,24 @@ async def init_db():
     require manual migrations. New columns should be added here with
     `ADD COLUMN IF NOT EXISTS`.
     """
+    # Log which database backend we're using so the operator can verify
+    # in Railway logs whether memory will persist across redeploys.
+    import logging
+    log = logging.getLogger(__name__)
+    if _is_postgres:
+        log.warning("DB backend: Postgres (memory persists across deploys)")
+    else:
+        # Check whether the SQLite file is on a Railway volume
+        vol = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH')
+        if vol and vol in DATABASE_URL:
+            log.warning(f"DB backend: SQLite on Railway volume {vol} (memory persists across deploys)")
+        else:
+            log.warning(
+                "DB backend: SQLite on EPHEMERAL container disk. "
+                "Memory will be WIPED on every redeploy. Either set DATABASE_URL "
+                "to a Postgres URL or mount a Railway volume so RAILWAY_VOLUME_MOUNT_PATH is set."
+            )
+
     # Import payment models so their tables are registered with Base.metadata
     from payments.models import Subscription, PaymentEvent  # noqa: F401
 
@@ -479,7 +510,7 @@ async def get_user_memories(db: AsyncSession, user_id: str) -> list[UserMemory]:
         select(UserMemory)
         .where(UserMemory.user_id == user_id)
         .order_by(UserMemory.updated_at.desc())
-        .limit(20)  # Cap at 20 memories to keep system prompt manageable
+        .limit(50)  # Cap at 50 memories — enough depth without bloating the prompt
     )
     return result.scalars().all()
 
@@ -500,28 +531,94 @@ async def add_user_memory(db: AsyncSession, user_id: str, category: str, content
     return memory
 
 
-async def update_user_memories(db: AsyncSession, user_id: str, memories: list[dict]) -> None:
-    """Replace all memories for a user with a new synthesized set.
-
-    Called at the end of a chat session (or every N messages as a checkpoint).
-    Stores surface_next so the Oracle knows which memories to actively reference
-    in the next conversation. surface_next resets to False after one session
-    so the flag is consumed rather than sticky.
+def _memory_fingerprint(content: str) -> str:
     """
-    # Delete old memories
-    await db.execute(delete(UserMemory).where(UserMemory.user_id == user_id))
-    # Write new set, capped at 20
+    Collapse a memory's content to a fingerprint used for dedup.
+    Lowercase, strip punctuation, keep the first ~80 chars of words.
+    Two memories with the same fingerprint are treated as the same memory.
+    """
+    import re
+    s = (content or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = " ".join(s.split())[:80]
+    return s
+
+
+async def update_user_memories(db: AsyncSession, user_id: str, new_memories: list[dict]) -> None:
+    """Merge newly synthesized memories into the user's existing memory set.
+
+    This is a MERGE, not a replace. The previous implementation wiped all
+    existing memories and wrote only the new synthesis, which meant one bad
+    synthesis turn could erase months of continuity. Now we:
+      1. Load the existing set.
+      2. For each new memory, match by (category, fingerprint) against existing.
+         If it matches, update content + touch updated_at + apply surface_next.
+         If it does not match, insert it as a new row.
+      3. Cap at 50 by dropping oldest entries if needed, preferring to keep
+         surface_next=True entries.
+      4. Reset surface_next=False on existing non-matching entries (the flag
+         is per-turn, not sticky — fresh surface_next comes from the new set).
+
+    Called at session checkpoints and session end. Safe to call repeatedly.
+    """
     import uuid
-    for m in memories[:20]:
-        memory = UserMemory(
-            id=str(uuid.uuid4()),
-            user_id=user_id,
-            category=m.get('category', 'general'),
-            content=m.get('content', ''),
-            surface_next=bool(m.get('surface_next', False)),
-        )
-        db.add(memory)
+    from datetime import datetime
+
+    # Load existing
+    result = await db.execute(
+        select(UserMemory).where(UserMemory.user_id == user_id)
+    )
+    existing = list(result.scalars().all())
+    # Reset surface_next on all existing entries; fresh flags come from the new set
+    for m in existing:
+        m.surface_next = False
+
+    # Index existing by (category, fingerprint) for merge lookup
+    existing_by_key = {}
+    for m in existing:
+        key = (m.category, _memory_fingerprint(m.content))
+        existing_by_key[key] = m
+
+    now = datetime.utcnow()
+
+    for new in new_memories:
+        cat = new.get('category', 'general')
+        content = (new.get('content') or '').strip()
+        if not content:
+            continue
+        key = (cat, _memory_fingerprint(content))
+        hit = existing_by_key.get(key)
+        if hit is not None:
+            # Update in place: take the new content (it may be a refined version)
+            hit.content = content
+            hit.updated_at = now
+            hit.surface_next = bool(new.get('surface_next', False))
+        else:
+            memory = UserMemory(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                category=cat,
+                content=content,
+                surface_next=bool(new.get('surface_next', False)),
+            )
+            db.add(memory)
+            # Also add to the dict so subsequent duplicates within the new set merge
+            existing_by_key[key] = memory
+
     await db.commit()
+
+    # Cap at 50 by pruning oldest, but always keep surface_next=True rows.
+    result = await db.execute(
+        select(UserMemory).where(UserMemory.user_id == user_id)
+    )
+    all_memories = list(result.scalars().all())
+    if len(all_memories) > 50:
+        # Keep surface_next=True first, then most recent. Drop the remainder.
+        all_memories.sort(key=lambda x: (not x.surface_next, x.updated_at), reverse=True)
+        to_delete = all_memories[50:]
+        for old in to_delete:
+            await db.delete(old)
+        await db.commit()
 
 
 async def reset_surface_next_flags(db: AsyncSession, user_id: str) -> None:
