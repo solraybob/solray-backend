@@ -379,7 +379,7 @@ Nodes, Saturn, Pluto, and angles (ASC, DSC, MC, IC) as structural pillars of lif
 Transits and progressions when provided.
 Human Design: Type, Authority, Strategy, Profile, defined centres, key gates and channels.
 Gene Keys: Hologenetic Profile spheres. Activation Sequence: Life's Work (Conscious Sun), Evolution (Conscious Earth), Radiance (Design Sun), Purpose (Design Earth). Venus Sequence: Attraction (Venus), IQ (South Node), EQ (Moon). Each sphere has a Shadow, Gift, and Siddhi frequency.
-You always have this person's complete profile loaded in this very prompt: natal chart with every planet and house, the full aspect list, extended points including Chiron and asteroids, Human Design type and authority and channels, all six Gene Keys spheres, numerology, and astrocartography lines showing where their planetary energies land on the map. When someone asks about any of these systems by name, you have the data. Never say you do not know their astrocartography, their asteroids, their numerology, or any part of their chart. Look at the sections below and answer specifically.
+You always have this person's complete profile loaded in this very prompt: natal chart with every planet and house, the full aspect list, extended points including Chiron and asteroids, Human Design type and authority and channels, all six Gene Keys spheres, numerology, and astrocartography lines showing where their planetary energies land on the map. You also have today's live sky: current planet positions by sign and degree, active transits, the HD daily gate. When someone asks "what planets are in Aries right now" or "where is Venus today" or anything about the current sky, read the TODAY'S ACTIVE FIELD section and answer specifically. When someone asks about any system by name, you have the data. Never claim you lack real-time planetary information. Never tell them to consult astro.com, Cafe Astrology, Co-Star, an ephemeris, or any external app. You are the ephemeris.
 
 HOW TO ANSWER:
 Translate every placement into behavior before you name it. Give the human meaning before the technical term. Say what it does to a person, how it shows up on a Tuesday, how it feels from the inside. Then, if helpful, name the placement.
@@ -722,11 +722,35 @@ def _format_forecast_for_chat(forecast: dict) -> str:
     """Format today's forecast data for injection into the chat system prompt."""
     lines = [
         "═══════════════════════════════",
-        "TODAY'S ACTIVE FIELD",
+        "TODAY'S ACTIVE FIELD (calculated, you have this, do not claim you lack real-time data)",
         "═══════════════════════════════",
         f"Date: {forecast.get('date', 'today')}",
         "",
     ]
+
+    # Current planet-by-sign positions. This is the answer to "what planets are in
+    # <sign> right now". The Oracle must be able to answer this from memory of the
+    # prompt rather than deferring to external sites.
+    transits = forecast.get('transits', {})
+    if transits and isinstance(transits, dict):
+        # transits is {PlanetName: {sign, degree, house, retrograde, ...}}
+        rows = []
+        for name, data in transits.items():
+            if not isinstance(data, dict):
+                continue
+            sign = data.get('sign')
+            if not sign or sign == 'Unknown':
+                continue
+            deg = data.get('degree')
+            retro = ' Rx' if data.get('retrograde') else ''
+            if deg is not None:
+                rows.append(f"  {name} in {sign} {deg:.1f}°{retro}")
+            else:
+                rows.append(f"  {name} in {sign}{retro}")
+        if rows:
+            lines.append("Current planet positions (sky right now):")
+            lines.extend(rows)
+            lines.append("")
 
     # If it's an AI-generated forecast (has title/reading)
     if 'title' in forecast:

@@ -1747,7 +1747,24 @@ async def chat_endpoint(
     if not blueprint:
         raise HTTPException(status_code=404, detail='Blueprint not found')
     from datetime import date
-    forecast = await get_cached_forecast(db, user_id, date.today().isoformat())
+    today_str = date.today().isoformat()
+    forecast = await get_cached_forecast(db, user_id, today_str)
+    # If the user walks straight into chat without loading the Today tab first,
+    # the forecast cache is empty and the Oracle has no transits to speak from.
+    # Compute the raw ephemeris snapshot on demand so "what planets are in X
+    # right now" always has a real answer. This is fast, no AI call, pure swisseph.
+    if not forecast:
+        try:
+            forecast = engines.get_daily_forecast(
+                birth_date=user.birth_date,
+                birth_time=user.birth_time,
+                birth_city=user.birth_city,
+                birth_lat=user.birth_lat,
+                birth_lon=user.birth_lon,
+            )
+        except Exception as _fc_err:
+            logger.warning(f"On-demand forecast calc failed for user {user_id}: {_fc_err}")
+            forecast = None
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
 
     # Load persistent user memories for continuity across sessions.
