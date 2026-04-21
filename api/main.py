@@ -46,7 +46,7 @@ try:
 except ImportError:
     pass  # sentry-sdk not installed — monitoring disabled
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from timezonefinder import TimezoneFinder
@@ -1822,6 +1822,89 @@ async def chat_endpoint(
         except Exception:
             logger.warning("Sentry not available for error reporting")
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# /chat/transcribe — Voice-to-text for the Oracle composer
+#
+# Accepts a single audio file (webm/opus from Chrome, mp4/m4a from iOS Safari)
+# and returns the transcript. Works on every browser that exposes
+# MediaRecorder, including iOS Safari installed as a PWA — which is where the
+# Web Speech API silently fails.
+#
+# Provider priority (first one with a key set wins):
+#   1. GROQ_API_KEY      — whisper-large-v3-turbo, free tier, ~200ms / 30s clip
+#   2. OPENAI_API_KEY    — whisper-1, ~$0.006/min
+# Both share the same OpenAI-compatible /audio/transcriptions contract.
+# ---------------------------------------------------------------------------
+@app.post('/chat/transcribe', summary='Transcribe a short audio clip from the voice composer')
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    import httpx
+
+    groq_key = os.environ.get('GROQ_API_KEY', '').strip()
+    openai_key = os.environ.get('OPENAI_API_KEY', '').strip()
+
+    if groq_key:
+        base_url = 'https://api.groq.com/openai/v1'
+        model = 'whisper-large-v3-turbo'
+        api_key = groq_key
+        provider = 'groq'
+    elif openai_key:
+        base_url = 'https://api.openai.com/v1'
+        model = 'whisper-1'
+        api_key = openai_key
+        provider = 'openai'
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice transcription isn't configured on this server. Set GROQ_API_KEY or OPENAI_API_KEY.",
+        )
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail='Empty audio payload.')
+
+    # Soft cap at 25 MB — Whisper's own limit, and a sane ceiling for a single
+    # composer clip. Longer audio should be split client-side.
+    if len(contents) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail='Audio clip too long. Keep it under about 10 minutes.')
+
+    filename = file.filename or 'audio.webm'
+    content_type = file.content_type or 'audio/webm'
+
+    files = {'file': (filename, contents, content_type)}
+    data = {'model': model, 'response_format': 'json'}
+    headers = {'Authorization': f'Bearer {api_key}'}
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f'{base_url}/audio/transcriptions',
+                headers=headers,
+                files=files,
+                data=data,
+            )
+    except httpx.RequestError as e:
+        logger.warning(f"Transcription network error via {provider}: {e}")
+        raise HTTPException(status_code=502, detail='Transcription service unreachable. Try again.')
+
+    if r.status_code != 200:
+        logger.warning(f"Transcription failed via {provider}: {r.status_code} {r.text[:300]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription failed ({r.status_code}). Try again in a moment.",
+        )
+
+    try:
+        payload = r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail='Transcription returned an unexpected response.')
+
+    transcript = (payload.get('text') or '').strip()
+    return {'transcript': transcript, 'provider': provider}
 
 
 class SynthesizeRequest(BaseModel):
