@@ -464,3 +464,151 @@ def get_upcoming_cycles(blueprint: dict, today: Optional[date] = None, days_ahea
     # Sort by soonest first, return top 2
     upcoming.sort(key=lambda x: x['days_until_orb'])
     return upcoming[:2]
+
+
+# ---------------------------------------------------------------------------
+# Forward calendar: month-by-month sky snapshot for chat context
+# ---------------------------------------------------------------------------
+
+_SIGNS = [
+    'Aries', 'Taurus', 'Gemini', 'Cancer', 'Leo', 'Virgo',
+    'Libra', 'Scorpio', 'Sagittarius', 'Capricorn', 'Aquarius', 'Pisces',
+]
+
+
+def _lon_to_sign(lon: float) -> tuple:
+    """Return (sign_name, degree_in_sign) for an ecliptic longitude."""
+    lon = lon % 360
+    sign_index = int(lon // 30)
+    deg_in_sign = lon - sign_index * 30
+    return _SIGNS[sign_index], deg_in_sign
+
+
+def get_monthly_outlook(blueprint: dict, months: int = 12, today: Optional[date] = None) -> list:
+    """
+    Return a month-by-month sky snapshot for the next `months` months.
+
+    For each month we report:
+      - The sign each outer planet (Jupiter, Saturn, Uranus, Neptune, Pluto)
+        sits in on the 15th of that month.
+      - Any sign ingress that happens during the month (planet crosses from
+        one sign to the next), which is the single most meaningful "cycle
+        change" event for a non-astrologer question like "what is shifting".
+      - Any major aspect (conjunction, opposition, square, trine, sextile)
+        between an outer planet and the user's natal Sun, Moon, or Ascendant
+        that is within 3 degrees during that month.
+
+    Designed to be injected into the Oracle system prompt so the Higher Self
+    can answer questions like "what's happening in September" directly,
+    without needing tool-use or external calls.
+    """
+    if today is None:
+        today = date.today()
+
+    natal_planets = blueprint.get('astrology', {}).get('natal', {}).get('planets', {})
+    natal_asc = blueprint.get('astrology', {}).get('natal', {}).get('ascendant', {})
+
+    natal_points = []
+    for name in ('Sun', 'Moon'):
+        lon = natal_planets.get(name, {}).get('longitude')
+        if lon is not None:
+            natal_points.append((name, lon))
+    asc_lon = natal_asc.get('longitude')
+    if asc_lon is not None:
+        natal_points.append(('Ascendant', asc_lon))
+
+    outer = [
+        ('Jupiter', swe.JUPITER),
+        ('Saturn',  swe.SATURN),
+        ('Uranus',  swe.URANUS),
+        ('Neptune', swe.NEPTUNE),
+        ('Pluto',   swe.PLUTO),
+    ]
+
+    # Major aspects we care about, expressed as target angles with a 3 degree orb.
+    MAJOR_ASPECTS = [
+        ('conjunction', 0.0),
+        ('sextile',     60.0),
+        ('square',      90.0),
+        ('trine',       120.0),
+        ('opposition',  180.0),
+    ]
+    ORB = 3.0
+
+    def _aspect_delta(lon_a: float, lon_b: float) -> float:
+        diff = abs((lon_a - lon_b + 180) % 360 - 180)
+        return diff
+
+    outlook = []
+
+    # Anchor to the 1st of the month containing `today`
+    year = today.year
+    month = today.month
+
+    for i in range(months):
+        m_year = year + (month - 1 + i) // 12
+        m_month = ((month - 1 + i) % 12) + 1
+        mid = date(m_year, m_month, 15)
+        first = date(m_year, m_month, 1)
+        # End of month = first of next month minus 1 day
+        if m_month == 12:
+            last = date(m_year, 12, 31)
+        else:
+            last = date(m_year, m_month + 1, 1) - timedelta(days=1)
+
+        mid_jd = _date_to_jd(mid)
+        first_jd = _date_to_jd(first)
+        last_jd = _date_to_jd(last)
+
+        planet_signs = {}  # name -> (sign, deg)
+        ingresses = []  # list of "Jupiter enters Virgo on YYYY-MM-DD"
+        aspects_hit = []  # list of "Saturn square natal Sun, orb 2.1°, around mid-<month>"
+
+        for planet_name, planet_id in outer:
+            mid_lon, _ = _get_planet_lon(mid_jd, planet_id)
+            sign, deg = _lon_to_sign(mid_lon)
+            planet_signs[planet_name] = (sign, deg)
+
+            # Ingress check: does the planet's sign at start of month differ
+            # from its sign at end of month? If so, find the crossing day.
+            start_lon, _ = _get_planet_lon(first_jd, planet_id)
+            end_lon, _ = _get_planet_lon(last_jd, planet_id)
+            start_sign, _ = _lon_to_sign(start_lon)
+            end_sign, _ = _lon_to_sign(end_lon)
+            if start_sign != end_sign:
+                # Binary-ish search for the exact crossing day
+                lo, hi = first_jd, last_jd
+                # Walk day by day, we only need 31 iterations max
+                cross_day = None
+                prev_sign = start_sign
+                for d_offset in range(0, (last - first).days + 1):
+                    check_jd = first_jd + d_offset
+                    check_lon, _ = _get_planet_lon(check_jd, planet_id)
+                    check_sign, _ = _lon_to_sign(check_lon)
+                    if check_sign != prev_sign:
+                        cross_day = _jd_to_date(check_jd)
+                        ingresses.append(
+                            f"{planet_name} enters {check_sign} on {cross_day.isoformat()}"
+                        )
+                        prev_sign = check_sign
+
+            # Aspects to natal points
+            for np_name, np_lon in natal_points:
+                delta = _aspect_delta(mid_lon, np_lon)
+                for aspect_name, target_angle in MAJOR_ASPECTS:
+                    orb = abs(delta - target_angle)
+                    if orb <= ORB:
+                        aspects_hit.append(
+                            f"{planet_name} {aspect_name} natal {np_name}, orb {orb:.1f}°"
+                        )
+
+        outlook.append({
+            'year':         m_year,
+            'month':        m_month,
+            'month_name':   mid.strftime('%B %Y'),
+            'planet_signs': planet_signs,
+            'ingresses':    ingresses,
+            'aspects':      aspects_hit,
+        })
+
+    return outlook

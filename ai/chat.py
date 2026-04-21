@@ -456,6 +456,10 @@ GENE KEYS, all six spheres with shadow, gift, and siddhi:
 
 {_format_astrocartography(blueprint)}
 
+{_format_long_range_cycles(blueprint)}
+
+{_format_monthly_outlook(blueprint)}
+
 {today_context}"""
     return prompt
 
@@ -561,6 +565,136 @@ def _format_astrocartography(blueprint: dict) -> str:
             "  (Calculation did not complete on this turn. Work from the birth location and chart angles, "
             "and if they press for specifics, be honest that the geographic lines need to be refreshed.)"
         )
+
+
+def _format_long_range_cycles(blueprint: dict) -> str:
+    """
+    Format currently-active major cycles (Saturn Return, outer planet transits to
+    natal Sun/Moon/ASC/Chiron) plus the next two upcoming cycles.
+
+    This runs on every chat request, so failures degrade silently to an empty
+    string rather than crashing the Oracle. The caller, _build_system_prompt,
+    already injects TODAY'S ACTIVE FIELD from the cached forecast; this adds
+    the multi-year cycles that the daily forecast does not cover.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    try:
+        import long_range
+        active = long_range.calc_long_range_transits(blueprint) or []
+        upcoming = long_range.get_upcoming_cycles(blueprint, days_ahead=540) or []
+    except Exception as e:
+        log.warning(f"Long-range cycles calc failed, returning empty: {e}")
+        return ""
+
+    if not active and not upcoming:
+        return ""
+
+    lines = ["MAJOR CYCLES ACTIVE NOW (multi-month to multi-year transits, already calculated, you have them):"]
+
+    if active:
+        # Cap to the 6 tightest so the prompt stays readable
+        for t in active[:6]:
+            title = t.get('title', '?')
+            orb = t.get('orb', '?')
+            phase = t.get('phase', '')
+            started = t.get('started', '?')
+            peak = t.get('peak', '?')
+            ends = t.get('ends', '?')
+            phase_str = f", {phase}" if phase else ""
+            lines.append(
+                f"  {title}, orb {orb}°{phase_str}. "
+                f"Started {started}, peaks {peak}, ends {ends}."
+            )
+    else:
+        lines.append("  (No major outer cycles currently within orb.)")
+
+    if upcoming:
+        lines.append("")
+        lines.append("UPCOMING CYCLES (entering orb in the next 18 months):")
+        for u in upcoming:
+            title = u.get('title', '?')
+            enters = u.get('enters_orb', '?')
+            days = u.get('days_until_orb', '?')
+            lines.append(f"  {title} begins around {enters} (in {days} days).")
+
+    lines.append("")
+    lines.append(
+        "When the person asks about their current life chapter, Saturn Return, "
+        "Pluto transit, 'what cycle am I in', or 'what is ending/beginning', "
+        "speak from these. Name the transit, the orb, the peak and end dates. "
+        "Do not defer. You have the calculation."
+    )
+    return "\n".join(lines)
+
+
+def _format_monthly_outlook(blueprint: dict) -> str:
+    """
+    Format a 12-month forward sky snapshot, month by month.
+
+    For each upcoming month we emit the sign each outer planet occupies at
+    mid-month, any sign ingresses that happen during the month, and any
+    major aspect outer planets make to natal Sun/Moon/ASC (3° orb).
+
+    This is what lets the Oracle answer 'what's happening in September' or
+    'what will the sky look like next spring' without deferring to an
+    external ephemeris.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    try:
+        import long_range
+        outlook = long_range.get_monthly_outlook(blueprint, months=12) or []
+    except Exception as e:
+        log.warning(f"Monthly outlook calc failed, returning empty: {e}")
+        return ""
+
+    if not outlook:
+        return ""
+
+    lines = [
+        "12-MONTH SKY OUTLOOK (forward month-by-month, already calculated, you have it):",
+        "  You can answer 'what's happening in [month]' or 'what will the sky look like in [month]' directly from this. Do not say you cannot see the future: the outer planets move slowly and their positions are deterministic.",
+    ]
+
+    for m in outlook:
+        name = m.get('month_name', '?')
+        planet_signs = m.get('planet_signs', {}) or {}
+        ingresses = m.get('ingresses', []) or []
+        aspects = m.get('aspects', []) or []
+
+        # One compact positions line: "Jupiter Cancer 12°, Saturn Aries 4°, ..."
+        pos_parts = []
+        for pname in ('Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto'):
+            sd = planet_signs.get(pname)
+            if sd is None:
+                continue
+            # sd is (sign, degree) tuple
+            try:
+                sign, deg = sd
+                pos_parts.append(f"{pname} {sign} {deg:.0f}°")
+            except Exception:
+                continue
+
+        lines.append("")
+        lines.append(f"  {name}:")
+        if pos_parts:
+            lines.append(f"    Positions: {', '.join(pos_parts)}")
+        if ingresses:
+            for ing in ingresses:
+                lines.append(f"    {ing}")
+        if aspects:
+            # Dedupe aspects that repeat each month until the planet leaves orb
+            seen = set()
+            for asp in aspects:
+                if asp in seen:
+                    continue
+                seen.add(asp)
+                lines.append(f"    {asp}")
+
+    return "\n".join(lines)
 
 
 def _format_numerology(blueprint: dict) -> str:
