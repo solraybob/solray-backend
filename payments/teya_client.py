@@ -277,11 +277,33 @@ class TeyaClient:
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
-        # Redact the secret-derived hash and key in logs, keep everything else
-        # visible so the Railway logs are diagnostic if Teya rejects again.
-        logger.info(
-            "[Teya] SecurePay URL: merchant=%s gateway=%s currency=%s amount=%s orderid=%s return=%s",
-            self.merchant_id, gateway_id, currency_alpha, amount_str, order_id, return_url,
+        # Force-log at WARNING so Railway surfaces this regardless of how the
+        # root logger ends up configured. Redact nothing except the raw secret
+        # key. The hash itself is derived so it's safe to log for debugging.
+        logger.warning(
+            "[Teya] SecurePay session\n"
+            "  gateway_url:    %s\n"
+            "  merchant_id:    %r\n"
+            "  gateway_id:     %r\n"
+            "  currency:       %s (raw=%s)\n"
+            "  amount:         %s\n"
+            "  order_id:       %s\n"
+            "  return_url:     %s\n"
+            "  secret_key_len: %d\n"
+            "  hash_input:     %s\n"
+            "  check_hash:     %s\n"
+            "  session_url:    %s",
+            TEYA_SECUREPAY_URL,
+            self.merchant_id,
+            gateway_id,
+            currency_alpha, raw_currency,
+            amount_str,
+            order_id,
+            return_url,
+            len(TEYA_SECRET_KEY or ""),
+            hash_input,
+            check_hash,
+            session_url,
         )
         if not TEYA_SECRET_KEY:
             logger.error("[Teya] TEYA_SECRET_KEY is empty — CheckHash will fail verification")

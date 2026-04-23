@@ -23,6 +23,14 @@ import logging
 from datetime import date, datetime
 from typing import Optional, List
 
+# Surface INFO/WARNING logs in the Railway console. Without this, Python's
+# default WARNING-only root logger silently swallows diagnostics like the
+# Teya SecurePay URL trace.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
