@@ -25,6 +25,8 @@ from payments.subscription_manager import (
     convert_trial_to_active,
     renew,
     retry_charge,
+    start_trial,
+    get_subscription,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,44 @@ async def _retry_failed_charges(db: AsyncSession):
             await retry_charge(db, sub)
         except Exception as e:
             logger.error("[billing] Failed to retry charge for sub %s: %s", sub.id, e)
+
+
+# ---------------------------------------------------------------------------
+# One-time backfill: give every existing user a 5-day trial from today
+# ---------------------------------------------------------------------------
+
+async def backfill_trials_for_existing_users() -> int:
+    """
+    For every user who has no subscription row yet, start a fresh 5-day
+    trial from right now. Idempotent: users with an existing subscription
+    (trial, active, past_due, cancelled, expired) are skipped.
+
+    Safe to call on every boot. Once all users have a subscription, this
+    becomes a cheap no-op loop over the user table.
+    """
+    from db.database import User
+
+    started = 0
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User))
+        users = result.scalars().all()
+
+        for user in users:
+            existing = await get_subscription(db, user.id)
+            if existing is not None:
+                continue
+            try:
+                await start_trial(db, user.id)
+                started += 1
+            except Exception as e:
+                logger.warning(
+                    "[backfill] Could not start trial for user %s: %s",
+                    user.id, e,
+                )
+
+    if started:
+        logger.info("[backfill] Started a 5-day trial for %d existing users", started)
+    return started
 
 
 # ---------------------------------------------------------------------------

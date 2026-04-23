@@ -121,6 +121,15 @@ app.add_middleware(
 async def startup():
     """Initialise DB tables on first start, kick off billing scheduler."""
     await init_db()
+
+    # One-time (idempotent) backfill: every existing user who was signed up
+    # before subscriptions existed gets a fresh 5-day trial from today.
+    try:
+        from payments.billing_scheduler import backfill_trials_for_existing_users
+        await backfill_trials_for_existing_users()
+    except Exception as e:
+        logger.warning("[startup] Trial backfill failed: %s", e)
+
     # Start the background billing loop (checks every 60 min)
     import asyncio
     from payments.billing_scheduler import billing_loop
@@ -653,7 +662,7 @@ async def search_users_endpoint(
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
     refresh: bool = False,
-    user_id: str = Depends(get_current_user_id),  # Force redeploy
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1085,7 +1094,7 @@ async def list_souls(
 @app.get('/souls/{soul_id}/synergy', summary='Synergy reading between self and a soul connection')
 async def soul_synergy(
     soul_id: str,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1144,7 +1153,7 @@ async def soul_synergy(
 @app.get('/souls/{connection_id}/blueprint', summary="Get a soul connection's full blueprint (for chat only)")
 async def soul_blueprint_for_chat(
     connection_id: str,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1186,7 +1195,7 @@ async def soul_blueprint_for_chat(
 @app.post('/chat/group', summary='Group compatibility chat with a soul connection')
 async def group_chat_endpoint(
     req: GroupChatRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1630,7 +1639,7 @@ async def recalculate_all_blueprints(
 
 @app.get('/astrocartography', summary="Get astrocartography lines for the authenticated user")
 async def astrocartography(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1669,7 +1678,7 @@ async def astrocartography(
 
 @app.get('/transits/long-range', summary="Get the user's active long-range astrological cycles")
 async def long_range_transits(
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -1737,7 +1746,7 @@ async def long_range_transits(
 @app.post('/chat', summary='Chat with your Higher Self')
 async def chat_endpoint(
     req: ChatRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     user = await get_user_by_id(db, user_id)
@@ -1840,7 +1849,7 @@ async def chat_endpoint(
 @app.post('/chat/transcribe', summary='Transcribe a short audio clip from the voice composer')
 async def transcribe_audio(
     file: UploadFile = File(...),
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
 ):
     import httpx
 
@@ -1914,7 +1923,7 @@ class SynthesizeRequest(BaseModel):
 @app.post('/chat/synthesize', summary='Synthesize session memories on session close')
 async def synthesize_session(
     req: SynthesizeRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(require_premium),
     db: AsyncSession = Depends(get_db),
 ):
     """
