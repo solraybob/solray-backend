@@ -235,11 +235,16 @@ class TeyaClient:
         order_id     = uuid.uuid4().hex[:20]
         language     = "EN"
         amount_str   = str(amount)
-        server_url   = ""   # optional server-side callback; leave blank
         error_url    = cancel_url
 
-        # CheckHash = Base64( HMAC-SHA256( secret_key, fields joined with "|" ) )
-        # Borgun SecurePay field order per spec:
+        # Per Borgun SecurePay spec: if returnurlsuccessserver is omitted
+        # from the URL, Teya uses returnurlsuccess in its place for hash
+        # verification. Send it explicitly equal to return_url so both
+        # sides compute the same hash input.
+        server_url = return_url
+
+        # CheckHash = hex( HMAC-SHA256( secret_key, fields joined with "|" ) )
+        # Field order per spec:
         #   MerchantId | ReturnUrlSuccess | ReturnUrlSuccessServer | OrderId | Amount | Currency
         hash_parts = [
             self.merchant_id,
@@ -250,36 +255,38 @@ class TeyaClient:
             currency_alpha,
         ]
         hash_input  = "|".join(hash_parts)
-        check_hash  = base64.b64encode(
-            hmac.new(
-                TEYA_SECRET_KEY.encode("utf-8"),
-                hash_input.encode("utf-8"),
-                hashlib.sha256,
-            ).digest()
-        ).decode("utf-8")
+        check_hash  = hmac.new(
+            TEYA_SECRET_KEY.encode("utf-8"),
+            hash_input.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
         params = {
-            "merchantid":       self.merchant_id,
-            "paymentgatewayid": gateway_id,
-            "currency":         currency_alpha,
-            "language":         language,
-            "amount":           amount_str,
-            "orderid":          order_id,
-            "returnurlsuccess": return_url,
-            "returnurlcancel":  cancel_url,
-            "returnurlerror":   error_url,
-            "checkhash":        check_hash,
+            "merchantid":             self.merchant_id,
+            "paymentgatewayid":       gateway_id,
+            "currency":               currency_alpha,
+            "language":               language,
+            "amount":                 amount_str,
+            "orderid":                order_id,
+            "returnurlsuccess":       return_url,
+            "returnurlsuccessserver": server_url,
+            "returnurlcancel":        cancel_url,
+            "returnurlerror":         error_url,
+            "checkhash":              check_hash,
         }
-        # Only include server callback URL if explicitly set — empty string causes Borgun to error
-        if server_url:
-            params["returnurlsuccessserver"] = server_url
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
+        # Redact the secret-derived hash and key in logs, keep everything else
+        # visible so the Railway logs are diagnostic if Teya rejects again.
         logger.info(
-            "[Teya] SecurePay URL generated: orderid=%s merchant=%s currency=%s amount=%s",
-            order_id, self.merchant_id, currency_alpha, amount_str,
+            "[Teya] SecurePay URL: merchant=%s gateway=%s currency=%s amount=%s orderid=%s return=%s",
+            self.merchant_id, gateway_id, currency_alpha, amount_str, order_id, return_url,
         )
+        if not TEYA_SECRET_KEY:
+            logger.error("[Teya] TEYA_SECRET_KEY is empty — CheckHash will fail verification")
+        if not self.merchant_id:
+            logger.error("[Teya] TEYA_MERCHANT_ID is empty — SecurePay will reject the request")
 
         return {"SessionUrl": session_url, "SessionToken": order_id}
 
