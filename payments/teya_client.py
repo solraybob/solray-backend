@@ -283,6 +283,7 @@ class TeyaClient:
         cancel_url: str,
         amount: int = 0,
         currency: Optional[str] = None,
+        success_server_url: Optional[str] = None,
     ) -> dict:
         """Generate a Borgun SecurePay hosted page URL for card entry.
 
@@ -333,15 +334,22 @@ class TeyaClient:
         amount_major = usd_dollars * rate
         amount_str = f"{amount_major:.2f}".replace(".", ",")
 
-        # Per Borgun SecurePay spec: if returnurlsuccessserver is omitted
-        # from the URL, Teya uses returnurlsuccess in its place for hash
-        # verification. Send it explicitly equal to return_url so both
-        # sides compute the same hash input.
-        server_url = return_url
+        # ReturnUrlSuccessServer is an OPTIONAL server-to-server callback
+        # that Teya POSTs to after a successful payment. We don't currently
+        # run a server-side callback handler, so this field stays empty.
+        # Both the param AND the hash position must be empty so Teya and
+        # we compute identical HMAC inputs. Prior code duplicated return_url
+        # here, which worked with the reference HikaShop plugin (where the
+        # same URL was shared) but breaks signature validation when the
+        # param is genuinely omitted.
+        server_url = (success_server_url or "").strip()
 
         # CheckHash = hex( HMAC-SHA256( secret_key, fields joined with "|" ) )
         # Field order per spec:
         #   MerchantId | ReturnUrlSuccess | ReturnUrlSuccessServer | OrderId | Amount | Currency
+        # When ReturnUrlSuccessServer is omitted from params, its slot in
+        # the hash input is an empty string, producing "...||..." between
+        # positions 2 and 4. That's intentional, not a bug.
         hash_parts = [
             self.merchant_id,
             return_url,
@@ -375,18 +383,19 @@ class TeyaClient:
             "Itemunitamount_1":       amount_str,
             "Itemamount_1":           amount_str,
             "returnurlsuccess":       return_url,
-            "returnurlsuccessserver": server_url,
             "returnurlcancel":        cancel_url,
             "returnurlerror":         error_url,
             "checkhash":              check_hash,
         }
+        # Only include server callback URL when one was actually provided.
+        # Omitting it keeps the URL shorter AND ensures the hash position
+        # 3 (empty string) matches what Teya will recompute.
+        if server_url:
+            params["returnurlsuccessserver"] = server_url
         # Only include gateway_id when we actually have one. Empty strings
         # trigger Teya's validator to look up a non-existent gateway.
         if gateway_id:
             params["paymentgatewayid"] = gateway_id
-        # Skip empty buyer fields — some Teya environments reject empty
-        # strings where they expect either a filled value or the field
-        # omitted entirely.
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
