@@ -34,6 +34,11 @@ TEYA_MERCHANT_ID  = os.environ.get("TEYA_MERCHANT_ID", "")
 TEYA_PUBLIC_KEY   = os.environ.get("TEYA_PUBLIC_KEY", "")
 TEYA_PRIVATE_KEY  = os.environ.get("TEYA_PRIVATE_KEY", "")
 TEYA_VENDOR_ID    = os.environ.get("TEYA_VENDOR_ID", "")
+# The SecurePay hosted page requires a *payment gateway id* which is a
+# Teya-assigned number SEPARATE from the merchant id and SEPARATE from the
+# RPG vendor id. If your merchant has only one gateway Teya sometimes lets
+# you omit it entirely. Precedence: explicit env > vendor_id > omit.
+TEYA_PAYMENT_GATEWAY_ID = os.environ.get("TEYA_PAYMENT_GATEWAY_ID", "")
 TEYA_SECRET_KEY   = os.environ.get("TEYA_SECRET_KEY", "")
 TEYA_CURRENCY     = os.environ.get("TEYA_CURRENCY", "840")  # 840 = USD, 352 = ISK
 
@@ -262,11 +267,16 @@ class TeyaClient:
         raw_currency = currency or TEYA_CURRENCY
         currency_alpha = numeric_to_alpha.get(raw_currency, raw_currency)
 
-        gateway_id   = self.vendor_id or "1"
+        # paymentgatewayid precedence: explicit env > vendor_id > skip
+        # An incorrect gateway id is one of the top causes of the generic
+        # "Unexpected error on payment page". Omitting it lets Teya pick
+        # the default gateway on single-gateway merchants.
+        gateway_id   = TEYA_PAYMENT_GATEWAY_ID or self.vendor_id or ""
         # Teya's SecurePay validator expects a numeric OrderId (per reference
         # plugins: $order->order_id). Hex/UUID strings can silently trigger
-        # the generic "Unexpected error on payment page".
-        order_id     = str(uuid.uuid4().int)[:18]
+        # the generic "Unexpected error on payment page". Max length ~10-12
+        # digits is safest across older test merchants.
+        order_id     = str(uuid.uuid4().int)[:12]
         language     = "EN"
         error_url    = cancel_url
 
@@ -318,7 +328,6 @@ class TeyaClient:
         item_description = "Solray AI membership"
         params = {
             "MerchantId":             self.merchant_id,
-            "paymentgatewayid":       gateway_id,
             "currency":               currency_alpha,
             "language":               language,
             "amount":                 amount_str,
@@ -328,14 +337,19 @@ class TeyaClient:
             "Itemcount_1":            "1",
             "Itemunitamount_1":       amount_str,
             "Itemamount_1":           amount_str,
-            "buyername":              "",
-            "buyeremail":             "",
             "returnurlsuccess":       return_url,
             "returnurlsuccessserver": server_url,
             "returnurlcancel":        cancel_url,
             "returnurlerror":         error_url,
             "checkhash":              check_hash,
         }
+        # Only include gateway_id when we actually have one. Empty strings
+        # trigger Teya's validator to look up a non-existent gateway.
+        if gateway_id:
+            params["paymentgatewayid"] = gateway_id
+        # Skip empty buyer fields — some Teya environments reject empty
+        # strings where they expect either a filled value or the field
+        # omitted entirely.
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
