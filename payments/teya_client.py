@@ -38,12 +38,17 @@ TEYA_SECRET_KEY   = os.environ.get("TEYA_SECRET_KEY", "")
 TEYA_CURRENCY     = os.environ.get("TEYA_CURRENCY", "840")  # 840 = USD, 352 = ISK
 
 # SecurePay hosted page base URL — override to switch between test and production.
-# Test:  https://test.borgun.is/securepay/default.aspx
+# Test env uses capital "SecurePay" in the path; live uses lowercase.
+# Test:  https://test.borgun.is/SecurePay/default.aspx
 # Live:  https://securepay.borgun.is/securepay/default.aspx
 TEYA_SECUREPAY_URL = os.environ.get(
     "TEYA_SECUREPAY_URL",
     "https://securepay.borgun.is/securepay/default.aspx",
 )
+
+# Currencies whose minor-unit is used (cents, etc). Everything else (ISK, JPY)
+# is already in major units so no /100 conversion.
+_CURRENCIES_WITH_MINOR_UNITS = {"USD", "EUR", "GBP", "DKK", "NOK", "SEK", "CHF", "CAD"}
 
 
 class TeyaError(Exception):
@@ -234,13 +239,23 @@ class TeyaClient:
         gateway_id   = self.vendor_id or "1"
         # Teya's SecurePay validator expects a numeric OrderId (per reference
         # plugins: $order->order_id). Hex/UUID strings can silently trigger
-        # the generic "Unexpected error on payment page". Use a timestamp-
-        # derived numeric id, which is collision-safe enough for our scale
-        # and always parses.
+        # the generic "Unexpected error on payment page".
         order_id     = str(uuid.uuid4().int)[:18]
         language     = "EN"
-        amount_str   = str(amount)
         error_url    = cancel_url
+
+        # CRITICAL: Teya expects amount as a DECIMAL STRING with comma as the
+        # decimal separator and exactly two fractional digits — e.g. "23,00",
+        # never "2300" (minor units). Reference PHP:
+        #   number_format($price, 2, ',', '')
+        # Internally our subscription stores price in USD cents. Convert to
+        # major units for currencies that use minor units; pass through for
+        # zero-decimal currencies (ISK, JPY).
+        if currency_alpha in _CURRENCIES_WITH_MINOR_UNITS:
+            amount_major = amount / 100.0
+        else:
+            amount_major = float(amount)
+        amount_str = f"{amount_major:.2f}".replace(".", ",")
 
         # Per Borgun SecurePay spec: if returnurlsuccessserver is omitted
         # from the URL, Teya uses returnurlsuccess in its place for hash
@@ -266,23 +281,25 @@ class TeyaClient:
             hashlib.sha256,
         ).hexdigest()
 
-        # Teya's SecurePay page needs something to display to the buyer.
-        # Reference integrations always send at least one Itemdescription_N /
-        # Itemcount_N / Itemunitamount_N / Itemamount_N quartet; omitting
-        # them can cause the renderer to throw its generic "Unexpected error
-        # on payment page" before reaching the card-entry form.
+        # Parameter names match the reference HikaShop plugin verbatim,
+        # including the mixed casing (MerchantId, Orderid, Itemdescription_1).
+        # ASP.NET form binding is usually case-insensitive but we follow the
+        # known-working casing to eliminate that as a variable.
         item_description = "Solray AI membership"
         params = {
-            "merchantid":             self.merchant_id,
+            "MerchantId":             self.merchant_id,
             "paymentgatewayid":       gateway_id,
             "currency":               currency_alpha,
             "language":               language,
             "amount":                 amount_str,
-            "orderid":                order_id,
-            "itemdescription_1":      item_description,
-            "itemcount_1":            "1",
-            "itemunitamount_1":       amount_str,
-            "itemamount_1":           amount_str,
+            "Orderid":                order_id,
+            "reference":              order_id,
+            "Itemdescription_1":      item_description,
+            "Itemcount_1":            "1",
+            "Itemunitamount_1":       amount_str,
+            "Itemamount_1":           amount_str,
+            "buyername":              "",
+            "buyeremail":             "",
             "returnurlsuccess":       return_url,
             "returnurlsuccessserver": server_url,
             "returnurlcancel":        cancel_url,
