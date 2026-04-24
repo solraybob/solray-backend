@@ -82,6 +82,42 @@ def _usd_rate(code: str) -> float:
     return _DEFAULT_USD_RATES.get(code, 1.0)
 
 
+def _secret_key_bytes() -> bytes:
+    """Return the HMAC key bytes for Teya CheckHash.
+
+    Teya's portal delivers the SecretKey as 32 hex characters (e.g.
+    "d64f2893e921a9434664668d51d00383") which represents a 16-byte binary
+    key. For the HMAC signature to match, we must hex-decode before passing
+    to hmac.new; using the hex STRING as the key produces a different
+    signature that Teya's validator rejects.
+
+    Detection rule: if the key is pure hex of length 32 or 64, decode it;
+    otherwise assume it's already a plain string and UTF-8 encode it. This
+    preserves backward compatibility for any deployments that configured
+    the secret as a string.
+
+    Explicit override via TEYA_SECRET_KEY_FORMAT = "hex" | "utf8" | "base64"
+    when auto-detection is ambiguous.
+    """
+    key = TEYA_SECRET_KEY or ""
+    override = (os.environ.get("TEYA_SECRET_KEY_FORMAT") or "").lower().strip()
+
+    if override == "utf8":
+        return key.encode("utf-8")
+    if override == "hex":
+        return bytes.fromhex(key)
+    if override == "base64":
+        return base64.b64decode(key)
+
+    # Auto-detect: pure hex of typical HMAC key lengths gets decoded.
+    if len(key) in (32, 64) and all(c in "0123456789abcdefABCDEF" for c in key):
+        try:
+            return bytes.fromhex(key)
+        except ValueError:
+            pass
+    return key.encode("utf-8")
+
+
 class TeyaError(Exception):
     """Raised when the Borgun RPG API returns an error."""
 
@@ -315,8 +351,9 @@ class TeyaClient:
             currency_alpha,
         ]
         hash_input  = "|".join(hash_parts)
-        check_hash  = hmac.new(
-            TEYA_SECRET_KEY.encode("utf-8"),
+        key_bytes = _secret_key_bytes()
+        check_hash = hmac.new(
+            key_bytes,
             hash_input.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -366,7 +403,7 @@ class TeyaClient:
             "  amount:         %s\n"
             "  order_id:       %s\n"
             "  return_url:     %s\n"
-            "  secret_key_len: %d\n"
+            "  secret_key_len: %d chars / %d bytes (%s)\n"
             "  hash_input:     %s\n"
             "  check_hash:     %s\n"
             "  session_url:    %s",
@@ -379,6 +416,8 @@ class TeyaClient:
             order_id,
             return_url,
             len(TEYA_SECRET_KEY or ""),
+            len(key_bytes),
+            "hex-decoded" if len(key_bytes) != len(TEYA_SECRET_KEY or "") else "utf-8",
             hash_input,
             check_hash,
             session_url,
