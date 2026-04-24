@@ -232,7 +232,12 @@ class TeyaClient:
         currency_alpha = numeric_to_alpha.get(raw_currency, raw_currency)
 
         gateway_id   = self.vendor_id or "1"
-        order_id     = uuid.uuid4().hex[:20]
+        # Teya's SecurePay validator expects a numeric OrderId (per reference
+        # plugins: $order->order_id). Hex/UUID strings can silently trigger
+        # the generic "Unexpected error on payment page". Use a timestamp-
+        # derived numeric id, which is collision-safe enough for our scale
+        # and always parses.
+        order_id     = str(uuid.uuid4().int)[:18]
         language     = "EN"
         amount_str   = str(amount)
         error_url    = cancel_url
@@ -261,12 +266,12 @@ class TeyaClient:
             hashlib.sha256,
         ).hexdigest()
 
-        # authorizeonly=1 tells Teya to authorize the card without capturing
-        # funds. For the "save a card for recurring billing" flow this is the
-        # correct mode, and many Teya test merchants reject Sale transactions
-        # but accept authorization-only. Not part of the signed hash.
-        # skipreceiptpage=1 suppresses Teya's post-payment receipt screen so
-        # the user returns to our callback immediately.
+        # Teya's SecurePay page needs something to display to the buyer.
+        # Reference integrations always send at least one Itemdescription_N /
+        # Itemcount_N / Itemunitamount_N / Itemamount_N quartet; omitting
+        # them can cause the renderer to throw its generic "Unexpected error
+        # on payment page" before reaching the card-entry form.
+        item_description = "Solray AI membership"
         params = {
             "merchantid":             self.merchant_id,
             "paymentgatewayid":       gateway_id,
@@ -274,8 +279,10 @@ class TeyaClient:
             "language":               language,
             "amount":                 amount_str,
             "orderid":                order_id,
-            "authorizeonly":          "1",
-            "skipreceiptpage":        "1",
+            "itemdescription_1":      item_description,
+            "itemcount_1":            "1",
+            "itemunitamount_1":       amount_str,
+            "itemamount_1":           amount_str,
             "returnurlsuccess":       return_url,
             "returnurlsuccessserver": server_url,
             "returnurlcancel":        cancel_url,
