@@ -261,6 +261,12 @@ class TeyaClient:
             hashlib.sha256,
         ).hexdigest()
 
+        # authorizeonly=1 tells Teya to authorize the card without capturing
+        # funds. For the "save a card for recurring billing" flow this is the
+        # correct mode, and many Teya test merchants reject Sale transactions
+        # but accept authorization-only. Not part of the signed hash.
+        # skipreceiptpage=1 suppresses Teya's post-payment receipt screen so
+        # the user returns to our callback immediately.
         params = {
             "merchantid":             self.merchant_id,
             "paymentgatewayid":       gateway_id,
@@ -268,6 +274,8 @@ class TeyaClient:
             "language":               language,
             "amount":                 amount_str,
             "orderid":                order_id,
+            "authorizeonly":          "1",
+            "skipreceiptpage":        "1",
             "returnurlsuccess":       return_url,
             "returnurlsuccessserver": server_url,
             "returnurlcancel":        cancel_url,
