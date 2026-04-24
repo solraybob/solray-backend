@@ -304,10 +304,12 @@ class TeyaClient:
         raw_currency = currency or TEYA_CURRENCY
         currency_alpha = numeric_to_alpha.get(raw_currency, raw_currency)
 
-        # paymentgatewayid precedence: explicit env > vendor_id > skip
-        # An incorrect gateway id is one of the top causes of the generic
-        # "Unexpected error on payment page". Omitting it lets Teya pick
-        # the default gateway on single-gateway merchants.
+        # paymentgatewayid is REQUIRED by Borgun's SecurePay validator in the
+        # URL params. It must NOT appear in the HMAC CheckHash calculation
+        # (only the 6 fields below are hashed). Precedence for the value:
+        # explicit TEYA_PAYMENT_GATEWAY_ID > TEYA_VENDOR_ID. An empty
+        # gateway id causes Teya to reject the request outright, so we log
+        # a loud error if neither env var is set.
         gateway_id   = TEYA_PAYMENT_GATEWAY_ID or self.vendor_id or ""
         # Teya's SecurePay validator expects a numeric OrderId (per reference
         # plugins: $order->order_id). Hex/UUID strings can silently trigger
@@ -371,8 +373,16 @@ class TeyaClient:
         # ASP.NET form binding is usually case-insensitive but we follow the
         # known-working casing to eliminate that as a variable.
         item_description = "Solray AI membership"
+        # paymentgatewayid is a REQUIRED URL parameter for Teya SecurePay,
+        # but it is NOT part of the HMAC input (the hash above covers only
+        # MerchantId, returnurlsuccess, returnurlsuccessserver, Orderid,
+        # amount, currency). Always include it in the URL. If neither env
+        # var provided a value, we still include the key with an empty
+        # string so the request isn't silently deformed, and log an error
+        # to make the misconfiguration obvious in Railway.
         params = {
             "MerchantId":             self.merchant_id,
+            "paymentgatewayid":       gateway_id,
             "currency":               currency_alpha,
             "language":               language,
             "amount":                 amount_str,
@@ -392,10 +402,6 @@ class TeyaClient:
         # 3 (empty string) matches what Teya will recompute.
         if server_url:
             params["returnurlsuccessserver"] = server_url
-        # Only include gateway_id when we actually have one. Empty strings
-        # trigger Teya's validator to look up a non-existent gateway.
-        if gateway_id:
-            params["paymentgatewayid"] = gateway_id
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
@@ -432,9 +438,15 @@ class TeyaClient:
             session_url,
         )
         if not TEYA_SECRET_KEY:
-            logger.error("[Teya] TEYA_SECRET_KEY is empty — CheckHash will fail verification")
+            logger.error("[Teya] TEYA_SECRET_KEY is empty, CheckHash will fail verification")
         if not self.merchant_id:
-            logger.error("[Teya] TEYA_MERCHANT_ID is empty — SecurePay will reject the request")
+            logger.error("[Teya] TEYA_MERCHANT_ID is empty, SecurePay will reject the request")
+        if not gateway_id:
+            logger.error(
+                "[Teya] paymentgatewayid is empty. Set TEYA_PAYMENT_GATEWAY_ID "
+                "or TEYA_VENDOR_ID in Railway. SecurePay requires this value "
+                "in the URL params even though it is excluded from the HMAC."
+            )
 
         return {"SessionUrl": session_url, "SessionToken": order_id}
 
