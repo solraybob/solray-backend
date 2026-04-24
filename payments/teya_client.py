@@ -362,11 +362,23 @@ class TeyaClient:
         ]
         hash_input  = "|".join(hash_parts)
         key_bytes = _secret_key_bytes()
-        check_hash = hmac.new(
+        hmac_digest = hmac.new(
             key_bytes,
             hash_input.encode("utf-8"),
             hashlib.sha256,
-        ).hexdigest()
+        ).digest()
+
+        # Borgun's SecurePay spec defines CheckHash as
+        #   Base64( HMAC-SHA256( secret, fields ) )
+        # Some reference third-party plugins (HikaShop) send HEX instead,
+        # which works for SOME merchants but fails for Teya's canonical
+        # validator. Default to base64; allow override via env for the
+        # rare case a merchant is on the legacy hex-accepting endpoint.
+        hash_format = (os.environ.get("TEYA_CHECKHASH_FORMAT") or "base64").lower().strip()
+        if hash_format == "hex":
+            check_hash = hmac_digest.hex()
+        else:
+            check_hash = base64.b64encode(hmac_digest).decode("utf-8")
 
         # Parameter names match the reference HikaShop plugin verbatim,
         # including the mixed casing (MerchantId, Orderid, Itemdescription_1).
@@ -420,7 +432,7 @@ class TeyaClient:
             "  return_url:     %s\n"
             "  secret_key_len: %d chars / %d bytes (%s)\n"
             "  hash_input:     %s\n"
-            "  check_hash:     %s\n"
+            "  check_hash:     %s (format=%s)\n"
             "  session_url:    %s",
             TEYA_SECUREPAY_URL,
             self.merchant_id,
@@ -435,6 +447,7 @@ class TeyaClient:
             "hex-decoded" if len(key_bytes) != len(TEYA_SECRET_KEY or "") else "utf-8",
             hash_input,
             check_hash,
+            hash_format,
             session_url,
         )
         if not TEYA_SECRET_KEY:
