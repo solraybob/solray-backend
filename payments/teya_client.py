@@ -50,6 +50,32 @@ TEYA_SECUREPAY_URL = os.environ.get(
 # is already in major units so no /100 conversion.
 _CURRENCIES_WITH_MINOR_UNITS = {"USD", "EUR", "GBP", "DKK", "NOK", "SEK", "CHF", "CAD"}
 
+# Approximate USD->foreign-currency rates for when we charge outside USD.
+# The subscription price is authored in USD cents ($23.00 = 2300) so we
+# convert to the gateway currency at these rates. Override with env var
+# (e.g. TEYA_USD_RATE_ISK=135) when the market moves materially.
+_DEFAULT_USD_RATES = {
+    "ISK": 130.0,  # $23 ≈ 2,990 ISK
+    "EUR": 0.92,
+    "GBP": 0.79,
+    "DKK": 6.85,
+    "NOK": 10.8,
+    "SEK": 10.5,
+    "CHF": 0.88,
+    "CAD": 1.36,
+    "JPY": 150.0,
+}
+
+
+def _usd_rate(code: str) -> float:
+    override = os.environ.get(f"TEYA_USD_RATE_{code}")
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
+    return _DEFAULT_USD_RATES.get(code, 1.0)
+
 
 class TeyaError(Exception):
     """Raised when the Borgun RPG API returns an error."""
@@ -245,16 +271,20 @@ class TeyaClient:
         error_url    = cancel_url
 
         # CRITICAL: Teya expects amount as a DECIMAL STRING with comma as the
-        # decimal separator and exactly two fractional digits — e.g. "23,00",
+        # decimal separator and exactly two fractional digits, e.g. "23,00",
         # never "2300" (minor units). Reference PHP:
         #   number_format($price, 2, ',', '')
-        # Internally our subscription stores price in USD cents. Convert to
-        # major units for currencies that use minor units; pass through for
-        # zero-decimal currencies (ISK, JPY).
-        if currency_alpha in _CURRENCIES_WITH_MINOR_UNITS:
-            amount_major = amount / 100.0
-        else:
-            amount_major = float(amount)
+        #
+        # Our subscription price is authored in USD cents ($23.00 = 2300).
+        # The gateway currency may not be USD (for an Iceland-routed merchant
+        # it is typically ISK), so we must:
+        #   1. Convert USD cents to USD dollars (divide by 100).
+        #   2. Multiply by the USD->target rate (configurable via env, e.g.
+        #      TEYA_USD_RATE_ISK=130 makes $23 land as 2,990 ISK).
+        # When the gateway currency IS USD, the rate is 1.0.
+        usd_dollars = amount / 100.0
+        rate = 1.0 if currency_alpha == "USD" else _usd_rate(currency_alpha)
+        amount_major = usd_dollars * rate
         amount_str = f"{amount_major:.2f}".replace(".", ",")
 
         # Per Borgun SecurePay spec: if returnurlsuccessserver is omitted
@@ -318,6 +348,7 @@ class TeyaClient:
             "  merchant_id:    %r\n"
             "  gateway_id:     %r\n"
             "  currency:       %s (raw=%s)\n"
+            "  usd_rate:       %.4f\n"
             "  amount:         %s\n"
             "  order_id:       %s\n"
             "  return_url:     %s\n"
@@ -329,6 +360,7 @@ class TeyaClient:
             self.merchant_id,
             gateway_id,
             currency_alpha, raw_currency,
+            rate,
             amount_str,
             order_id,
             return_url,
