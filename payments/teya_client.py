@@ -368,17 +368,16 @@ class TeyaClient:
             hashlib.sha256,
         ).digest()
 
-        # Borgun's SecurePay spec defines CheckHash as
-        #   Base64( HMAC-SHA256( secret, fields ) )
-        # Some reference third-party plugins (HikaShop) send HEX instead,
-        # which works for SOME merchants but fails for Teya's canonical
-        # validator. Default to base64; allow override via env for the
-        # rare case a merchant is on the legacy hex-accepting endpoint.
-        hash_format = (os.environ.get("TEYA_CHECKHASH_FORMAT") or "base64").lower().strip()
-        if hash_format == "hex":
-            check_hash = hmac_digest.hex()
-        else:
+        # Borgun's SecurePay form example shows CheckHash as a 64-character
+        # lowercase hex string, matching what the reference HikaShop Joomla
+        # plugin sends (PHP's hash_hmac with default args). Default to hex.
+        # TEYA_CHECKHASH_FORMAT=base64 is kept as an env override for any
+        # merchant on an endpoint that expects the raw spec-style base64.
+        hash_format = (os.environ.get("TEYA_CHECKHASH_FORMAT") or "hex").lower().strip()
+        if hash_format == "base64":
             check_hash = base64.b64encode(hmac_digest).decode("utf-8")
+        else:
+            check_hash = hmac_digest.hex()
 
         # Parameter names match the reference HikaShop plugin verbatim,
         # including the mixed casing (MerchantId, Orderid, Itemdescription_1).
