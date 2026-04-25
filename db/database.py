@@ -121,6 +121,7 @@ class User(Base):
     birth_lon     = Column(Float,       nullable=True)
     sex              = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
     profile_photo    = Column(Text,        nullable=True)    # base64 data URI
+    is_public        = Column(Boolean,     nullable=False, default=False)  # show full profile to connections
     email_verified   = Column(Boolean,     nullable=False, default=False)
     verification_token = Column(String(64), nullable=True)   # random token for email verify link
     created_at       = Column(DateTime,    nullable=False, default=datetime.utcnow)
@@ -257,6 +258,22 @@ async def init_db():
                     await conn.execute(text("ALTER TABLE users ADD COLUMN profile_photo TEXT"))
         except Exception as e:
             print(f"[init_db] profile_photo column migration note: {e}")
+
+        # is_public column — controls whether a user's profile is visible to
+        # their soul connections. Default false (private) so existing users
+        # don't get their charts exposed without consent.
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'is_public' not in cols:
+                    await conn.execute(text("ALTER TABLE users ADD COLUMN is_public BOOLEAN DEFAULT 0"))
+        except Exception as e:
+            print(f"[init_db] is_public column migration note: {e}")
 
         # email_verified (BOOLEAN) + verification_token (VARCHAR) columns
         try:

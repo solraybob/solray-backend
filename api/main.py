@@ -54,7 +54,8 @@ try:
 except ImportError:
     pass  # sentry-sdk not installed — monitoring disabled
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, Response
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from timezonefinder import TimezoneFinder
@@ -307,6 +308,7 @@ def _user_profile(user: User) -> dict:
         'birth_lon':     user.birth_lon,
         'sex':           getattr(user, 'sex', None),
         'profile_photo': getattr(user, 'profile_photo', None),
+        'is_public':     bool(getattr(user, 'is_public', False)),
         'created_at':    user.created_at.isoformat() if user.created_at else None,
     }
 
@@ -565,6 +567,7 @@ async def get_me(
 class ProfileUpdateRequest(BaseModel):
     name: Optional[str] = None
     username: Optional[str] = None
+    is_public: Optional[bool] = None
 
 @app.patch('/users/profile', summary='Update user profile')
 async def update_profile(
@@ -579,15 +582,126 @@ async def update_profile(
     if req.name:
         user.name = req.name
     if req.username:
-        # Check uniqueness
-        existing = await get_user_by_username(db, req.username)
+        # Normalise to URL-safe lowercase, then check uniqueness
+        cleaned = re.sub(r'[^a-z0-9_]', '', req.username.lower())[:30]
+        if not cleaned:
+            raise HTTPException(status_code=400, detail='Username must contain letters or numbers')
+        existing = await get_user_by_username(db, cleaned)
         if existing and existing.id != user_id:
             raise HTTPException(status_code=400, detail='Username already taken')
-        user.username = req.username
+        user.username = cleaned
+    if req.is_public is not None:
+        user.is_public = bool(req.is_public)
 
     await db.commit()
     await db.refresh(user)
-    return {'name': user.name, 'username': user.username}
+    return _user_profile(user)
+
+
+# ---------------------------------------------------------------------------
+# PATCH /users/birth — update birth details + recompute blueprint
+# ---------------------------------------------------------------------------
+
+class BirthUpdateRequest(BaseModel):
+    birth_date: str = Field(..., example='1989-09-05', description='YYYY-MM-DD')
+    birth_time: str = Field(..., example='12:30',      description='HH:MM (24h)')
+    birth_city: Optional[str]   = None
+    birth_lat:  Optional[float] = None
+    birth_lon:  Optional[float] = None
+
+@app.patch('/users/birth', summary='Update birth details and regenerate blueprint')
+async def update_birth(
+    req: BirthUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Updates the user's birth_date/time/city and rebuilds the full blueprint.
+
+    A successful update replaces the stored blueprint, so all downstream
+    surfaces (today, chart, souls, chat memory) reflect the corrected
+    chart on the next read. The current day's cached forecast is also
+    invalidated — it would be calculated from stale natal data otherwise.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    # Geocode the city if no lat/lon supplied
+    birth_lat = req.birth_lat
+    birth_lon = req.birth_lon
+    if (birth_lat is None or birth_lon is None) and req.birth_city:
+        try:
+            from astrology import geocode_city
+            geo = geocode_city(req.birth_city)
+            if geo:
+                birth_lat = birth_lat if birth_lat is not None else geo.get('lat')
+                birth_lon = birth_lon if birth_lon is not None else geo.get('lon')
+        except Exception:
+            pass
+
+    if birth_lat is None or birth_lon is None:
+        raise HTTPException(
+            status_code=400,
+            detail='Could not resolve birth location. Provide a recognized city or lat/lon directly.'
+        )
+
+    tz_offset = get_tz_offset(birth_lat, birth_lon, req.birth_date, req.birth_time)
+
+    try:
+        blueprint = engines.build_blueprint(
+            birth_date=req.birth_date,
+            birth_time=req.birth_time,
+            birth_city=req.birth_city,
+            birth_lat=birth_lat,
+            birth_lon=birth_lon,
+            tz_offset=tz_offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Blueprint calculation failed: {str(e)}')
+
+    # Persist new birth data + new blueprint in a SINGLE transaction so a
+    # mid-flow failure can't leave the user with new birth fields but a
+    # stale blueprint (which would show the wrong chart everywhere). We
+    # also wipe today's forecast in the same transaction; it was computed
+    # against the old natal chart.
+    import json as _json
+    import uuid as _uuid
+    from sqlalchemy import select as _select, delete as _delete
+    from db.database import Blueprint as _Blueprint, DailyForecast as _DailyForecast
+
+    try:
+        user.birth_date = req.birth_date
+        user.birth_time = req.birth_time
+        user.birth_city = req.birth_city
+        user.birth_lat  = birth_lat
+        user.birth_lon  = birth_lon
+
+        # Upsert blueprint within the SAME session — do not commit yet.
+        bp_existing = await db.execute(_select(_Blueprint).where(_Blueprint.user_id == user_id))
+        bp = bp_existing.scalar_one_or_none()
+        bp_json = _json.dumps(blueprint)
+        if bp:
+            bp.blueprint_json = bp_json
+            bp.updated_at = datetime.utcnow()
+        else:
+            db.add(_Blueprint(id=str(_uuid.uuid4()), user_id=user_id, blueprint_json=bp_json))
+
+        # Drop today's cached forecast — same session, same commit.
+        today_str = date.today().isoformat()
+        await db.execute(
+            _delete(_DailyForecast).where(
+                _DailyForecast.user_id == user_id,
+                _DailyForecast.forecast_date == today_str,
+            )
+        )
+
+        await db.commit()
+        await db.refresh(user)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f'Failed to save birth data: {str(e)}')
+
+    return {'profile': _user_profile(user), 'blueprint': blueprint}
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +775,59 @@ async def search_users_endpoint(
         })
 
     return {'results': results, 'count': len(results)}
+
+
+# ---------------------------------------------------------------------------
+# GET /users/{user_id}/public-profile — view a connection's profile if public
+# ---------------------------------------------------------------------------
+
+@app.get('/users/{target_user_id}/public-profile', summary='View a soul connection\'s profile')
+async def get_public_profile(
+    target_user_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return full profile + blueprint for a target user — but only if:
+       1. The viewer has an accepted soul connection with the target, AND
+       2. The target has set is_public=true.
+    Otherwise return a minimal shape with is_public=false so the UI can
+    show a 'private' indicator without leaking any chart data.
+    """
+    target = await get_user_by_id(db, target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    # Connection check: scan accepted souls for either direction
+    connections = await get_accepted_souls(db, user_id)
+    is_connected = any(
+        (c.requester_id == user_id and c.recipient_id == target_user_id) or
+        (c.recipient_id == user_id and c.requester_id == target_user_id)
+        for c in connections
+    )
+    if not is_connected:
+        raise HTTPException(status_code=403, detail='Not a soul connection')
+
+    # Always-safe minimal payload
+    minimal = {
+        'id':         target.id,
+        'username':   target.username,
+        'name':       target.name,
+        'profile_photo': getattr(target, 'profile_photo', None),
+        'is_public':  bool(getattr(target, 'is_public', False)),
+    }
+
+    if not minimal['is_public']:
+        return minimal
+
+    # Public — surface the full chart + blueprint
+    blueprint = await get_blueprint(db, target_user_id)
+    return {
+        **minimal,
+        'birth_date': target.birth_date,
+        'birth_time': target.birth_time,
+        'birth_city': target.birth_city,
+        'blueprint':  blueprint,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1461,8 +1628,20 @@ async def cancel_sub(
 async def subscription_status(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
+    response: Response = None,
 ):
-    """Return current subscription state and access level."""
+    """Return current subscription state and access level.
+    
+    Cache-Control: no-cache, no-store, must-revalidate ensures the browser
+    never serves stale subscription data. Payment activation must be visible
+    immediately, not 5 minutes later.
+    """
+    # Force no caching
+    if response:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    
     sub = await get_subscription(db, user_id)
     if not sub:
         return {
@@ -1491,25 +1670,224 @@ async def create_securepay(
 ):
     """Generate a Borgun SecurePay hosted page URL.
     The frontend redirects the user there to enter card details.
-    On success, Borgun redirects back with a token.
+    On success, Borgun redirects back to /subscribe/teya-return with a token.
+
+    We persist a PaymentEvent with event_type='session_created' and the
+    SecurePay orderid in teya_transaction_id so the return-callback (which
+    has no user cookie) can map orderid -> user_id and activate the sub.
     """
     sub = await get_subscription(db, user_id)
     if not sub:
         raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
 
     try:
+        backend_base = os.environ.get("BACKEND_BASE_URL", "https://solray-backend-production.up.railway.app")
+        return_url = f"{backend_base}/subscribe/teya-return"
         result = await teya.create_securepay_session(
-            return_url="https://app.solray.ai/subscribe/callback",
-            cancel_url="https://app.solray.ai/subscribe/cancelled",
+            return_url=return_url,
+            cancel_url=return_url,
             amount=sub.price_amount,  # Charge first month via SecurePay hosted form
+            success_server_url=return_url,  # Teya requires returnurlsuccessserver to match returnurlsuccess
         )
+
+        session_url = result.get("SessionUrl") or result.get("url")
+        session_token = result.get("SessionToken")  # This is the SecurePay orderid
+
+        # Persist orderid -> user_id mapping so the return callback (which
+        # comes back on the browser with no auth context) can find who to
+        # activate. Use an immutable PaymentEvent row, so we also get an
+        # audit trail of every checkout attempt.
+        if session_token:
+            from payments.subscription_manager import _log_event
+            await _log_event(
+                db,
+                user_id=user_id,
+                subscription_id=sub.id,
+                event_type="session_created",
+                amount=sub.price_amount,
+                currency=sub.price_currency,
+                teya_transaction_id=str(session_token),
+                teya_status="pending",
+                teya_response=None,
+            )
+            await db.commit()
+
         return {
-            "session_url": result.get("SessionUrl") or result.get("url"),
-            "session_token": result.get("SessionToken"),
+            "session_url": session_url,
+            "session_token": session_token,
         }
     except TeyaError as e:
         logger.error("[payments] SecurePay session creation failed: %s", e.message)
         raise HTTPException(status_code=502, detail="Could not create payment session. Please try again.")
+
+
+@app.api_route('/subscribe/teya-return', methods=["GET", "POST"], summary='Teya SecurePay return callback')
+async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
+    """Return URL for Teya SecurePay. Borgun sends the browser (and, if
+    configured, a server-to-server POST) back here after card entry.
+
+    Responsibilities:
+      1. Log every parameter Teya sent (audit + debugging).
+      2. Look up the user who started this checkout via PaymentEvent where
+         event_type='session_created' AND teya_transaction_id=Orderid.
+      3. If successful, call attach_card() + mark subscription active and
+         log a 'charge' PaymentEvent.
+      4. Redirect the browser to the frontend:
+         - success -> /subscribe?activated=1 (page re-fetches status)
+         - failure -> /subscribe/cancelled?<teya error params>
+    """
+    from payments.models import PaymentEvent, Subscription
+    from payments.subscription_manager import _log_event, BILLING_CYCLE_DAYS
+    from datetime import datetime, timedelta
+    from sqlalchemy import select
+
+    qp = dict(request.query_params)
+    form = {}
+    try:
+        form = dict(await request.form())
+    except Exception:
+        pass
+
+    logger.warning(
+        "[Teya] return callback\n"
+        " method: %s\n"
+        " path: %s\n"
+        " query: %s\n"
+        " form: %s\n"
+        " headers: %s",
+        request.method,
+        request.url.path,
+        qp,
+        form,
+        {k: v for k, v in request.headers.items() if k.lower() not in {"cookie", "authorization"}},
+    )
+
+    merged = {**qp, **form}
+
+    # Case-insensitive lookup helper: Borgun mixes casing (Orderid vs orderid,
+    # Token vs token, etc.) between product versions.
+    def pick(*names: str) -> str:
+        lowered = {k.lower(): v for k, v in merged.items()}
+        for n in names:
+            v = lowered.get(n.lower())
+            if v:
+                return v
+        return ""
+
+    order_id = pick("Orderid", "OrderID", "orderid", "order_id", "reference")
+    token = pick("Token", "token")
+    masked_pan = pick("pan", "PAN", "maskedpan", "MaskedPAN", "cardnumbermasked", "CardNumberMasked")
+    card_type = pick("card_type", "cardtype", "CardType", "cardbrand", "CardBrand")
+    status_raw = pick("Status", "status", "ResponseCode", "responsecode", "ActionCode", "actioncode")
+    status_val = status_raw.lower()
+    transaction_id = pick("transactionid", "TransactionID", "transaction_id", "paymentid", "PaymentID")
+
+    frontend = "https://app.solray.ai"
+
+    # Derive success: explicit status, OR presence of a token (Borgun sometimes
+    # omits a status field entirely on success and only sends token + pan).
+    is_success = bool(token) or status_val in {"success", "ok", "approved", "completed", "000"}
+
+    # Failure path: redirect to cancelled with full query string so the user
+    # (and we) can see why.
+    if not is_success:
+        target = f"{frontend}/subscribe/cancelled?{request.url.query}"
+        logger.warning("[Teya] callback treated as failure, redirecting to %s", target)
+        return RedirectResponse(target, status_code=302)
+
+    # Success path: find who this checkout belongs to.
+    user_id: Optional[str] = None
+    sub_obj: Optional[object] = None
+    if order_id:
+        result = await db.execute(
+            select(PaymentEvent)
+            .where(PaymentEvent.event_type == "session_created")
+            .where(PaymentEvent.teya_transaction_id == str(order_id))
+            .order_by(PaymentEvent.created_at.desc())
+            .limit(1)
+        )
+        event_row = result.scalar_one_or_none()
+        if event_row:
+            user_id = event_row.user_id
+            sub_lookup = await db.execute(
+                select(Subscription).where(Subscription.id == event_row.subscription_id)
+            )
+            sub_obj = sub_lookup.scalar_one_or_none()
+
+    if not user_id or not sub_obj:
+        logger.error(
+            "[Teya] return callback could not resolve user for orderid=%r. "
+            "Redirecting to /subscribe so the user can retry.",
+            order_id,
+        )
+        target = f"{frontend}/subscribe?activation=unknown"
+        return RedirectResponse(target, status_code=302)
+
+    # Idempotency: if this orderid already has a 'charge' event, we've
+    # already activated this checkout. Just redirect the user to the
+    # success page without touching the DB again. Protects against Borgun
+    # firing both a server-to-server POST and a browser GET, or the user
+    # hitting back + forward in their browser.
+    already_charged = await db.execute(
+        select(PaymentEvent)
+        .where(PaymentEvent.event_type == "charge")
+        .where(PaymentEvent.teya_transaction_id == str(order_id))
+        .limit(1)
+    )
+    if already_charged.scalar_one_or_none():
+        logger.info(
+            "[Teya] return callback is a duplicate for orderid=%s, skipping re-activation",
+            order_id,
+        )
+        target = f"{frontend}/subscribe?activated=1"
+        return RedirectResponse(target, status_code=302)
+
+    # Derive card_last_four from masked pan (keep only the last 4 digits).
+    last_four = ""
+    if masked_pan:
+        digits = "".join(c for c in masked_pan if c.isdigit())
+        if digits:
+            last_four = digits[-4:]
+
+    brand = (card_type or "Card").title()
+
+    # Write card details + flip to active. We do this inline (rather than
+    # calling attach_card + second commit) so it's a single transaction.
+    now = datetime.utcnow()
+    sub_obj.teya_token = token or sub_obj.teya_token
+    if last_four:
+        sub_obj.card_last_four = last_four
+    if brand:
+        sub_obj.card_brand = brand
+    sub_obj.status = "active"
+    sub_obj.current_period_start = now
+    sub_obj.current_period_end = now + timedelta(days=BILLING_CYCLE_DAYS)
+    sub_obj.retry_count = 0
+    sub_obj.next_retry_at = None
+    sub_obj.updated_at = now
+
+    # Audit the successful first charge. SecurePay charged us before sending
+    # the browser back, so this row represents the real money movement.
+    await _log_event(
+        db,
+        user_id=user_id,
+        subscription_id=sub_obj.id,
+        event_type="charge",
+        amount=sub_obj.price_amount,
+        currency=sub_obj.price_currency,
+        teya_transaction_id=transaction_id or str(order_id),
+        teya_status=status_raw or "success",
+        teya_response=str(merged),
+    )
+    await db.commit()
+
+    logger.warning(
+        "[Teya] subscription activated via SecurePay return: user=%s sub=%s order=%s token=%s brand=%s ..%s",
+        user_id, sub_obj.id, order_id, (token or "")[:6] + "...", brand, last_four,
+    )
+
+    target = f"{frontend}/subscribe?activated=1"
+    return RedirectResponse(target, status_code=302)
 
 
 @app.post('/admin/billing-cycle', summary='Manually trigger a billing cycle (admin only)')
