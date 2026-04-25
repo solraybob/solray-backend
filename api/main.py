@@ -603,11 +603,14 @@ async def update_profile(
 # ---------------------------------------------------------------------------
 
 class BirthUpdateRequest(BaseModel):
-    birth_date: str = Field(..., example='1989-09-05', description='YYYY-MM-DD')
-    birth_time: str = Field(..., example='12:30',      description='HH:MM (24h)')
-    birth_city: Optional[str]   = None
-    birth_lat:  Optional[float] = None
-    birth_lon:  Optional[float] = None
+    # Strict shapes so a malformed payload cannot reach build_blueprint and
+    # silently corrupt the user's stored chart. Pydantic rejects on first
+    # mismatch, returning 422 before we touch the DB.
+    birth_date: str   = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}$', example='1989-09-05', description='YYYY-MM-DD')
+    birth_time: str   = Field(..., pattern=r'^\d{2}:\d{2}$',       example='12:30',      description='HH:MM (24h)')
+    birth_city: Optional[str]   = Field(None, max_length=255)
+    birth_lat:  Optional[float] = Field(None, ge=-90.0,  le=90.0)
+    birth_lon:  Optional[float] = Field(None, ge=-180.0, le=180.0)
 
 @app.patch('/users/birth', summary='Update birth details and regenerate blueprint')
 async def update_birth(
@@ -625,6 +628,18 @@ async def update_birth(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail='User not found')
+
+    # Hard parseability checks — Pydantic verified the SHAPE, not that the
+    # values are real. "9999-99-99" matches the regex; datetime.strptime
+    # is the gate that rejects it.
+    try:
+        datetime.strptime(req.birth_date, '%Y-%m-%d')
+    except ValueError:
+        raise HTTPException(status_code=400, detail='birth_date is not a real calendar date.')
+    try:
+        datetime.strptime(req.birth_time, '%H:%M')
+    except ValueError:
+        raise HTTPException(status_code=400, detail='birth_time must be a valid 24h time (HH:MM).')
 
     # Geocode the city if no lat/lon supplied
     birth_lat = req.birth_lat
@@ -796,6 +811,24 @@ async def get_public_profile(
     target = await get_user_by_id(db, target_user_id)
     if not target:
         raise HTTPException(status_code=404, detail='User not found')
+
+    # Self-view: always allowed, returns the full payload regardless of
+    # the user's own is_public flag (it's THEIR data). Saves the caller
+    # from special-casing /profile/{my_own_id} in the UI.
+    if target_user_id == user_id:
+        blueprint = await get_blueprint(db, user_id)
+        return {
+            'id':            target.id,
+            'username':      target.username,
+            'name':          target.name,
+            'profile_photo': getattr(target, 'profile_photo', None),
+            'is_public':     bool(getattr(target, 'is_public', False)),
+            'birth_date':    target.birth_date,
+            'birth_time':    target.birth_time,
+            'birth_city':    target.birth_city,
+            'blueprint':     blueprint,
+            'is_self':       True,
+        }
 
     # Connection check: scan accepted souls for either direction
     connections = await get_accepted_souls(db, user_id)
