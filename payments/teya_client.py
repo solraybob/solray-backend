@@ -85,36 +85,26 @@ def _usd_rate(code: str) -> float:
 def _secret_key_bytes() -> bytes:
     """Return the HMAC key bytes for Teya CheckHash.
 
-    Teya's portal delivers the SecretKey as 32 hex characters (e.g.
-    "d64f2893e921a9434664668d51d00383") which represents a 16-byte binary
-    key. For the HMAC signature to match, we must hex-decode before passing
-    to hmac.new; using the hex STRING as the key produces a different
-    signature that Teya's validator rejects.
+    Default is UTF-8 — which is what the Teya production merchants we've
+    deployed against actually require for the CheckHash to validate. An
+    earlier draft auto-detected pure-hex strings and hex-decoded them,
+    on the theory that the portal's hex-formatted secret should be
+    treated as 16 bytes of binary key. That theory was wrong for our
+    merchant and broke paid signups on 2026-04-26 when the env-var
+    override that forced UTF-8 was lost. Removing the auto-detect makes
+    the working path the only default path; an env-var override is
+    preserved for any future merchant that genuinely needs hex/base64.
 
-    Detection rule: if the key is pure hex of length 32 or 64, decode it;
-    otherwise assume it's already a plain string and UTF-8 encode it. This
-    preserves backward compatibility for any deployments that configured
-    the secret as a string.
-
-    Explicit override via TEYA_SECRET_KEY_FORMAT = "hex" | "utf8" | "base64"
-    when auto-detection is ambiguous.
+    Explicit override via TEYA_SECRET_KEY_FORMAT = "hex" | "utf8" | "base64".
     """
     key = TEYA_SECRET_KEY or ""
     override = (os.environ.get("TEYA_SECRET_KEY_FORMAT") or "").lower().strip()
 
-    if override == "utf8":
-        return key.encode("utf-8")
     if override == "hex":
         return bytes.fromhex(key)
     if override == "base64":
         return base64.b64decode(key)
-
-    # Auto-detect: pure hex of typical HMAC key lengths gets decoded.
-    if len(key) in (32, 64) and all(c in "0123456789abcdefABCDEF" for c in key):
-        try:
-            return bytes.fromhex(key)
-        except ValueError:
-            pass
+    # Default — and explicit "utf8" — both fall through to here.
     return key.encode("utf-8")
 
 
