@@ -396,17 +396,33 @@ async def register(
             tz_offset=tz_offset,
         )
     except Exception as e:
-        # Blueprint calculation failed — user is created but without blueprint
-        # Log the error and capture to Sentry for debugging
+        # Blueprint calculation failed. The user row was already committed
+        # by create_user — if we leave it there, the user's email is now
+        # permanently taken with a half-formed account they can't log
+        # into and can't re-register. Roll the user row back so they can
+        # retry with the same email (or a corrected birth city).
         logger.exception(f"Blueprint calculation failed during registration for {req.email}")
         try:
             import sentry_sdk as _sentry
             _sentry.capture_exception(e)
         except Exception:
             logger.warning("Sentry not available for error reporting")
+        try:
+            from sqlalchemy import delete as _delete
+            from db.database import User as _User
+            await db.execute(_delete(_User).where(_User.id == user_id))
+            await db.commit()
+        except Exception as _cleanup_err:
+            logger.exception(
+                "Failed to roll back user row after blueprint failure for %s; "
+                "manual cleanup required: %s", req.email, _cleanup_err,
+            )
         raise HTTPException(
             status_code=500,
-            detail=f'User created but blueprint calculation failed: {str(e)}'
+            detail=(
+                'Could not build your chart from that birth data. Please '
+                'check the city name and try again.'
+            ),
         )
 
     # Store blueprint
