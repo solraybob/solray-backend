@@ -44,22 +44,25 @@ async def require_premium(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> str:
-    """FastAPI dependency: returns user_id if they have premium access
-    AND verified email, raises 403 otherwise.
-    Founders bypass both checks entirely.
+    """FastAPI dependency: returns user_id if they have premium access,
+    raises 403 otherwise. Founders bypass entirely.
+
+    Email verification is intentionally NOT enforced here. We used to
+    block until a user clicked the verification link, but that turned
+    into a hard wall for new signups whose email took a minute to
+    arrive (or arrived in spam). On 2026-04-26, an Instagram surge
+    drove a wave of new users straight into a 403 loop on /today
+    immediately after registration, with no obvious way out. Email
+    verification still happens via the link in the welcome email and
+    flips user.email_verified=True, but it doesn't gate access. Any
+    UI affordance to nudge unverified users belongs in the frontend
+    (a soft banner, never a block).
     """
     user = await get_user_by_id(db, user_id)
 
     # Founders always pass
     if user and user.email in FOUNDER_EMAILS:
         return user_id
-
-    # Email verification check
-    if user and not user.email_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Please verify your email address first. Check your inbox for the verification link.",
-        )
 
     # Subscription check
     sub = await get_subscription(db, user_id)
