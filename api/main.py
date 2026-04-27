@@ -1872,7 +1872,7 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
             "[Teya] return callback is a duplicate for orderid=%s, skipping re-activation",
             order_id,
         )
-        target = f"{frontend}/subscribe?activated=1"
+        target = f"{frontend}/subscribe/welcome"
         return RedirectResponse(target, status_code=302)
 
     # Derive card_last_four from masked pan (keep only the last 4 digits).
@@ -1919,7 +1919,7 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
         user_id, sub_obj.id, order_id, (token or "")[:6] + "...", brand, last_four,
     )
 
-    target = f"{frontend}/subscribe?activated=1"
+    target = f"{frontend}/subscribe/welcome"
     return RedirectResponse(target, status_code=302)
 
 
