@@ -2553,4 +2553,89 @@ async def push_subscribe(
         pass
 
     return {'subscribed': True}
+
+
+# ---------------------------------------------------------------------------
+# POST /push/native-subscribe — Store APNs / FCM device token
+# ---------------------------------------------------------------------------
+#
+# Web push uses an "endpoint URL + p256dh + auth" tuple. Native iOS uses
+# a 64-char APNs hex token. Native Android uses a (much longer) FCM
+# string. They're not interchangeable, so we store them in a separate
+# table keyed by (user_id, platform, device_token) with platform-side
+# uniqueness so a single user with phone+tablet has multiple rows.
+# ---------------------------------------------------------------------------
+
+class NativePushSubscribeRequest(BaseModel):
+    device_token: str = Field(..., min_length=8, max_length=512)
+    platform:     str = Field(..., pattern=r'^(ios|android|unknown)$')
+    app_version:  Optional[str] = Field(None, max_length=120)
+
+@app.post('/push/native-subscribe', summary='Register a native APNs/FCM device token')
+async def push_native_subscribe(
+    req: NativePushSubscribeRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store the APNs (iOS) or FCM (Android) device token for the
+    authenticated user, so the backend can deliver native pushes via
+    the appropriate provider later.
+
+    Idempotent at the (user_id, device_token) level — re-registering
+    the same token by the same user updates the platform/app_version
+    in place rather than creating duplicate rows.
+    """
+    from sqlalchemy import text
+    import uuid
+
+    # Create the table if it doesn't exist. Schema chosen to be Postgres-
+    # and SQLite-compatible. The unique constraint on (user_id, device_token)
+    # is what makes the upsert safe.
+    try:
+        await db.execute(text("""
+            CREATE TABLE IF NOT EXISTS native_push_tokens (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                device_token TEXT NOT NULL,
+                platform VARCHAR(16) NOT NULL,
+                app_version VARCHAR(120),
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (user_id, device_token)
+            )
+        """))
+        await db.commit()
+    except Exception as e:
+        logger.warning("[push_native_subscribe] table create note: %s", e)
+
+    try:
+        # Upsert by (user_id, device_token) so a user re-launching the app
+        # doesn't create infinite rows. Postgres UPSERT syntax via
+        # ON CONFLICT works on Postgres; SQLite supports the same syntax
+        # since 3.24+.
+        await db.execute(
+            text("""
+                INSERT INTO native_push_tokens
+                    (id, user_id, device_token, platform, app_version)
+                VALUES
+                    (:id, :uid, :tok, :plat, :ver)
+                ON CONFLICT (user_id, device_token) DO UPDATE SET
+                    platform = EXCLUDED.platform,
+                    app_version = EXCLUDED.app_version,
+                    updated_at = NOW()
+            """),
+            {
+                "id":   str(uuid.uuid4()),
+                "uid":  user_id,
+                "tok":  req.device_token,
+                "plat": req.platform,
+                "ver":  req.app_version,
+            },
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning("[push_native_subscribe] upsert failed: %s", e)
+        return {"subscribed": False}
+
+    return {"subscribed": True, "platform": req.platform}
 # Force redeploy Tue Apr 14 18:15:01 CEST 2026
