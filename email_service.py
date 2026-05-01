@@ -78,6 +78,69 @@ async def send_verification_email(to_email: str, name: str, token: str) -> bool:
     )
 
 
+async def send_password_reset_email(to_email: str, name: str, token: str) -> bool:
+    """Send a password-reset email with a one-click reset link.
+
+    The token is single-use and expires in 1 hour. The link points at
+    /reset-password/<token> on the frontend, which collects the new
+    password and POSTs to /users/reset-password.
+
+    Returns True if Resend accepted the message, False otherwise. We
+    never reveal delivery success or failure to the requesting user
+    (the /users/forgot-password endpoint always returns ok), so this
+    return value is for logging only.
+    """
+    reset_url = f"{APP_URL}/reset-password/{token}"
+
+    html = f"""
+    <div style="font-family: 'Inter', system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 24px; color: #e8e0cc; background: #050f08;">
+      <div style="text-align: center; margin-bottom: 32px;">
+        <h1 style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 28px; font-weight: 300; color: #e8e0cc; margin: 0;">
+          Reset your Solray password
+        </h1>
+      </div>
+
+      <p style="font-size: 15px; line-height: 1.6; color: #8a9e8d; margin-bottom: 24px;">
+        {name}, we got a request to reset your password. Tap the button below
+        to set a new one. The link is good for one hour.
+      </p>
+
+      <div style="text-align: center; margin: 32px 0;">
+        <a href="{reset_url}"
+           style="display: inline-block; padding: 14px 36px; background: #e8821a; color: #050f08;
+                  font-size: 14px; font-weight: 500; letter-spacing: 0.5px; text-decoration: none;
+                  border-radius: 2px;">
+          Reset password
+        </a>
+      </div>
+
+      <p style="font-size: 12px; color: #8a9e8d; line-height: 1.5;">
+        If the button does not work, copy this link into your browser:
+      </p>
+      <p style="font-size: 12px; color: #8a9e8d; word-break: break-all;">
+        {reset_url}
+      </p>
+
+      <p style="font-size: 12px; color: #8a9e8d; line-height: 1.5; margin-top: 24px;">
+        If you did not request this, ignore this email. Your password
+        will stay the way it is.
+      </p>
+
+      <hr style="border: none; border-top: 1px solid #1a3020; margin: 32px 0;" />
+
+      <p style="font-size: 11px; color: #8a9e8d; text-align: center;">
+        Solray. Living by design.
+      </p>
+    </div>
+    """
+
+    return await _send(
+        to=to_email,
+        subject="Reset your Solray password",
+        html=html,
+    )
+
+
 async def _send(to: str, subject: str, html: str) -> bool:
     """Low-level Resend API call."""
     if not RESEND_API_KEY:

@@ -125,6 +125,8 @@ class User(Base):
     analytics_opt_out= Column(Boolean,     nullable=False, default=False)  # disable analytics event recording
     email_verified   = Column(Boolean,     nullable=False, default=False)
     verification_token = Column(String(64), nullable=True)   # random token for email verify link
+    password_reset_token   = Column(String(64), nullable=True)   # random token for password reset link
+    password_reset_expires = Column(DateTime,   nullable=True)   # token expiry (typically NOW + 1h)
     created_at       = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
     blueprint     = relationship('Blueprint', back_populates='user', uselist=False, cascade='all, delete-orphan')
@@ -341,6 +343,28 @@ async def init_db():
                     ))
         except Exception as e:
             print(f"[init_db] analytics_opt_out column migration note: {e}")
+
+        # password_reset_token + password_reset_expires columns on User.
+        # Backs the /users/forgot-password and /users/reset-password
+        # endpoints. NULL on every existing row — they only get values
+        # when a user actually requests a reset.
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token VARCHAR(64)"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires TIMESTAMP"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'password_reset_token' not in cols:
+                    await conn.execute(text("ALTER TABLE users ADD COLUMN password_reset_token VARCHAR(64)"))
+                if 'password_reset_expires' not in cols:
+                    await conn.execute(text("ALTER TABLE users ADD COLUMN password_reset_expires TIMESTAMP"))
+        except Exception as e:
+            print(f"[init_db] password_reset columns migration note: {e}")
 
         # analytics_events table. Stores the event stream that powers
         # the funnel dashboard, retention cohorts, and the canary alerts.

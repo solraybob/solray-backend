@@ -577,6 +577,118 @@ async def get_me(
 
 
 # ---------------------------------------------------------------------------
+# POST /users/forgot-password — request a password reset link
+# ---------------------------------------------------------------------------
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+@app.post('/users/forgot-password', summary='Request a password reset email')
+async def forgot_password(
+    req: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a reset token, store it on the user with an expiry, and
+    send an email containing the reset link.
+
+    Anti-enumeration: this endpoint ALWAYS returns the same success
+    payload, whether the email exists or not. We never reveal which
+    addresses have accounts. The downside is users who mistype their
+    email get a soft "check your inbox" with no clue why no email
+    arrived; the upside is attackers can't probe for valid emails.
+    """
+    from email_service import send_password_reset_email, generate_verification_token
+    from datetime import datetime, timedelta
+
+    user = await get_user_by_email(db, req.email.lower())
+    if user:
+        token = generate_verification_token()
+        user.password_reset_token = token
+        user.password_reset_expires = datetime.utcnow() + timedelta(hours=1)
+        try:
+            await db.commit()
+        except Exception as e:
+            logger.warning("[forgot_password] commit failed for %s: %s", req.email, e)
+            await db.rollback()
+            # Fall through — return ok anyway so we don't leak existence
+        else:
+            try:
+                await send_password_reset_email(user.email, user.name or "there", token)
+            except Exception as e:
+                logger.warning("[forgot_password] email send failed for %s: %s", user.email, e)
+
+    # Same shape regardless of whether the user existed.
+    return {
+        "ok": True,
+        "message": "If that email is registered, a reset link is on the way."
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /users/reset-password — consume a reset token, set new password
+# ---------------------------------------------------------------------------
+
+class ResetPasswordRequest(BaseModel):
+    token:        str = Field(..., min_length=32, max_length=128)
+    new_password: str = Field(..., min_length=6, max_length=200)
+
+
+@app.post('/users/reset-password', summary='Set a new password using a reset token')
+async def reset_password(
+    req: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Find the user by token, verify it hasn't expired, hash + store
+    the new password, and invalidate the token. Returns a fresh JWT
+    so the user is logged in immediately after reset (no re-login UX
+    on top of a frustrating forgot-password flow).
+    """
+    from sqlalchemy import select as _select
+    from datetime import datetime
+    from db.database import User as _User
+
+    # Look up by token only — no email needed in the request, the
+    # token itself proves the user controls the inbox we sent it to.
+    result = await db.execute(
+        _select(_User).where(_User.password_reset_token == req.token)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has already been used.")
+
+    if not user.password_reset_expires or user.password_reset_expires < datetime.utcnow():
+        # Clear the stale token so it can't be re-attempted.
+        user.password_reset_token = None
+        user.password_reset_expires = None
+        await db.commit()
+        raise HTTPException(status_code=400, detail="This reset link has expired. Request a new one from the login page.")
+
+    # Hash + persist + invalidate token (single atomic commit so a
+    # mid-flight failure doesn't leave the token spent without the
+    # password actually changing).
+    try:
+        user.password_hash = hash_password(req.new_password)
+        user.password_reset_token = None
+        user.password_reset_expires = None
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.exception("[reset_password] commit failed for user %s: %s", user.id, e)
+        raise HTTPException(status_code=500, detail="Could not save the new password. Try again.")
+
+    # Issue a fresh JWT so the user is logged in immediately.
+    new_token = create_access_token(user_id=user.id, email=user.email)
+
+    return {
+        "ok": True,
+        "token": new_token,
+        "user_id": user.id,
+        "profile": _user_profile(user),
+    }
+
+
+# ---------------------------------------------------------------------------
 # PATCH /users/profile
 # ---------------------------------------------------------------------------
 
