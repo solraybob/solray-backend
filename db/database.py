@@ -122,6 +122,7 @@ class User(Base):
     sex              = Column(String(10),  nullable=True)    # 'male' | 'female' | None (legacy)
     profile_photo    = Column(Text,        nullable=True)    # base64 data URI
     is_public        = Column(Boolean,     nullable=False, default=False)  # show full profile to connections
+    analytics_opt_out= Column(Boolean,     nullable=False, default=False)  # disable analytics event recording
     email_verified   = Column(Boolean,     nullable=False, default=False)
     verification_token = Column(String(64), nullable=True)   # random token for email verify link
     created_at       = Column(DateTime,    nullable=False, default=datetime.utcnow)
@@ -321,6 +322,60 @@ async def init_db():
                     ))
         except Exception as e:
             print(f"[init_db] surface_next column migration note: {e}")
+
+        # analytics_opt_out column on User. Defaults to FALSE so existing
+        # users are tracked unless they explicitly opt out from settings.
+        # The frontend respects the same flag from localStorage too — this
+        # column is the durable, cross-device source of truth.
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS analytics_opt_out BOOLEAN DEFAULT FALSE"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'analytics_opt_out' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN analytics_opt_out BOOLEAN DEFAULT 0"
+                    ))
+        except Exception as e:
+            print(f"[init_db] analytics_opt_out column migration note: {e}")
+
+        # analytics_events table. Stores the event stream that powers
+        # the funnel dashboard, retention cohorts, and the canary alerts.
+        # 90-day auto-purge handled by the cron in analytics/retention.py;
+        # see GDPR note below.
+        #
+        # Schema choices:
+        #   - user_id is nullable so anonymous events (landing, /onboard
+        #     pre-register) can flow through. We don't tie events to
+        #     identifiers we don't have yet.
+        #   - props is TEXT (JSON) for portability; Postgres-specific
+        #     JSONB requires a separate code path and we're not running
+        #     queries that need it yet.
+        #   - Indexes target the two queries the dashboard + canary
+        #     actually run: by event_name within a time window, and by
+        #     user_id within a time window.
+        try:
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS analytics_events (
+                    id          VARCHAR(36) PRIMARY KEY,
+                    user_id     VARCHAR(36),
+                    session_id  VARCHAR(36) NOT NULL,
+                    event_name  VARCHAR(64) NOT NULL,
+                    props       TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_ae_name_created ON analytics_events(event_name, created_at)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_ae_user_created ON analytics_events(user_id, created_at)"
+            ))
+        except Exception as e:
+            print(f"[init_db] analytics_events table migration note: {e}")
 
 
 # ---------------------------------------------------------------------------

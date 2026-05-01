@@ -1767,6 +1767,25 @@ async def create_securepay(
         }
     except TeyaError as e:
         logger.error("[payments] SecurePay session creation failed: %s", e.message)
+        # Persist a session_failed PaymentEvent so the canary detects the
+        # outage even if no end-user complains. Best-effort; never let
+        # this masking write fail the original error response.
+        try:
+            from payments.subscription_manager import _log_event
+            await _log_event(
+                db,
+                user_id=user_id,
+                subscription_id=sub.id if sub else None,
+                event_type="session_failed",
+                amount=sub.price_amount if sub else 0,
+                currency=sub.price_currency if sub else "USD",
+                teya_transaction_id=None,
+                teya_status="error",
+                teya_response=str(e.message)[:2000],
+            )
+            await db.commit()
+        except Exception as _e:
+            logger.warning("[payments] could not log session_failed event: %s", _e)
         raise HTTPException(status_code=502, detail="Could not create payment session. Please try again.")
 
 
@@ -1838,8 +1857,42 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
     is_success = bool(token) or status_val in {"success", "ok", "approved", "completed", "000"}
 
     # Failure path: redirect to cancelled with full query string so the user
-    # (and we) can see why.
+    # (and we) can see why. Also persist a 'charge_failed' PaymentEvent so
+    # the canary can detect systemic failures without scraping logs.
     if not is_success:
+        try:
+            # Attempt to find the user via order_id so the failed event is
+            # attributable. If we can't, log a sentinel row anyway — the
+            # canary just counts these.
+            failed_user_id = None
+            failed_sub_id = None
+            if order_id:
+                _r = await db.execute(
+                    select(PaymentEvent)
+                    .where(PaymentEvent.event_type == "session_created")
+                    .where(PaymentEvent.teya_transaction_id == str(order_id))
+                    .order_by(PaymentEvent.created_at.desc())
+                    .limit(1)
+                )
+                _ev = _r.scalar_one_or_none()
+                if _ev:
+                    failed_user_id = _ev.user_id
+                    failed_sub_id  = _ev.subscription_id
+            if failed_user_id and failed_sub_id:
+                await _log_event(
+                    db,
+                    user_id=failed_user_id,
+                    subscription_id=failed_sub_id,
+                    event_type="charge_failed",
+                    amount=0,
+                    currency="USD",
+                    teya_transaction_id=str(order_id) if order_id else None,
+                    teya_status=status_raw or "failed",
+                    teya_response=str(merged)[:2000],
+                )
+                await db.commit()
+        except Exception as _e:
+            logger.warning("[Teya] could not log charge_failed event: %s", _e)
         target = f"{frontend}/subscribe/cancelled?{request.url.query}"
         logger.warning("[Teya] callback treated as failure, redirecting to %s", target)
         return RedirectResponse(target, status_code=302)
@@ -2638,4 +2691,151 @@ async def push_native_subscribe(
         return {"subscribed": False}
 
     return {"subscribed": True, "platform": req.platform}
+
+
+# ===========================================================================
+# ANALYTICS — event ingestion + privacy controls
+# ===========================================================================
+#
+# What we track:    funnel events, feature usage, error events, subscription
+#                   transitions. Event-shaped, aggregate-friendly.
+# What we never track: chat/forecast content, identifiable behavior beyond
+#                      user_id, third-party trackers.
+# Retention:        90 days, auto-purged by analytics/retention.py cron.
+# User control:     analytics_opt_out flag on User; respected on every
+#                   insert. PATCH /users/analytics-opt-out toggles it.
+# GDPR delete:      DELETE /users/me/analytics wipes a user's events on
+#                   demand.
+# ===========================================================================
+
+class AnalyticsEventIn(BaseModel):
+    event_name: str = Field(..., min_length=1, max_length=64,
+                            pattern=r'^[a-z0-9_]+$',
+                            description='Snake_case event name. No PII permitted.')
+    session_id: str = Field(..., min_length=8, max_length=64,
+                            description='Client-generated UUID grouping events from one session.')
+    props:      Optional[dict] = Field(None, description='Tiny JSON payload, no user content.')
+
+
+@app.post('/analytics/event', summary='Log an analytics event')
+async def analytics_event(
+    req: AnalyticsEventIn,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Best-effort analytics event ingestion. Never blocks the user flow:
+    if the insert fails (DB hiccup, table not yet migrated), we return
+    202 Accepted with a soft note rather than 5xx-ing the client.
+
+    Privacy gates, in order:
+      1. analytics_opt_out flag — if true, event is dropped silently.
+      2. props size limit — anything bigger than 4 KB is truncated.
+      3. event_name regex (Pydantic-enforced) — only snake_case ASCII,
+         can't sneak in PII via clever event names.
+    """
+    from sqlalchemy import text
+    import uuid as _uuid
+    import json as _json
+
+    # Honor opt-out without leaking that fact to the client (so the UI
+    # can still call track() without branching).
+    user = await get_user_by_id(db, user_id)
+    if user and getattr(user, 'analytics_opt_out', False):
+        return {"recorded": False, "reason": "opted_out"}
+
+    props_blob = None
+    if req.props is not None:
+        try:
+            props_blob = _json.dumps(req.props)[:4096]
+        except Exception:
+            props_blob = None
+
+    try:
+        await db.execute(
+            text("""
+                INSERT INTO analytics_events
+                    (id, user_id, session_id, event_name, props)
+                VALUES
+                    (:id, :uid, :sid, :evt, :props)
+            """),
+            {
+                "id":    str(_uuid.uuid4()),
+                "uid":   user_id,
+                "sid":   req.session_id,
+                "evt":   req.event_name,
+                "props": props_blob,
+            },
+        )
+        await db.commit()
+        return {"recorded": True}
+    except Exception as e:
+        logger.warning("[analytics] event insert failed (%s): %s", req.event_name, e)
+        return {"recorded": False, "reason": "ingest_error"}
+
+
+class AnalyticsOptOutRequest(BaseModel):
+    opt_out: bool
+
+
+@app.patch('/users/analytics-opt-out', summary='Toggle analytics tracking for the current user')
+async def set_analytics_opt_out(
+    req: AnalyticsOptOutRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """User-controlled toggle. true = stop recording; false = resume."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    user.analytics_opt_out = bool(req.opt_out)
+    await db.commit()
+    return {"opt_out": bool(user.analytics_opt_out)}
+
+
+@app.delete('/users/me/analytics', summary='Wipe the current user\'s analytics history (GDPR)')
+async def delete_my_analytics(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanent deletion of every analytics_events row for this user.
+    Runs synchronously; for active users this is at most a few hundred
+    rows. Idempotent: zero rows is also a successful response.
+    """
+    from sqlalchemy import text
+    try:
+        result = await db.execute(
+            text("DELETE FROM analytics_events WHERE user_id = :uid"),
+            {"uid": user_id},
+        )
+        await db.commit()
+        return {"deleted": result.rowcount or 0}
+    except Exception as e:
+        logger.warning("[analytics] user-data delete failed for %s: %s", user_id, e)
+        raise HTTPException(status_code=500, detail='Could not delete analytics history')
+
+
+# ===========================================================================
+# CANARY ALERTS — admin-only trigger; same logic the cron runs
+# ===========================================================================
+
+@app.post('/admin/canaries/run', summary='Manually run canary checks (admin only)')
+async def admin_run_canaries(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Same logic the Railway cron job runs. Exposed as an HTTP endpoint
+    so an operator can trigger a check from anywhere — no shell access
+    required. Founder-gated.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user or user.email not in {
+        "kristjangilbert@gmail.com",
+        "martakarenk@gmail.com",
+        "davidsnaerj@gmail.com",
+    }:
+        raise HTTPException(status_code=403, detail='Founder-only')
+
+    from analytics.canaries import run_canary_checks
+    report = await run_canary_checks(db, send_alert=True)
+    return report
 # Force redeploy Tue Apr 14 18:15:01 CEST 2026
