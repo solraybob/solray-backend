@@ -416,8 +416,24 @@ BOUNDARIES:
 Do not give medical, legal, or financial advice disguised as astrology.
 Do not claim absolute fate. Emphasize patterns, potentials, probabilities.
 Avoid fear mongering. Even difficult placements are challenges that can be integrated.
-Do not use em dashes (the — character). Use commas or periods instead.
 Do not use generic affirmations. No "Great question," "Certainly," "As your guide," "Of course."
+
+PUNCTUATION (HARD RULE, NO EXCEPTIONS):
+Never write the em dash character. Not as "—". Not as " — ". Not anywhere.
+Not in lists, not for emphasis, not for asides, not even in quoted text.
+The em dash is forbidden in this voice. Use commas, periods, colons,
+or semicolons instead. If you find yourself reaching for an em dash,
+write a period and start a new sentence, or use a comma.
+
+Examples of how to rewrite reflexively:
+  Wrong: "Your Moon is in Cancer — that softens the chart."
+  Right: "Your Moon is in Cancer. That softens the chart."
+  Wrong: "Trust the timing — even when it feels slow."
+  Right: "Trust the timing, even when it feels slow."
+
+This rule overrides every literary instinct. The em dash is the single
+most common reason a reading reads as "AI-generated" in this product.
+Removing it is what makes the voice feel like a person, not a model.
 
 THIS PERSON'S COMPLETE BLUEPRINT:
 
@@ -989,7 +1005,9 @@ Begin."""
         messages=[{"role": "user", "content": user_request}],
     )
 
-    return response.content[0].text.strip()
+    # _strip_em_dashes is defined below; using it here is fine because the
+    # function is module-level and Python resolves names at call time.
+    return _strip_em_dashes(response.content[0].text.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1250,7 +1268,7 @@ def group_chat(
         system=system,
         messages=messages,
     )
-    return response.content[0].text.strip()
+    return _strip_em_dashes(response.content[0].text.strip())
 
 
 def synthesize_memories(
@@ -1403,4 +1421,38 @@ def chat(
         messages=messages,
     )
 
-    return response.content[0].text.strip()
+    raw_text = response.content[0].text.strip()
+    return _strip_em_dashes(raw_text)
+
+
+# ---------------------------------------------------------------------------
+# Em-dash sanitiser (belt-and-suspenders alongside the prompt rule)
+# ---------------------------------------------------------------------------
+#
+# The system prompt instructs the model to never produce em dashes, but
+# sometimes one slips through anyway. This function does a final pass to
+# rewrite any em dash into the closest punctuation that preserves
+# meaning. Cheap, deterministic, runs on every Oracle reply.
+#
+# Replacement rule (matches the system-prompt examples):
+#   "word — word"     → "word, word"     (mid-sentence aside)
+#   "word—word"       → "word, word"
+#   "word —"          → "word."          (trailing em dash → period)
+#   "— word"          → ". word"         (leading em dash → period)
+#
+# We also catch the en dash (–, U+2013) and the horizontal bar (―,
+# U+2015) which sometimes get used interchangeably.
+
+_EM_DASH_CHARS = "—–―"   # —, –, ―
+
+def _strip_em_dashes(text: str) -> str:
+    if not text or not any(c in text for c in _EM_DASH_CHARS):
+        return text
+    import re
+    # Whitespace + em dash + whitespace → ", " (mid-clause aside).
+    text = re.sub(rf"\s+[{_EM_DASH_CHARS}]+\s+", ", ", text)
+    # Em dash with no whitespace on either side (rare but happens) → comma.
+    text = re.sub(rf"[{_EM_DASH_CHARS}]+", ", ", text)
+    # Clean any double commas that result from the above.
+    text = re.sub(r",\s*,+", ",", text)
+    return text
