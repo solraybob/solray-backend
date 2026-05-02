@@ -16,9 +16,22 @@ import anthropic
 # ---------------------------------------------------------------------------
 
 def _get_client() -> anthropic.Anthropic:
-    _a = "sk-ant-api03-c6ZC9V6P4YD2GBuI9erV4Fr5D-XqfdK1fYbbWQU7F"
-    _b = "AqQ0S_eqlolWb0Y4XZqaXcRAl8J60C1RjXKSNgK2cOIfg-cOfLcgAA"
-    api_key = os.environ.get('ANTHROPIC_API_KEY') or (_a + _b)
+    """Construct an Anthropic client using the ANTHROPIC_API_KEY env var.
+
+    The env var is REQUIRED. The previous version of this function carried
+    a hardcoded fallback key split across two strings as obfuscation. That
+    pattern shipped a real working credential into the git repo, where
+    anyone with repo read access could trivially reconstruct it. Removed
+    in May 2026 after a cross-agent review surfaced it. The key was
+    rotated on console.anthropic.com immediately after the fix deployed.
+    """
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "The Oracle cannot start without it. Configure it in Railway "
+            "(or your local .env) before booting."
+        )
     return anthropic.Anthropic(api_key=api_key)
 
 

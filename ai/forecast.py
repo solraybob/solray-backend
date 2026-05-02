@@ -24,9 +24,17 @@ from energy_calculator import calculate_energy_scores
 # ---------------------------------------------------------------------------
 
 def _get_client() -> anthropic.Anthropic:
-    _a = "sk-ant-api03-c6ZC9V6P4YD2GBuI9erV4Fr5D-XqfdK1fYbbWQU7F"
-    _b = "AqQ0S_eqlolWb0Y4XZqaXcRAl8J60C1RjXKSNgK2cOIfg-cOfLcgAA"
-    api_key = os.environ.get('ANTHROPIC_API_KEY') or (_a + _b)
+    """Construct an Anthropic client using the ANTHROPIC_API_KEY env var.
+
+    Required. The previous hardcoded fallback was removed for credential
+    safety. See ai/chat.py:_get_client for the full note.
+    """
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Daily forecast generation requires it."
+        )
     return anthropic.Anthropic(api_key=api_key)
 
 
