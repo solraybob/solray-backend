@@ -995,6 +995,50 @@ async def get_public_profile(
 # GET /forecast/today
 # ---------------------------------------------------------------------------
 
+@app.get('/first-mirror', summary="Generate the post-onboarding First Mirror three lines")
+async def first_mirror(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Three precise lines that prove Solray understood the user, shown
+    immediately after onboarding before /today, before /chat. Single
+    LLM call against the user's blueprint. Caller should fall back
+    gracefully (skip the screen, route straight to /today) if this
+    errors, never invent content.
+
+    Codex UX hook 1, the "First Mirror" pattern: pattern they lead
+    with, place they hide their power, question their design returns to.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    bp_row = await get_blueprint(db, user_id)
+    if not bp_row:
+        raise HTTPException(status_code=404, detail="Blueprint not found, complete onboarding first")
+    try:
+        import json as _json
+        blueprint = _json.loads(bp_row.blueprint_json) if bp_row.blueprint_json else {}
+    except Exception:
+        blueprint = {}
+    if 'meta' not in blueprint:
+        blueprint['meta'] = {}
+    if not blueprint['meta'].get('name'):
+        blueprint['meta']['name'] = user.name
+
+    try:
+        from ai.first_mirror import generate_first_mirror
+        result = generate_first_mirror(blueprint)
+        return result
+    except Exception as e:
+        logger.exception(f"[first_mirror] failed for user {user_id}: {e}")
+        try:
+            import sentry_sdk as _sentry
+            _sentry.capture_exception(e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="First Mirror generation is temporarily unavailable.")
+
+
 @app.get('/forecast/today', summary="Get today's personalised AI-generated forecast")
 async def forecast_today(
     refresh: bool = False,
