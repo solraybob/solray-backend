@@ -20,8 +20,26 @@ from jose import JWTError, jwt
 # Config
 # ---------------------------------------------------------------------------
 
-# In production: load from environment variables / secrets manager
-SECRET_KEY = os.environ.get('JWT_SECRET', os.environ.get('JWT_SECRET_KEY', 'solray-dev-secret-change-in-production-please'))
+# JWT signing secret. REQUIRED in env. Boot must fail loudly when
+# unset rather than fall back to a known dev string, otherwise a
+# misconfigured deploy would silently sign tokens with a publicly
+# committed value and accept tokens forged by anyone with the same.
+# Codex P1.3 trust audit, May 2026. Bob has rotated the secret on
+# Railway; the old value (committed to BUILD_LOG_RAILWAY.md) must
+# never be honored again.
+SECRET_KEY = os.environ.get('JWT_SECRET') or os.environ.get('JWT_SECRET_KEY')
+if not SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET environment variable is not set. "
+        "The API refuses to start without a real signing key. "
+        "Set JWT_SECRET in Railway (or your local .env) before booting."
+    )
+if len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        f"JWT_SECRET is only {len(SECRET_KEY)} characters. "
+        "Use at least 32 characters of high-entropy random data; "
+        "the previous short secret was committed to git history and is compromised."
+    )
 ALGORITHM = 'HS256'
 ACCESS_TOKEN_EXPIRE_HOURS = int(os.environ.get('TOKEN_EXPIRE_HOURS', '720'))  # 30 days default
 

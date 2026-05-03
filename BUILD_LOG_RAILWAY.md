@@ -62,9 +62,15 @@ In your Railway project, go to **Variables** tab and add:
 
 | Variable | Value |
 |----------|-------|
-| `DATABASE_URL` | `postgresql://postgres.ecgyapdnwhvflycboomm:Hvitjakkafot25@aws-1-eu-west-2.pooler.supabase.com:6543/postgres` |
-| `ANTHROPIC_API_KEY` | `sk-ant-api03-...` *(use the key from your secrets — see private notes)* |
-| `JWT_SECRET` | `solray-jwt-secret-2026-production` |
+| `DATABASE_URL` | The Supabase pooled connection string. Get the current value from the Supabase dashboard, never from this doc. |
+| `ANTHROPIC_API_KEY` | The current key from console.anthropic.com. |
+| `JWT_SECRET` | A 64-character random string. Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
+
+**SECURITY NOTE:** Earlier versions of this document committed the
+literal Supabase password and JWT secret to git. Both values were
+compromised the moment they were committed and have been rotated.
+Never paste live credentials into this file. Always reference the
+secrets manager. Codex P1.2 trust audit, May 2026.
 
 ### Step 4 — Deploy
 
