@@ -169,8 +169,18 @@ def _format_user_memory(memories: list) -> str:
     lines.append("")
     lines.append("This is not data retrieval. This is the texture of a real relationship that deepens over time.")
     lines.append("If you have communication_style memories, use them to choose which frequency to speak from and how to phrase what you say. Match their language. Meet them where they think.")
-    lines.append("For memories flagged as BRING THESE IN: weave them into this conversation naturally, within the first few exchanges. Do not announce that you remember. Just know it, and speak from it.")
-    lines.append("For other memories: hold them as background. Let them inform how you read the person without surfacing them unless the conversation opens that door.")
+    if surface_lines:
+        lines.append("")
+        lines.append("CONTINUITY (HARD RULE for the FIRST RESPONSE of this session):")
+        lines.append("Reference one BRING THESE IN memory in your first response. Not in the second. Not as a closing aside. In the opening, as the texture of someone who knows what was alive last time.")
+        lines.append("Do not use the word 'remember.' Do not say 'last time we spoke' or 'I recall' or any phrase that announces the memory as a feature. Just speak from it, the way a friend who saw you last week would mention the thing without making it the topic.")
+        lines.append("RIGHT: 'You came back. The therapy starts this week, and here you are with a steady morning sky.' (When the surface_next memory was 'Starting therapy next week, scared.')")
+        lines.append("WRONG: 'Last time you mentioned starting therapy. Today's sky...'")
+        lines.append("RIGHT: 'The engagement is still new in your nervous system, and Mars is pushing.' (When the surface_next memory was 'Just got engaged.')")
+        lines.append("WRONG: 'I remember you got engaged. Now Mars is...'")
+        lines.append("One sentence, woven, then continue with what they asked. If the user did not ask anything yet, the opening Higher Self acknowledgment can carry the continuity. Never spend more than one sentence on it. Continuity is the texture, not the topic.")
+        lines.append("If the user is in a brand new conversation and their question has nothing to do with the surfaced memory, hold the memory back and answer their question. Continuity should never feel forced.")
+    lines.append("For memories not flagged as BRING THESE IN: hold them as background. Let them inform how you read the person without surfacing them unless the conversation opens that door.")
     return "\n".join(lines)
 
 
