@@ -718,10 +718,13 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
 
 
 async def reset_surface_next_flags(db: AsyncSession, user_id: str) -> None:
-    """Clear surface_next on all memories after a session starts.
+    """Clear surface_next on all memories after they have been consumed.
 
-    Called at the beginning of a chat session so flagged memories are consumed
-    once and not re-surfaced every session indefinitely.
+    Called once per chat session AFTER the first response has been
+    generated, so flagged memories are surfaced once and not re-loaded
+    on every subsequent session indefinitely. Previously called BEFORE
+    memories were loaded, which silently defeated the surface_next
+    mechanism. Order corrected in May 2026.
     """
     from sqlalchemy import update as sql_update
     await db.execute(
@@ -730,4 +733,27 @@ async def reset_surface_next_flags(db: AsyncSession, user_id: str) -> None:
         .values(surface_next=False)
     )
     await db.commit()
+
+
+async def delete_all_user_memories(db: AsyncSession, user_id: str) -> int:
+    """Hard-delete every memory row for a user. Returns the count deleted.
+
+    The /memory DELETE endpoint is the user's "fresh start" lever and
+    must actually empty the table. The previous implementation called
+    update_user_memories(db, user_id, []) which is a MERGE not a
+    REPLACE, so the empty new-list resulted in zero deletions and the
+    user kept all their old memories silently. Codex flagged this in
+    May 2026.
+    """
+    from sqlalchemy import delete as sql_delete, select as sql_select, func
+    # Count first so we can return how many rows were actually removed.
+    count_result = await db.execute(
+        sql_select(func.count()).select_from(UserMemory).where(UserMemory.user_id == user_id)
+    )
+    count = count_result.scalar() or 0
+    await db.execute(
+        sql_delete(UserMemory).where(UserMemory.user_id == user_id)
+    )
+    await db.commit()
+    return int(count)
 

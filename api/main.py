@@ -2377,12 +2377,15 @@ async def chat_endpoint(
     history = [{"role": m.role, "content": m.content} for m in req.conversation_history]
 
     # Load persistent user memories for continuity across sessions.
-    # Reset surface_next flags if this is the first message of a new session
-    # (history is empty on the client side when a new session opens).
-    from db.database import get_user_memories, update_user_memories, reset_surface_next_flags
+    # Order matters: load memories FIRST with surface_next flags intact,
+    # let the Oracle use them in this turn, THEN clear surface_next on a
+    # new session AFTER the response is generated. The previous version
+    # cleared surface_next BEFORE loading memories, which meant the
+    # Oracle never actually saw the flagged memories on a new session,
+    # defeating the entire surface_next mechanism. Surfaced by a
+    # cross-agent review (Codex) in May 2026.
+    from db.database import get_user_memories, update_user_memories, reset_surface_next_flags, delete_all_user_memories  # noqa: F401
     is_new_session = len(history) == 0
-    if is_new_session:
-        await reset_surface_next_flags(db, user_id)
     memories = await get_user_memories(db, user_id)
 
     try:
@@ -2394,6 +2397,16 @@ async def chat_endpoint(
             soul_blueprint=req.soul_blueprint,
             memories=memories,
         )
+
+        # surface_next memories have now been "consumed" by the Oracle in
+        # this response, clear them so they are not re-surfaced
+        # indefinitely. Only on the first turn of a session, since that
+        # is the moment continuity from the previous session matters.
+        if is_new_session:
+            try:
+                await reset_surface_next_flags(db, user_id)
+            except Exception as _flag_err:
+                logger.warning(f"reset_surface_next_flags failed for user {user_id}: {_flag_err}")
 
         # Synthesize memories in background at session checkpoints.
         # Fire at message 2, 5, 8, 11... so even short sessions (2-3 turns,
@@ -2414,12 +2427,26 @@ async def chat_endpoint(
             # Append the current user message so synthesis sees the full exchange
             full_history = history + [{"role": "user", "content": req.message or ""}]
             async def _synthesize():
+                # Surface synthesis outcomes so the memory pipeline is
+                # observable in production. Previously the only signal was
+                # a single warning on failure; now we log start, model
+                # outcome (handled inside synthesize_memories), persist
+                # outcome, and persist failure.
                 try:
+                    logger.info(
+                        f"[memory] synthesis triggered for user {user_id} "
+                        f"at turn={next_count} existing_count={len(memories)}"
+                    )
                     new_memories = synthesize_memories(blueprint, full_history, memories)
                     if new_memories:
                         await update_user_memories(db, user_id, new_memories)
+                        logger.info(
+                            f"[memory] persisted {len(new_memories)} memories for user {user_id}"
+                        )
+                    else:
+                        logger.info(f"[memory] synthesis returned 0 memories for user {user_id}")
                 except Exception as err:
-                    logger.warning(f"Memory synthesis failed for user {user_id}: {err}")
+                    logger.exception(f"[memory] persist failed for user {user_id}: {err}")
             asyncio.create_task(_synthesize())
 
         return {"response": response}
@@ -2586,10 +2613,18 @@ async def clear_memory(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Clear all persistent memories for fresh start."""
-    from db.database import update_user_memories
-    await update_user_memories(db, user_id, [])
-    return {'cleared': True}
+    """Clear all persistent memories for a fresh start.
+
+    Hard-deletes every UserMemory row for this user. Returns the count
+    actually removed so the client can confirm the clear took effect.
+    Previously called update_user_memories(db, user_id, []) which is a
+    merge-not-replace operation and never deleted anything; the user
+    saw {'cleared': True} but kept all their old memories silently.
+    """
+    from db.database import delete_all_user_memories
+    count = await delete_all_user_memories(db, user_id)
+    logger.info(f"[memory] cleared {count} memories for user {user_id}")
+    return {'cleared': True, 'deleted_count': count}
 
 
 

@@ -1356,6 +1356,18 @@ The "surface_next" field is critical: set it to true for any memory that should 
 Return [] if nothing significant to remember. Return ONLY valid JSON, no explanation.
 IMPORTANT: Always include or update a communication_style memory after the first session and whenever you notice their style shifting or deepening."""
 
+    # Logging for synthesis success / failure. The previous version of
+    # this function caught every exception silently and returned [],
+    # which meant the entire memory pipeline could be broken in
+    # production with no visible signal. Codex flagged this in May
+    # 2026. Now every failure mode is logged with context so operators
+    # can see what is actually happening.
+    import logging
+    log = logging.getLogger("solray.memory")
+    log.info(
+        f"[synth] starting synthesis: existing_memory_count={len(existing_memories)} "
+        f"history_turns={len(conversation_history)}"
+    )
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1367,10 +1379,43 @@ IMPORTANT: Always include or update a communication_style memory after the first
         # Extract JSON array
         start = text.find('[')
         end = text.rfind(']') + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-        return []
-    except Exception:
+        if start < 0 or end <= start:
+            log.warning(
+                f"[synth] model returned no JSON array. "
+                f"raw_text_prefix={text[:200]!r}"
+            )
+            return []
+        try:
+            parsed = json.loads(text[start:end])
+        except json.JSONDecodeError as je:
+            log.warning(
+                f"[synth] JSON parse failed: {je}. "
+                f"slice_prefix={text[start:start + 200]!r}"
+            )
+            return []
+        if not isinstance(parsed, list):
+            log.warning(f"[synth] parsed JSON is not a list: type={type(parsed).__name__}")
+            return []
+        # Useful counters: per-category, surface_next count, has communication_style
+        cats: dict[str, int] = {}
+        surface_next_count = 0
+        has_comm_style = False
+        for m in parsed:
+            if not isinstance(m, dict):
+                continue
+            cat = str(m.get('category', 'unknown'))
+            cats[cat] = cats.get(cat, 0) + 1
+            if m.get('surface_next'):
+                surface_next_count += 1
+            if cat == 'communication_style':
+                has_comm_style = True
+        log.info(
+            f"[synth] success: returned={len(parsed)} categories={cats} "
+            f"surface_next={surface_next_count} has_communication_style={has_comm_style}"
+        )
+        return parsed
+    except Exception as e:
+        log.exception(f"[synth] failed with exception: {e}")
         return []
 
 
