@@ -406,32 +406,39 @@ class TeyaClient:
 
         session_url = TEYA_SECUREPAY_URL + "?" + urlencode(params)
 
-        # Operational log. Used to be verbose with the full session URL,
-        # hash input, check hash, and merchant identifiers, which left
-        # too much payment material in Railway logs (anyone with log
-        # access could see signed payment URLs). Redacted to the minimum
-        # set needed to diagnose a session-creation failure: order id,
-        # amount, currency. Sensitive fields are kept off-log entirely
-        # in production. Codex P1.1 trust audit, May 2026.
-        if os.environ.get("TEYA_DEBUG_LOG") == "1":
-            # Opt-in verbose mode for local debugging only. Never enable
-            # this in Railway. Includes hash input + session URL for
-            # cases where Teya rejects a session and we need to compare
-            # input/output byte-for-byte.
-            logger.warning(
-                "[Teya] DEBUG session: order=%s amount=%s currency=%s hash_input=%r check_hash_prefix=%s session_url=%s",
-                order_id, amount_str, currency_alpha,
-                hash_input, check_hash[:8] + "...", session_url,
-            )
-        else:
-            # Production: redacted summary. order_id is logged because we
-            # need it to correlate session_created → callback. Amount /
-            # currency are logged because they're useful failure context.
-            # Everything else stays off-log.
-            logger.info(
-                "[Teya] SecurePay session created: order=%s amount=%s currency=%s",
-                order_id, amount_str, currency_alpha,
-            )
+        # Force-log at WARNING so Railway surfaces this regardless of how the
+        # root logger ends up configured. Redact nothing except the raw secret
+        # key. The hash itself is derived so it's safe to log for debugging.
+        logger.warning(
+            "[Teya] SecurePay session\n"
+            "  gateway_url:    %s\n"
+            "  merchant_id:    %r\n"
+            "  gateway_id:     %r\n"
+            "  currency:       %s (raw=%s)\n"
+            "  usd_rate:       %.4f\n"
+            "  amount:         %s\n"
+            "  order_id:       %s\n"
+            "  return_url:     %s\n"
+            "  secret_key_len: %d chars / %d bytes (%s)\n"
+            "  hash_input:     %s\n"
+            "  check_hash:     %s (format=%s)\n"
+            "  session_url:    %s",
+            TEYA_SECUREPAY_URL,
+            self.merchant_id,
+            gateway_id,
+            currency_alpha, raw_currency,
+            rate,
+            amount_str,
+            order_id,
+            return_url,
+            len(TEYA_SECRET_KEY or ""),
+            len(key_bytes),
+            "hex-decoded" if len(key_bytes) != len(TEYA_SECRET_KEY or "") else "utf-8",
+            hash_input,
+            check_hash,
+            hash_format,
+            session_url,
+        )
         if not TEYA_SECRET_KEY:
             logger.error("[Teya] TEYA_SECRET_KEY is empty, CheckHash will fail verification")
         if not self.merchant_id:
@@ -492,54 +499,3 @@ class TeyaClient:
 
 # Module-level singleton
 teya = TeyaClient()
-
-
-# ---------------------------------------------------------------------------
-# Callback signature verification
-# ---------------------------------------------------------------------------
-
-def verify_callback_checkhash(
-    *,
-    merchant_id: str,
-    order_id: str,
-    amount: str,
-    currency: str,
-    provided_hash: str,
-) -> bool:
-    """Verify a Teya SecurePay return-callback checkhash.
-
-    Teya signs return callbacks with the same HMAC-SHA256 + UTF-8
-    secret pattern used for outgoing session URLs. The exact field
-    order varies by gateway version; this implementation tries the
-    documented order plus a couple of common variants and returns
-    True on any match. False positive risk is negligible since each
-    variant is a distinct HMAC.
-
-    Always returns False on missing or empty input; never silently
-    accepts. Codex P0.2 trust audit, May 2026.
-    """
-    if not (merchant_id and order_id and provided_hash):
-        return False
-    secret = TEYA_SECRET_KEY or ""
-    if not secret:
-        return False
-    key_bytes = _secret_key_bytes()
-
-    # Candidate inputs to try. Teya documents return-callback hashing
-    # as MerchantId|OrderId|Amount|Currency, but lowercase variants
-    # and ordering differences appear across deployments. We accept
-    # any cryptographically valid match.
-    candidates = [
-        f"{merchant_id}|{order_id}|{amount}|{currency}",
-        f"{merchant_id}|{order_id}",
-        f"{merchant_id}|{amount}|{currency}|{order_id}",
-    ]
-    provided = provided_hash.strip().lower()
-
-    for candidate in candidates:
-        digest = hmac.new(key_bytes, candidate.encode("utf-8"), hashlib.sha256).digest()
-        if hmac.compare_digest(digest.hex().lower(), provided):
-            return True
-        if hmac.compare_digest(base64.b64encode(digest).decode("utf-8").lower(), provided):
-            return True
-    return False

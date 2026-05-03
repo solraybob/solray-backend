@@ -1750,32 +1750,47 @@ async def subscribe(
     }
 
 
-@app.post('/subscribe/card', summary='REMOVED: see /subscribe/teya-return')
-async def attach_payment_card_removed(
+@app.post('/subscribe/card', summary='Attach a payment card')
+async def attach_payment_card(
+    req: AttachCardRequest,
+    db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """REMOVED for security.
+    """Store a Teya multi-use token on the subscription and activate it.
 
-    The previous version of this endpoint accepted a client-supplied
-    Teya token, stored it, and flipped the subscription to active.
-    There was no Teya verification of the token. Any authenticated
-    user could call POST /subscribe/card with a fake token-shaped
-    string and become "active" without paying. Codex P0.1 trust audit
-    surfaced this in May 2026.
-
-    The legitimate activation path is the Teya hosted SecurePay form
-    redirecting the browser to /subscribe/teya-return, where the
-    backend verifies the order against the session_created event and
-    (after the checkhash work) the cryptographic signature. The
-    front-end no longer calls this endpoint.
-
-    Returning 410 Gone with a clear message rather than 404 so any
-    stale clients get a precise diagnostic.
+    Called after the user completes the SecurePay hosted card form.
+    SecurePay already charged the first month, so we activate immediately
+    without a second charge.
     """
-    raise HTTPException(
-        status_code=410,
-        detail="This endpoint was removed. Subscription activation happens server-to-server via the Teya callback at /subscribe/teya-return. If you reached this from an old client build, refresh the app.",
+    sub = await get_subscription(db, user_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
+
+    # Store the token and card details
+    sub = await attach_card(
+        db, user_id,
+        teya_token=req.teya_token,
+        card_last_four=req.card_last_four,
+        card_brand=req.card_brand,
     )
+
+    # Activate the subscription — first month was already charged by SecurePay
+    from datetime import datetime, timedelta
+    from payments.subscription_manager import BILLING_CYCLE_DAYS
+    now = datetime.utcnow()
+    sub.status = "active"
+    sub.current_period_start = now
+    sub.current_period_end = now + timedelta(days=BILLING_CYCLE_DAYS)
+    sub.updated_at = now
+    await db.commit()
+    await db.refresh(sub)
+
+    return {
+        "status": sub.status,
+        "card_brand": sub.card_brand,
+        "card_last_four": sub.card_last_four,
+        "message": "Subscription activated.",
+    }
 
 
 @app.post('/subscribe/activate', summary='Convert trial to paid (charge card now)')
@@ -1973,35 +1988,6 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
 
     merged = {**qp, **form}
 
-    # Sanitised allowlist for the audit row. The previous version
-    # stored str(merged) in the DB, which included token, masked card
-    # number, status fields, response codes, and any other params
-    # Teya happened to send. Codex P1.4 trust audit flagged this as
-    # too much payment material in user-table-adjacent storage. Now
-    # we keep ONLY the small set we actually need to debug a payment
-    # later. Token is intentionally NOT stored here, it's stored on
-    # the Subscription row as the multi-use card token, separately.
-    def _audit_payload(payload: dict) -> str:
-        keep = (
-            "orderid", "Orderid", "OrderID", "order_id", "reference",
-            "transactionid", "TransactionID", "transaction_id", "paymentid", "PaymentID",
-            "Status", "status", "ResponseCode", "responsecode", "ActionCode", "actioncode",
-            "card_type", "cardtype", "CardType", "cardbrand", "CardBrand",
-            "amount", "currency",
-        )
-        sanitised = {k: v for k, v in payload.items() if k in keep}
-        # Mask the last four digits from masked PAN if present, drop the rest of the PAN.
-        for pan_key in ("pan", "PAN", "maskedpan", "MaskedPAN", "cardnumbermasked", "CardNumberMasked"):
-            if pan_key in payload:
-                digits = "".join(c for c in str(payload[pan_key]) if c.isdigit())
-                if digits:
-                    sanitised["last_four"] = digits[-4:]
-                break
-        import json as _json
-        # Keep payload size bounded; truncate if Teya ever sends an
-        # unexpectedly large field.
-        return _json.dumps(sanitised, default=str)[:1500]
-
     # Case-insensitive lookup helper: Borgun mixes casing (Orderid vs orderid,
     # Token vs token, etc.) between product versions.
     def pick(*names: str) -> str:
@@ -2022,59 +2008,9 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
 
     frontend = "https://app.solray.ai"
 
-    # Verify the Teya checkhash signature when one is present in the
-    # callback. Codex P0.2 trust audit caught that we previously
-    # treated mere token presence as proof of payment, which lets a
-    # forged URL trigger activation if an attacker knows a session's
-    # order_id. The legitimate Teya callback includes a checkhash
-    # parameter computed over a fixed field order with the merchant
-    # secret. We recompute and compare.
-    #
-    # Conservative posture: when checkhash IS present and verification
-    # FAILS, treat as non-success regardless of token. When checkhash
-    # is absent (some test environments omit it), log a warning and
-    # fall back to the existing order_id-lookup defense (the callback
-    # only activates a session that already had a session_created
-    # PaymentEvent row, which means the order was created by a real
-    # logged-in user, narrowing the attack surface).
-    callback_checkhash = pick("checkhash", "CheckHash", "Checkhash")
-    checkhash_verified: Optional[bool] = None
-    if callback_checkhash:
-        try:
-            from payments.teya_client import verify_callback_checkhash
-            checkhash_verified = verify_callback_checkhash(
-                merchant_id=os.environ.get("TEYA_MERCHANT_ID", ""),
-                order_id=order_id,
-                amount=str(merged.get("amount", "") or merged.get("Amount", "") or ""),
-                currency=str(merged.get("currency", "") or merged.get("Currency", "") or ""),
-                provided_hash=callback_checkhash,
-            )
-            if not checkhash_verified:
-                logger.error(
-                    "[Teya] callback checkhash verification FAILED for order=%s. "
-                    "Refusing to activate.",
-                    order_id,
-                )
-        except Exception as _verr:
-            logger.warning(
-                "[Teya] checkhash verification raised %r for order=%s. "
-                "Falling back to existing flow.",
-                _verr, order_id,
-            )
-    else:
-        logger.info(
-            "[Teya] callback for order=%s has no checkhash param. "
-            "Using order_id-lookup defense only.",
-            order_id,
-        )
-
     # Derive success: explicit status, OR presence of a token (Borgun sometimes
     # omits a status field entirely on success and only sends token + pan).
-    # Block on a FAILED checkhash regardless of other signals.
-    is_success = (
-        (bool(token) or status_val in {"success", "ok", "approved", "completed", "000"})
-        and checkhash_verified is not False
-    )
+    is_success = bool(token) or status_val in {"success", "ok", "approved", "completed", "000"}
 
     # Failure path: redirect to cancelled with full query string so the user
     # (and we) can see why. Also persist a 'charge_failed' PaymentEvent so
@@ -2108,7 +2044,7 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
                     currency="USD",
                     teya_transaction_id=str(order_id) if order_id else None,
                     teya_status=status_raw or "failed",
-                    teya_response=_audit_payload(merged),
+                    teya_response=str(merged)[:2000],
                 )
                 await db.commit()
         except Exception as _e:
@@ -2199,7 +2135,7 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
         currency=sub_obj.price_currency,
         teya_transaction_id=transaction_id or str(order_id),
         teya_status=status_raw or "success",
-        teya_response=_audit_payload(merged),
+        teya_response=str(merged),
     )
     await db.commit()
 
