@@ -2022,36 +2022,21 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
 
     frontend = "https://app.solray.ai"
 
-    # Verify the Teya checkhash signature when present. Codex P0.2
-    # trust audit caught that we previously treated mere token
-    # presence as proof of payment, which lets a forged URL trigger
-    # activation if an attacker knows a session's order_id.
+    # Verify the Teya checkhash signature when one is present in the
+    # callback. Codex P0.2 trust audit caught that we previously
+    # treated mere token presence as proof of payment, which lets a
+    # forged URL trigger activation if an attacker knows a session's
+    # order_id. The legitimate Teya callback includes a checkhash
+    # parameter computed over a fixed field order with the merchant
+    # secret. We recompute and compare.
     #
-    # OBSERVE-THEN-ENFORCE posture: this is shipping in OBSERVE mode
-    # initially, where checkhash mismatches are logged as ERROR but
-    # do NOT block activation. The reason: my verify helper tries
-    # three documented Teya field orderings, but I have not yet seen
-    # a real production callback to confirm exactly which one Teya
-    # actually uses for return signatures. Shipping in enforce mode
-    # would risk blocking every new paid signup if Teya's true
-    # ordering is one I didn't try. Shipping in observe mode lets us
-    # SEE Teya's real format land in Railway logs the next time
-    # someone pays, then flip enforce on with confidence.
-    #
-    # The order_id-lookup defense already in place (the callback
+    # Conservative posture: when checkhash IS present and verification
+    # FAILS, treat as non-success regardless of token. When checkhash
+    # is absent (some test environments omit it), log a warning and
+    # fall back to the existing order_id-lookup defense (the callback
     # only activates a session that already had a session_created
     # PaymentEvent row, which means the order was created by a real
-    # logged-in user) keeps the attack surface narrow during the
-    # observe window. An attacker would need to know a specific
-    # active order_id, which is a SecurePay session token never
-    # exposed publicly.
-    #
-    # FLIP TO ENFORCE: once Railway logs show one real callback with
-    # a checkhash that any of the candidate orderings match, change
-    # CHECKHASH_ENFORCE to True (or set the env var). Until then we
-    # observe.
-    CHECKHASH_ENFORCE = os.environ.get("TEYA_CHECKHASH_ENFORCE") == "1"
-
+    # logged-in user, narrowing the attack surface).
     callback_checkhash = pick("checkhash", "CheckHash", "Checkhash")
     checkhash_verified: Optional[bool] = None
     if callback_checkhash:
@@ -2064,22 +2049,11 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
                 currency=str(merged.get("currency", "") or merged.get("Currency", "") or ""),
                 provided_hash=callback_checkhash,
             )
-            if checkhash_verified:
-                logger.info(
-                    "[Teya] callback checkhash VERIFIED for order=%s",
-                    order_id,
-                )
-            else:
+            if not checkhash_verified:
                 logger.error(
-                    "[Teya] callback checkhash MISMATCH for order=%s. "
-                    "Provided=%s amount=%r currency=%r. "
-                    "ENFORCE=%s — %s",
+                    "[Teya] callback checkhash verification FAILED for order=%s. "
+                    "Refusing to activate.",
                     order_id,
-                    callback_checkhash[:16] + "...",
-                    merged.get("amount") or merged.get("Amount"),
-                    merged.get("currency") or merged.get("Currency"),
-                    CHECKHASH_ENFORCE,
-                    "BLOCKING activation" if CHECKHASH_ENFORCE else "OBSERVING ONLY, allowing activation. Update verify_callback_checkhash with this order's correct field order then set TEYA_CHECKHASH_ENFORCE=1.",
                 )
         except Exception as _verr:
             logger.warning(
@@ -2096,10 +2070,11 @@ async def teya_return(request: Request, db: AsyncSession = Depends(get_db)):
 
     # Derive success: explicit status, OR presence of a token (Borgun sometimes
     # omits a status field entirely on success and only sends token + pan).
-    # In ENFORCE mode, a False checkhash forces non-success regardless.
-    is_success = bool(token) or status_val in {"success", "ok", "approved", "completed", "000"}
-    if CHECKHASH_ENFORCE and checkhash_verified is False:
-        is_success = False
+    # Block on a FAILED checkhash regardless of other signals.
+    is_success = (
+        (bool(token) or status_val in {"success", "ok", "approved", "completed", "000"})
+        and checkhash_verified is not False
+    )
 
     # Failure path: redirect to cancelled with full query string so the user
     # (and we) can see why. Also persist a 'charge_failed' PaymentEvent so
