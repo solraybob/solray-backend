@@ -704,13 +704,25 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
     await db.commit()
 
     # Cap at 50 by pruning oldest, but always keep surface_next=True rows.
+    # Sort key: (surface_next, updated_at), reverse=True. With descending
+    # tuple sort, this gives:
+    #   1. surface_next=True rows first (True > False)
+    #   2. within each group, most recent first
+    # Keeping all_memories[:50] then preserves all flagged rows + the
+    # most recent unflagged ones. all_memories[50:] is the oldest
+    # unflagged tail to drop.
+    #
+    # Note: an earlier version of this used `(not x.surface_next, ...)`
+    # with reverse=True, which inverted the desired order and
+    # preferentially DELETED the surface_next rows. Caught by the
+    # test_cap_at_50_keeps_surface_next_and_recent regression test in
+    # May 2026; the bug is exactly the kind Codex's review predicted.
     result = await db.execute(
         select(UserMemory).where(UserMemory.user_id == user_id)
     )
     all_memories = list(result.scalars().all())
     if len(all_memories) > 50:
-        # Keep surface_next=True first, then most recent. Drop the remainder.
-        all_memories.sort(key=lambda x: (not x.surface_next, x.updated_at), reverse=True)
+        all_memories.sort(key=lambda x: (x.surface_next, x.updated_at), reverse=True)
         to_delete = all_memories[50:]
         for old in to_delete:
             await db.delete(old)
