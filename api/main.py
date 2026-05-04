@@ -109,8 +109,20 @@ app = FastAPI(
     redoc_url='/redoc',
 )
 
-# Admin email list for authorization checks
-ADMIN_EMAILS = {"kristjangilbert@gmail.com"}
+# Admin email list for authorization checks. Loaded from env so we can
+# grant or revoke access without a code deploy. SOLRAY_ADMIN_EMAILS is a
+# comma-separated list. Defaults below are the floor: even if env is
+# unset or misconfigured, these two always have access.
+_DEFAULT_ADMIN_EMAILS = {
+    "kristjangilbert@gmail.com",
+    "davidsnaerj@gmail.com",
+}
+_ADMIN_EMAILS_FROM_ENV = {
+    e.strip().lower()
+    for e in os.environ.get("SOLRAY_ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+ADMIN_EMAILS = {e.lower() for e in _DEFAULT_ADMIN_EMAILS} | _ADMIN_EMAILS_FROM_ENV
 
 # CORS — restrict to known frontend origins
 app.add_middleware(
@@ -160,7 +172,7 @@ async def require_admin(
     Returns user_id if authorized, raises HTTPException 403 otherwise.
     """
     user = await get_user_by_id(db, user_id)
-    if not user or user.email not in ADMIN_EMAILS:
+    if not user or (user.email or "").strip().lower() not in ADMIN_EMAILS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail='Admin access required'
