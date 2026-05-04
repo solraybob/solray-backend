@@ -980,14 +980,16 @@ async def get_public_profile(
     if not minimal['is_public']:
         return minimal
 
-    # Public — surface the full chart + blueprint
+    # Public — surface the full chart + blueprint, but NOT the raw birth
+    # coordinates (date, time, city). The chart already encodes everything
+    # the connection needs to read who this person is; the raw birth data
+    # is the most identifying piece and stays with the person. The /users/me
+    # path above keeps these fields for the self view so users can still
+    # see and edit their own birth details on /profile/settings.
     blueprint = await get_blueprint(db, target_user_id)
     return {
         **minimal,
-        'birth_date': target.birth_date,
-        'birth_time': target.birth_time,
-        'birth_city': target.birth_city,
-        'blueprint':  blueprint,
+        'blueprint': blueprint,
     }
 
 
