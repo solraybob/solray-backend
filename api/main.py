@@ -80,7 +80,7 @@ from db.database import (
     get_user_memories, update_user_memories, add_user_memory,
     reset_surface_next_flags,
     User,
-    MarketingEvent, IntegrationCredential,
+    MarketingEvent, IntegrationCredential, MarketingSignal,
 )
 import engines
 from ai.forecast import generate_daily_forecast
@@ -2499,6 +2499,220 @@ async def list_integrations(
             'last_error':   record.last_error if record else None,
         })
     return {'integrations': out}
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: Signal Radar
+# ---------------------------------------------------------------------------
+
+class SignalCreate(BaseModel):
+    title:   str
+    body:    Optional[str] = None
+    url:     Optional[str] = None
+    source:  Optional[str] = 'manual'
+    score:   Optional[int] = 50
+    happens_at: Optional[str] = None  # ISO
+
+
+class SignalUpdate(BaseModel):
+    title:  Optional[str] = None
+    body:   Optional[str] = None
+    url:    Optional[str] = None
+    score:  Optional[int] = None
+    status: Optional[str] = None  # active | dismissed | acted
+
+
+def _serialize_signal(s: MarketingSignal) -> dict:
+    angles = None
+    if s.angles_json:
+        try:
+            import json
+            angles = json.loads(s.angles_json)
+        except Exception:
+            angles = None
+    return {
+        'id':         s.id,
+        'source':     s.source,
+        'title':      s.title,
+        'body':       s.body,
+        'url':        s.url,
+        'score':      s.score,
+        'status':     s.status,
+        'angles':     angles,
+        'happens_at': s.happens_at.isoformat() if s.happens_at else None,
+        'created_at': s.created_at.isoformat() if s.created_at else None,
+        'updated_at': s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
+@app.get('/admin/marketing/signals', summary='List Signal Radar signals (admin only)')
+async def list_signals(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(
+        select(MarketingSignal)
+        .where(MarketingSignal.status != 'dismissed')
+        .order_by(MarketingSignal.score.desc(), MarketingSignal.created_at.desc())
+    )
+    signals = result.scalars().all()
+    return {'signals': [_serialize_signal(s) for s in signals]}
+
+
+@app.post('/admin/marketing/signals', summary='Create a signal (admin only)', status_code=201)
+async def create_signal(
+    req: SignalCreate,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    happens = None
+    if req.happens_at:
+        try:
+            happens = datetime.fromisoformat(req.happens_at.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail='happens_at must be ISO 8601')
+
+    signal = MarketingSignal(
+        id=str(uuid.uuid4()),
+        source=(req.source or 'manual').strip(),
+        title=req.title.strip(),
+        body=req.body,
+        url=req.url,
+        score=req.score if req.score is not None else 50,
+        happens_at=happens,
+    )
+    db.add(signal)
+    await db.commit()
+    await db.refresh(signal)
+    return _serialize_signal(signal)
+
+
+@app.patch('/admin/marketing/signals/{signal_id}', summary='Update a signal (admin only)')
+async def update_signal(
+    signal_id: str,
+    req: SignalUpdate,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(select(MarketingSignal).where(MarketingSignal.id == signal_id))
+    signal = result.scalar_one_or_none()
+    if not signal:
+        raise HTTPException(status_code=404, detail='Signal not found')
+
+    if req.title is not None:  signal.title = req.title.strip()
+    if req.body is not None:   signal.body = req.body
+    if req.url is not None:    signal.url = req.url
+    if req.score is not None:  signal.score = max(0, min(100, int(req.score)))
+    if req.status is not None: signal.status = req.status.strip()
+
+    await db.commit()
+    await db.refresh(signal)
+    return _serialize_signal(signal)
+
+
+@app.delete('/admin/marketing/signals/{signal_id}', summary='Delete a signal (admin only)')
+async def delete_signal(
+    signal_id: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(select(MarketingSignal).where(MarketingSignal.id == signal_id))
+    signal = result.scalar_one_or_none()
+    if not signal:
+        raise HTTPException(status_code=404, detail='Signal not found')
+    await db.delete(signal)
+    await db.commit()
+    return {'ok': True, 'deleted': signal_id}
+
+
+@app.post('/admin/marketing/signals/{signal_id}/angles', summary='Generate Solray angles for a signal (admin only)')
+async def generate_signal_angles(
+    signal_id: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Call the Anthropic Haiku model to generate up to 5 ranked Solray
+    angles for the signal. Persists them on the row so the UI can read
+    them back without paying for tokens twice.
+    """
+    from sqlalchemy import select
+    result = await db.execute(select(MarketingSignal).where(MarketingSignal.id == signal_id))
+    signal = result.scalar_one_or_none()
+    if not signal:
+        raise HTTPException(status_code=404, detail='Signal not found')
+
+    from marketing.ai import generate_angles_for_signal
+    angles = generate_angles_for_signal(signal.title, signal.body, signal.source)
+
+    if not angles:
+        raise HTTPException(status_code=502, detail='AI did not return any angles. Try again.')
+
+    import json
+    signal.angles_json = json.dumps(angles)
+    await db.commit()
+    await db.refresh(signal)
+    return _serialize_signal(signal)
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: Founder Voice Studio
+# ---------------------------------------------------------------------------
+
+class VoiceStudioRequest(BaseModel):
+    raw_note: str
+    channels: Optional[List[str]] = None
+
+
+@app.post('/admin/marketing/voice', summary='Convert raw note to per-platform Solray drafts (admin only)')
+async def voice_studio(
+    req: VoiceStudioRequest,
+    admin_id: str = Depends(require_admin),
+):
+    if not req.raw_note or not req.raw_note.strip():
+        raise HTTPException(status_code=400, detail='raw_note is required')
+    from marketing.ai import generate_platform_variants
+    variants = generate_platform_variants(req.raw_note, req.channels)
+    if not variants:
+        raise HTTPException(status_code=502, detail='AI did not return any variants. Try again.')
+    return {'variants': variants}
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: brand-rule linter (no AI, instant)
+# ---------------------------------------------------------------------------
+
+class LintRequest(BaseModel):
+    text: str
+
+
+@app.post('/admin/marketing/lint', summary='Lint draft copy against Solray brand rules (admin only)')
+async def brand_lint(
+    req: LintRequest,
+    admin_id: str = Depends(require_admin),
+):
+    from marketing.brand_lint import lint
+    return {'violations': lint(req.text or '')}
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: upcoming astro events
+# ---------------------------------------------------------------------------
+
+@app.get('/admin/marketing/astro-events', summary='Upcoming sky events for marketing windows (admin only)')
+async def astro_events(
+    admin_id: str = Depends(require_admin),
+    days: int = 60,
+):
+    """Returns Mercury retrogrades, ingresses, and lunar quarters for the
+    next `days` days. The marketing calendar overlays these so Bob can
+    see when a transit-shaped post would land hardest.
+    """
+    from marketing.astro_events import upcoming_events
+    days = max(7, min(180, int(days)))
+    return {'events': upcoming_events(days=days)}
 
 
 # ---------------------------------------------------------------------------

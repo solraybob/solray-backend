@@ -17,7 +17,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Column, String, Float, Date, DateTime, Text, ForeignKey, Boolean,
+    Column, String, Integer, Float, Date, DateTime, Text, ForeignKey, Boolean,
     UniqueConstraint, CheckConstraint, select, update, delete
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -216,6 +216,40 @@ class MarketingEvent(Base):
     status         = Column(String(20),  nullable=False, default='idea')  # idea | scheduled | published | archived
     created_at     = Column(DateTime,    nullable=False, default=datetime.utcnow)
     updated_at     = Column(DateTime,    nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MarketingSignal(Base):
+    """A single signal Signal Radar surfaces for Bob's attention.
+
+    Sources:
+      'manual'       — Bob typed it in
+      'astro_event'  — auto-pulled from the ephemeris (Mercury retro, eclipse...)
+      'x'            — pulled from X once OAuth is live
+      'reddit'       — Reddit topic feed
+      'trends'       — search trends
+      'competitor'   — competitor post we're watching
+
+    A signal is a *living conversation* — something happening in the world that
+    Solray could plausibly respond to. Each signal can have one or many AI-
+    generated angles (suggested posts) attached via `angles_json`.
+
+    score is an integer 0-100 that the radar uses to rank what should rise to
+    the top. Manual signals default to 50; AI scoring populates this for
+    auto-pulled signals.
+    """
+    __tablename__ = 'marketing_signals'
+
+    id              = Column(String(36), primary_key=True)
+    source          = Column(String(20), nullable=False, default='manual')
+    title           = Column(String(255), nullable=False)
+    body            = Column(Text,         nullable=True)
+    url             = Column(String(500),  nullable=True)
+    score           = Column(Integer,      nullable=False, default=50)
+    status          = Column(String(20),   nullable=False, default='active')  # active | dismissed | acted
+    angles_json     = Column(Text,         nullable=True)  # JSON: list of {platform, copy, why}
+    happens_at      = Column(DateTime,     nullable=True)  # for astro events
+    created_at      = Column(DateTime,     nullable=False, default=datetime.utcnow)
+    updated_at      = Column(DateTime,     nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class IntegrationCredential(Base):
