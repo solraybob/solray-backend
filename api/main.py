@@ -1434,20 +1434,28 @@ async def list_souls(
         if not other_user:
             continue
 
-        # Get summary chart fields (not full blueprint, privacy)
-        bp = await get_blueprint(db, other_id)
+        # Privacy: only expose chart preview fields if the connection has
+        # marked their profile public. Otherwise the souls list shows just
+        # name + photo. Compatibility readings still work because the
+        # blueprint endpoint and chat endpoint inject the full chart for
+        # accepted connections (the connection handshake is the consent
+        # for the AI to read both charts together; is_public is the consent
+        # for chart data to be displayed in the UI).
+        is_public_flag = bool(getattr(other_user, 'is_public', False))
         sun_sign = None
         moon_sign = None
         hd_type = None
         hd_profile = None
-        if bp:
-            summary = bp.get('summary', {})
-            hd = bp.get('human_design', {})
-            planets = bp.get('astrology', {}).get('natal', {}).get('planets', {})
-            sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
-            moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign')
-            hd_type = summary.get('hd_type') or hd.get('type')
-            hd_profile = summary.get('hd_profile') or hd.get('profile')
+        if is_public_flag:
+            bp = await get_blueprint(db, other_id)
+            if bp:
+                summary = bp.get('summary', {})
+                hd = bp.get('human_design', {})
+                planets = bp.get('astrology', {}).get('natal', {}).get('planets', {})
+                sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
+                moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign')
+                hd_type = summary.get('hd_type') or hd.get('type')
+                hd_profile = summary.get('hd_profile') or hd.get('profile')
 
         result.append({
             'connection_id': conn.id,
@@ -1455,6 +1463,7 @@ async def list_souls(
                 'id':            other_user.id,
                 'username':      other_user.username,
                 'name':          other_user.name,
+                'is_public':     is_public_flag,
                 'sun_sign':      sun_sign,
                 'moon_sign':     moon_sign,
                 'hd_type':       hd_type,
