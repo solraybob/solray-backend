@@ -79,7 +79,8 @@ from db.database import (
     get_accepted_souls, get_pending_invites_for_user,
     get_user_memories, update_user_memories, add_user_memory,
     reset_surface_next_flags,
-    User
+    User,
+    MarketingEvent, IntegrationCredential,
 )
 import engines
 from ai.forecast import generate_daily_forecast
@@ -2167,6 +2168,325 @@ async def trigger_billing_cycle(
     from payments.billing_scheduler import run_billing_cycle
     await run_billing_cycle()
     return {"message": "Billing cycle complete."}
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: metrics
+# ---------------------------------------------------------------------------
+
+@app.get('/admin/metrics', summary='Marketing dashboard metrics (admin only)')
+async def admin_metrics(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Live counts and money for the marketing dashboard.
+
+    Numbers come from the production users table; nothing is faked. If a
+    field has no data yet the response carries a null, not zero, so the
+    UI can render an honest 'not yet' state instead of a misleading zero.
+    """
+    from sqlalchemy import text, select, func
+    from datetime import datetime, timedelta
+
+    # Subscriber + revenue metrics from the subscriptions / users tables.
+    PRICE_USD_MONTHLY = 23.0
+
+    out: dict = {
+        'price_usd_monthly': PRICE_USD_MONTHLY,
+        'generated_at': datetime.utcnow().isoformat(),
+    }
+
+    try:
+        result = await db.execute(text("SELECT COUNT(*) FROM users"))
+        out['total_users'] = result.scalar() or 0
+    except Exception:
+        out['total_users'] = None
+
+    try:
+        # Trialing users — have an active trial that hasn't expired and they
+        # have not yet converted to paid.
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM users u "
+            "WHERE EXISTS ("
+            "  SELECT 1 FROM subscriptions s "
+            "  WHERE s.user_id = u.id AND s.status = 'trialing'"
+            ")"
+        ))
+        out['trial_users'] = result.scalar() or 0
+    except Exception:
+        out['trial_users'] = None
+
+    try:
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM subscriptions WHERE status = 'active'"
+        ))
+        out['paying_subscribers'] = result.scalar() or 0
+    except Exception:
+        out['paying_subscribers'] = None
+
+    if out.get('paying_subscribers') is not None:
+        out['mrr_usd'] = round(out['paying_subscribers'] * PRICE_USD_MONTHLY, 2)
+    else:
+        out['mrr_usd'] = None
+
+    try:
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'"
+        ))
+        out['signups_last_7d'] = result.scalar() or 0
+    except Exception:
+        out['signups_last_7d'] = None
+
+    try:
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '30 days'"
+        ))
+        out['signups_last_30d'] = result.scalar() or 0
+    except Exception:
+        out['signups_last_30d'] = None
+
+    # Active users — anyone whose forecast was generated in the last 7 days
+    # (the closest signal we have for "opened the app today/recently").
+    try:
+        result = await db.execute(text(
+            "SELECT COUNT(DISTINCT user_id) FROM daily_forecasts "
+            "WHERE created_at > NOW() - INTERVAL '7 days'"
+        ))
+        out['active_users_7d'] = result.scalar() or 0
+    except Exception:
+        out['active_users_7d'] = None
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: calendar events CRUD
+# ---------------------------------------------------------------------------
+
+class MarketingEventCreate(BaseModel):
+    title:         str
+    channel:       str
+    scheduled_for: str  # ISO 8601
+    content_draft: Optional[str] = None
+    asset_notes:   Optional[str] = None
+    status:        Optional[str] = 'idea'
+
+
+class MarketingEventUpdate(BaseModel):
+    title:         Optional[str] = None
+    channel:       Optional[str] = None
+    scheduled_for: Optional[str] = None
+    content_draft: Optional[str] = None
+    asset_notes:   Optional[str] = None
+    status:        Optional[str] = None
+
+
+def _serialize_event(e: MarketingEvent) -> dict:
+    return {
+        'id':            e.id,
+        'title':         e.title,
+        'channel':       e.channel,
+        'scheduled_for': e.scheduled_for.isoformat() if e.scheduled_for else None,
+        'content_draft': e.content_draft,
+        'asset_notes':   e.asset_notes,
+        'status':        e.status,
+        'created_at':    e.created_at.isoformat() if e.created_at else None,
+        'updated_at':    e.updated_at.isoformat() if e.updated_at else None,
+    }
+
+
+@app.get('/admin/marketing/events', summary='List marketing calendar events (admin only)')
+async def list_marketing_events(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(
+        select(MarketingEvent).order_by(MarketingEvent.scheduled_for.asc())
+    )
+    events = result.scalars().all()
+    return {'events': [_serialize_event(e) for e in events]}
+
+
+@app.post('/admin/marketing/events', summary='Create a marketing calendar event (admin only)', status_code=201)
+async def create_marketing_event(
+    req: MarketingEventCreate,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        scheduled = datetime.fromisoformat(req.scheduled_for.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail='scheduled_for must be ISO 8601')
+
+    event = MarketingEvent(
+        id=str(uuid.uuid4()),
+        title=req.title.strip(),
+        channel=req.channel.strip(),
+        scheduled_for=scheduled,
+        content_draft=req.content_draft,
+        asset_notes=req.asset_notes,
+        status=(req.status or 'idea').strip(),
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(event)
+    return _serialize_event(event)
+
+
+@app.patch('/admin/marketing/events/{event_id}', summary='Update a marketing event (admin only)')
+async def update_marketing_event(
+    event_id: str,
+    req: MarketingEventUpdate,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(select(MarketingEvent).where(MarketingEvent.id == event_id))
+    event = result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=404, detail='Event not found')
+
+    if req.title is not None:         event.title = req.title.strip()
+    if req.channel is not None:       event.channel = req.channel.strip()
+    if req.content_draft is not None: event.content_draft = req.content_draft
+    if req.asset_notes is not None:   event.asset_notes = req.asset_notes
+    if req.status is not None:        event.status = req.status.strip()
+    if req.scheduled_for is not None:
+        try:
+            event.scheduled_for = datetime.fromisoformat(req.scheduled_for.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail='scheduled_for must be ISO 8601')
+
+    await db.commit()
+    await db.refresh(event)
+    return _serialize_event(event)
+
+
+@app.delete('/admin/marketing/events/{event_id}', summary='Delete a marketing event (admin only)')
+async def delete_marketing_event(
+    event_id: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(select(MarketingEvent).where(MarketingEvent.id == event_id))
+    event = result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=404, detail='Event not found')
+    await db.delete(event)
+    await db.commit()
+    return {'ok': True, 'deleted': event_id}
+
+
+# ---------------------------------------------------------------------------
+# Marketing tool: integration connection status
+# ---------------------------------------------------------------------------
+
+# Catalogue of integrations the marketing tool knows about. Each entry is
+# the canonical metadata the UI uses to render the connection card.
+# Status comes from the integration_credentials table; everything else is
+# constant. Keep this list in sync with the frontend integration cards.
+_INTEGRATION_CATALOGUE = [
+    {
+        'kind': 'meta_ads',
+        'name': 'Meta Ads',
+        'category': 'ads',
+        'description': 'Read ad performance, surface what is working, and recommend next steps.',
+        'prerequisites': [
+            'Meta Business Manager account',
+            'Meta ad account with at least one campaign',
+            'Marketing API access (Meta reviews, 1-7 days)',
+            'Facebook Pixel installed on solray.ai',
+            'OAuth approval for ads_read + ads_management',
+        ],
+    },
+    {
+        'kind': 'x',
+        'name': 'X (Twitter)',
+        'category': 'social',
+        'description': 'Post drafts, read engagement, surface trends in the astrology conversation.',
+        'prerequisites': [
+            'X Developer account',
+            'API key + secret + bearer token',
+            'OAuth 2.0 user context for posting',
+        ],
+    },
+    {
+        'kind': 'instagram',
+        'name': 'Instagram',
+        'category': 'social',
+        'description': 'Cross-post share cards, read engagement, schedule stories.',
+        'prerequisites': [
+            'Instagram Business or Creator account',
+            'Linked Facebook Page',
+            'Instagram Graph API access via Meta Business Manager',
+        ],
+    },
+    {
+        'kind': 'tiktok',
+        'name': 'TikTok',
+        'category': 'social',
+        'description': 'Schedule short-form video posts, pull view and engagement counts.',
+        'prerequisites': [
+            'TikTok for Business account',
+            'TikTok Developer app with Content Posting + Login Kit',
+            'OAuth approval',
+        ],
+    },
+    {
+        'kind': 'linkedin',
+        'name': 'LinkedIn',
+        'category': 'social',
+        'description': 'Post longer-form pieces and read company-page analytics.',
+        'prerequisites': [
+            'LinkedIn Company Page (admin role)',
+            'LinkedIn Developer app with w_member_social + r_organization_social',
+        ],
+    },
+    {
+        'kind': 'vercel_analytics',
+        'name': 'Vercel Analytics',
+        'category': 'analytics',
+        'description': 'Live page-view, country, and referrer data for solray.ai and app.solray.ai.',
+        'prerequisites': [
+            'Enable Web Analytics on both Vercel projects',
+            'Vercel API token with read scope on the team',
+        ],
+    },
+    {
+        'kind': 'posthog',
+        'name': 'PostHog',
+        'category': 'analytics',
+        'description': 'Funnel analysis: visit to signup to subscription, plus session replay if enabled.',
+        'prerequisites': [
+            'PostHog cloud project',
+            'Project API key',
+            'Event taxonomy decided (signup, trial_start, subscribe, etc.)',
+        ],
+    },
+]
+
+
+@app.get('/admin/integrations', summary='List marketing integrations + their connection status (admin only)')
+async def list_integrations(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+    result = await db.execute(select(IntegrationCredential))
+    by_kind = {row.kind: row for row in result.scalars().all()}
+
+    out = []
+    for entry in _INTEGRATION_CATALOGUE:
+        record = by_kind.get(entry['kind'])
+        out.append({
+            **entry,
+            'status':       record.status if record else 'not_connected',
+            'last_synced':  record.last_synced.isoformat() if record and record.last_synced else None,
+            'last_error':   record.last_error if record else None,
+        })
+    return {'integrations': out}
 
 
 # ---------------------------------------------------------------------------

@@ -197,6 +197,53 @@ class SoulConnection(Base):
     created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class MarketingEvent(Base):
+    """Marketing calendar entries — campaigns, posts, launches, ad spends.
+
+    The marketing tool's planning layer. One row per scheduled or in-flight
+    piece of marketing work. Channel is free text so we can add new ones
+    without migrations: 'x', 'instagram', 'tiktok', 'meta_ads', 'email',
+    'blog', 'launch', etc.
+    """
+    __tablename__ = 'marketing_events'
+
+    id             = Column(String(36), primary_key=True)
+    title          = Column(String(255), nullable=False)
+    channel        = Column(String(40),  nullable=False)
+    scheduled_for  = Column(DateTime,    nullable=False)
+    content_draft  = Column(Text,        nullable=True)   # post copy, ad text, email body
+    asset_notes    = Column(Text,        nullable=True)   # links to images, briefs, references
+    status         = Column(String(20),  nullable=False, default='idea')  # idea | scheduled | published | archived
+    created_at     = Column(DateTime,    nullable=False, default=datetime.utcnow)
+    updated_at     = Column(DateTime,    nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class IntegrationCredential(Base):
+    """Stored credentials and connection status for marketing integrations.
+
+    One row per integration kind ('meta_ads', 'x', 'instagram', 'tiktok',
+    'linkedin', 'vercel_analytics', 'posthog'). credentials_json stores
+    OAuth tokens or API keys as a JSON blob — encrypted at rest in
+    production; tonight we store plaintext under the assumption that Bob
+    will rotate any tokens we hold once we move to encrypted storage.
+
+    status is one of: 'not_connected' | 'connected' | 'error' | 'expired'.
+    """
+    __tablename__ = 'integration_credentials'
+    __table_args__ = (
+        UniqueConstraint('kind', name='uq_integration_kind'),
+    )
+
+    id                = Column(String(36), primary_key=True)
+    kind              = Column(String(40),  nullable=False)
+    status            = Column(String(20),  nullable=False, default='not_connected')
+    credentials_json  = Column(Text,        nullable=True)
+    last_synced       = Column(DateTime,    nullable=True)
+    last_error        = Column(Text,        nullable=True)
+    created_at        = Column(DateTime,    nullable=False, default=datetime.utcnow)
+    updated_at        = Column(DateTime,    nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ---------------------------------------------------------------------------
 # DB Initialisation
 # ---------------------------------------------------------------------------
