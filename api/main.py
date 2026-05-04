@@ -2715,6 +2715,74 @@ async def astro_events(
     return {'events': upcoming_events(days=days)}
 
 
+# Score weights by sky-event kind for seeding into Signal Radar.
+_SKY_KIND_SCORE = {
+    'station_retrograde': 85,
+    'station_direct':     70,
+    'ingress':            65,
+    'lunar_phase':        55,
+}
+
+
+@app.post('/admin/marketing/seed-from-sky', summary='Seed Signal Radar with upcoming sky events (admin only)')
+async def seed_signals_from_sky(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = 60,
+):
+    """Idempotent. Every upcoming sky event becomes a MarketingSignal with
+    source='astro_event'. Skips events that already have a matching
+    signal (same source + title + happens_at). Safe to re-run weekly as
+    the horizon rolls forward. Returns counts.
+    """
+    from sqlalchemy import select
+    from marketing.astro_events import upcoming_events
+
+    days = max(7, min(180, int(days)))
+    sky = upcoming_events(days=days)
+
+    inserted = 0
+    skipped = 0
+    for ev in sky:
+        try:
+            happens = datetime.fromisoformat(ev['happens_at'].replace('Z', '+00:00'))
+        except Exception:
+            continue
+
+        existing = await db.execute(
+            select(MarketingSignal).where(
+                MarketingSignal.source == 'astro_event',
+                MarketingSignal.title == ev['label'],
+                MarketingSignal.happens_at == happens,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            skipped += 1
+            continue
+
+        signal = MarketingSignal(
+            id=str(uuid.uuid4()),
+            source='astro_event',
+            title=ev['label'],
+            body=f"Kind: {ev.get('kind', 'sky_event')}",
+            url=None,
+            score=_SKY_KIND_SCORE.get(ev.get('kind'), 60),
+            happens_at=happens,
+        )
+        db.add(signal)
+        inserted += 1
+
+    if inserted > 0:
+        await db.commit()
+
+    return {
+        'days': days,
+        'sky_events_seen': len(sky),
+        'signals_inserted': inserted,
+        'signals_skipped':  skipped,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
