@@ -115,6 +115,7 @@ app = FastAPI(
 # unset or misconfigured, these two always have access.
 _DEFAULT_ADMIN_EMAILS = {
     "kristjangilbert@gmail.com",
+    "kristjangilbert@protonmail.com",
     "davidsnaerj@gmail.com",
 }
 _ADMIN_EMAILS_FROM_ENV = {
