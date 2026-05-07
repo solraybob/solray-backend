@@ -1552,6 +1552,68 @@ async def soul_synergy(
 
 
 # ---------------------------------------------------------------------------
+# GET /souls/{soul_id}/compatibility
+# ---------------------------------------------------------------------------
+
+@app.get('/souls/{soul_id}/compatibility', summary='Compatibility reading between self and a soul connection')
+async def soul_compatibility(
+    soul_id: str,
+    user_id: str = Depends(require_premium),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns a four-lens Oracle reading (amplify, misread, safety,
+    lesson) plus the structural synergy signals (shared gates, channels,
+    HD type pairing). No scoring, no percentage. Used by the embedded
+    Compatibility section on /profile/[id].
+
+    Premium gated: paying subscribers only. Both users must be in an
+    accepted soul connection.
+    """
+    # Verify accepted connection
+    connections = await get_accepted_souls(db, user_id)
+    conn = next(
+        (c for c in connections
+         if c.requester_id == soul_id or c.recipient_id == soul_id),
+        None,
+    )
+    if not conn:
+        raise HTTPException(
+            status_code=403,
+            detail='No accepted soul connection found with this user',
+        )
+
+    my_bp = await get_blueprint(db, user_id)
+    soul_bp = await get_blueprint(db, soul_id)
+    me = await get_user_by_id(db, user_id)
+    them = await get_user_by_id(db, soul_id)
+
+    if not my_bp or not soul_bp:
+        raise HTTPException(
+            status_code=404,
+            detail='Blueprint not found for one or both users.',
+        )
+
+    user_name = (me.name if me else 'You')
+    soul_name = (them.name if them else 'Soul')
+
+    # Structural signals (no AI). Drop resonance_score per Solray policy:
+    # we do not score relationships, we read their shape.
+    signals = _compute_synergy(my_bp, soul_bp)
+    signals.pop('resonance_score', None)
+
+    # Oracle four-lens reading.
+    from ai.compatibility import generate_compatibility_reading
+    reading = generate_compatibility_reading(my_bp, soul_bp, user_name, soul_name)
+
+    return {
+        'self': {'id': user_id, 'name': user_name},
+        'soul': {'id': soul_id, 'name': soul_name},
+        'signals': signals,
+        'reading': reading,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /souls/{connection_id}/blueprint
 # ---------------------------------------------------------------------------
 
