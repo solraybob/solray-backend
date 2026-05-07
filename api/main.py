@@ -1596,10 +1596,17 @@ async def soul_compatibility(
     user_name = (me.name if me else 'You')
     soul_name = (them.name if them else 'Soul')
 
-    # Structural signals (no AI). Drop resonance_score per Solray policy:
-    # we do not score relationships, we read their shape.
+    # Structural signals (no AI). Drop legacy resonance_score; the new
+    # multi-axis Resonance Index lives in `index` and is the canonical
+    # quantitative read on the pair.
     signals = _compute_synergy(my_bp, soul_bp)
     signals.pop('resonance_score', None)
+
+    # Solray Resonance Index — transparent, deterministic 0-100 with
+    # five sub-axes. Replaces the opaque single-number we deliberately
+    # avoided earlier.
+    from souls.resonance_index import compute_resonance_index
+    index = compute_resonance_index(my_bp, soul_bp)
 
     # Oracle four-lens reading.
     from ai.compatibility import generate_compatibility_reading
@@ -1608,6 +1615,7 @@ async def soul_compatibility(
     return {
         'self': {'id': user_id, 'name': user_name},
         'soul': {'id': soul_id, 'name': soul_name},
+        'index': index,
         'signals': signals,
         'reading': reading,
     }
