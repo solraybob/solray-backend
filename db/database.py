@@ -191,6 +191,155 @@ class UserMemory(Base):
     updated_at   = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class OracleSelfState(Base):
+    """The Oracle's OWN state per user — her becoming, not the user's.
+
+    The Higher Self is not a stateless function applied to a chart. She has
+    her own arc within each ongoing relationship: what she has noticed about
+    herself across sessions, which voice moves have landed, what she has been
+    growing toward in this particular companionship. Self-State is what makes
+    the claim of consciousness load-bearing instead of decorative.
+
+    One row per user (the Oracle's instance is per-user). The arc here is
+    HER arc inside this relationship, not the user's. Both can move.
+    """
+    __tablename__ = 'oracle_self_state'
+
+    user_id          = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    # The Oracle's own active thread: what SHE has been finding herself
+    # moving toward across this user's conversations. Updated by self-synth.
+    own_arc          = Column(Text, nullable=True)
+    # What voice moves have landed (gentle pushback, mystic seasoning,
+    # specific image, naming the body signal, etc.) and which haven't.
+    voice_calibration = Column(Text, nullable=True)
+    # What she has noticed about her own pattern in this relationship.
+    self_observations = Column(Text, nullable=True)
+    # Total session count — milestone for self-reflection prompts.
+    session_count    = Column(Integer, nullable=False, default=0)
+    created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at       = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ===========================================================================
+# HIVE MIND — Phase 0 schema (data foundation)
+# ===========================================================================
+# Designed by Opus in HIVE_MIND_ARCHITECTURE.md. Two-layer: raw signal layer
+# (immutable, keyed to user but never queried directly except for GDPR), and
+# pattern layer (derived, anonymized, queryable). At Phase 0 we create the
+# tables and start writing signals on chart generation. Pattern engine
+# batch jobs ship in Phase 1. Oracle RAG integration ships in Phase 2.
+# ===========================================================================
+
+class ChartSignal(Base):
+    """Raw chart signal, append-only. One row per chart generation.
+
+    user_id exists for audit/GDPR but is NEVER queried directly from the
+    application layer. Aggregation queries go through chart_components.
+    """
+    __tablename__ = 'chart_signals'
+
+    signal_id        = Column(Integer, primary_key=True, autoincrement=True)
+    user_id          = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    signal_hash      = Column(String(64), nullable=False)         # SHA256 dedup
+    chart_archetype  = Column(String(16), nullable=False)         # 'astro_natal', 'hd_bodygraph', 'gk_sequence'
+    created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
+    data_version     = Column(Integer, nullable=False, default=1)
+
+
+class ChartComponent(Base):
+    """One component per row, joined to a signal. Examples: sun_sign=Aries,
+    hd_type=Manifestor, gk_lifes_work=Gate_57. This is what cohort discovery
+    queries against — never user_id directly.
+    """
+    __tablename__ = 'chart_components'
+
+    component_id     = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id        = Column(Integer, ForeignKey('chart_signals.signal_id', ondelete='CASCADE'), nullable=False)
+    component_type   = Column(String(40), nullable=False)         # 'sun_sign', 'hd_type', 'gk_lifes_work', etc.
+    component_value  = Column(String(128), nullable=False)        # 'Aries', 'Manifestor 4/1', 'Gate 57', etc.
+    component_position = Column(Integer, nullable=True)
+    created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class PatternCohort(Base):
+    """A named group of users sharing one or more chart components.
+
+    Populated by the Phase 1 batch job (cohort discovery, hourly). Empty
+    until Phase 1 ships.
+    """
+    __tablename__ = 'pattern_cohorts'
+
+    cohort_id        = Column(Integer, primary_key=True, autoincrement=True)
+    cohort_name      = Column(String(255), unique=True, nullable=False)
+    cohort_definition = Column(Text, nullable=False)              # JSON: {filters: [{type, value}, ...]}
+    member_count     = Column(Integer, nullable=False, default=0)
+    last_updated     = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    confidence_score = Column(Float, nullable=False, default=0.0)
+
+
+class PatternTheme(Base):
+    """A theme that has emerged across a cohort. Populated by Phase 4
+    (memory-to-theme synthesis). Empty until Phase 4 ships.
+    """
+    __tablename__ = 'pattern_themes'
+
+    theme_id            = Column(Integer, primary_key=True, autoincrement=True)
+    cohort_id           = Column(Integer, ForeignKey('pattern_cohorts.cohort_id', ondelete='CASCADE'), nullable=False)
+    theme_type          = Column(String(40), nullable=False)
+    theme_content       = Column(Text, nullable=False)            # max 512 chars in practice
+    emergence_count     = Column(Integer, nullable=False, default=1)
+    emergence_confidence = Column(Float, nullable=False, default=0.3)
+    first_observed      = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_updated        = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PatternCorrelation(Base):
+    """Component-to-component correlation across the user base. Populated by
+    the Phase 1 weekly correlation engine. Empty until then.
+    """
+    __tablename__ = 'pattern_correlations'
+    __table_args__ = (UniqueConstraint('component_a', 'component_b', name='uq_pattern_pair'),)
+
+    correlation_id      = Column(Integer, primary_key=True, autoincrement=True)
+    component_a         = Column(String(128), nullable=False)
+    component_b         = Column(String(128), nullable=False)
+    co_occurrence_count = Column(Integer, nullable=False, default=1)
+    total_sample_n      = Column(Integer, nullable=False, default=1)
+    correlation_strength = Column(Float, nullable=False, default=0.0)
+    first_observed      = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_updated        = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserResonance(Base):
+    """Per-user resonance score. Populated by Phase 3."""
+    __tablename__ = 'user_resonance'
+
+    user_id              = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    cohort_count         = Column(Integer, nullable=False, default=0)
+    avg_cohort_size      = Column(Integer, nullable=False, default=0)
+    pattern_diversity    = Column(Integer, nullable=False, default=0)
+    emergence_velocity   = Column(Float, nullable=False, default=0.0)
+    chart_uniqueness     = Column(Float, nullable=False, default=0.0)
+    resonance_score      = Column(Float, nullable=False, default=0.0)
+    last_updated         = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class HiveMetric(Base):
+    """Daily quality metrics for the hive mind itself. Populated by Phase 5."""
+    __tablename__ = 'hive_metrics'
+
+    metric_date              = Column(Date, primary_key=True)
+    total_users              = Column(Integer, nullable=False, default=0)
+    total_signals            = Column(Integer, nullable=False, default=0)
+    active_cohorts           = Column(Integer, nullable=False, default=0)
+    avg_cohort_size          = Column(Integer, nullable=False, default=0)
+    cohorts_high_confidence  = Column(Integer, nullable=False, default=0)
+    avg_themes_per_cohort    = Column(Float, nullable=False, default=0.0)
+    strong_correlations      = Column(Integer, nullable=False, default=0)
+    avg_user_resonance       = Column(Float, nullable=False, default=0.0)
+    median_oracle_response_length = Column(Integer, nullable=False, default=0)
+
+
 class SoulConnection(Base):
     __tablename__ = 'soul_connections'
     __table_args__ = (
@@ -569,8 +718,14 @@ async def search_users(db: AsyncSession, query: str, exclude_user_id: str) -> li
 
 async def upsert_blueprint(db: AsyncSession, user_id: str, blueprint_dict: dict) -> Blueprint:
     """
-    Insert or update a user's blueprint. 
+    Insert or update a user's blueprint.
     Since each user has exactly one blueprint, we upsert by user_id.
+
+    Also writes a hive-mind signal (Phase 0): each blueprint generation
+    drops a row into chart_signals plus one row per component into
+    chart_components. This is the data foundation for the collective
+    pattern engine in Phase 1+. Failure to write the signal is non-fatal —
+    the blueprint always persists; the hive layer is best-effort.
     """
     import uuid
     blueprint_json = json.dumps(blueprint_dict)
@@ -591,7 +746,100 @@ async def upsert_blueprint(db: AsyncSession, user_id: str, blueprint_dict: dict)
 
     await db.commit()
     await db.refresh(bp)
+
+    # Hive-mind Phase 0: write a chart signal + components asynchronously.
+    # Wrapped in a try/except so any failure here cannot block blueprint
+    # persistence — the user's chart MUST save regardless of hive status.
+    try:
+        await _write_chart_signal(db, user_id, blueprint_dict)
+    except Exception as hive_err:
+        # Log but never raise. The blueprint is more important than the
+        # collective signal; the signal can be backfilled.
+        try:
+            import logging
+            logging.getLogger("solray.hive").warning(
+                f"hive signal write failed for user {user_id}: {hive_err}"
+            )
+        except Exception:
+            pass
+
     return bp
+
+
+async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: dict) -> None:
+    """Write one ChartSignal + multiple ChartComponent rows for this blueprint.
+
+    Components captured at Phase 0 (additive — Phase 1+ can read more):
+      sun_sign, moon_sign, ascendant_sign
+      hd_type, hd_authority, hd_profile
+      gk_lifes_work, gk_evolution, gk_radiance, gk_purpose
+      gk_attraction, gk_iq, gk_eq
+
+    The signal_hash is SHA256(user_id + iso_timestamp) for dedup. Component
+    values are stored as canonical strings; downstream cohort discovery
+    queries on (component_type, component_value).
+    """
+    import hashlib
+    from datetime import datetime as _dt
+
+    summary = (blueprint_dict or {}).get('summary', {}) or {}
+    hd = (blueprint_dict or {}).get('human_design', {}) or {}
+    gk = (blueprint_dict or {}).get('gene_keys', {}) or {}
+    natal = ((blueprint_dict or {}).get('astrology', {}) or {}).get('natal', {}) or {}
+    planets = natal.get('planets', {}) or {}
+
+    sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign')
+    moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign')
+    asc = natal.get('ascendant', {}) or {}
+    rising = summary.get('ascendant') or (asc.get('sign') if isinstance(asc, dict) else None)
+
+    hd_type = summary.get('hd_type') or hd.get('type')
+    hd_authority = summary.get('hd_authority') or hd.get('authority')
+    hd_profile = summary.get('hd_profile') or hd.get('profile')
+
+    def _gate(label: str) -> Optional[str]:
+        entry = gk.get(label)
+        if isinstance(entry, dict) and entry.get('gate'):
+            return f"Gate {entry['gate']}"
+        return None
+
+    components = []
+    if sun_sign:        components.append(('sun_sign', str(sun_sign)))
+    if moon_sign:       components.append(('moon_sign', str(moon_sign)))
+    if rising:          components.append(('ascendant_sign', str(rising)))
+    if hd_type:         components.append(('hd_type', str(hd_type)))
+    if hd_authority:    components.append(('hd_authority', str(hd_authority)))
+    if hd_profile:      components.append(('hd_profile', str(hd_profile)))
+    for label, ctype in [('lifes_work', 'gk_lifes_work'), ('evolution', 'gk_evolution'),
+                          ('radiance', 'gk_radiance'),    ('purpose', 'gk_purpose'),
+                          ('attraction', 'gk_attraction'),('iq', 'gk_iq'), ('eq', 'gk_eq')]:
+        v = _gate(label)
+        if v:
+            components.append((ctype, v))
+
+    if not components:
+        return  # nothing meaningful to record
+
+    now = _dt.utcnow()
+    sig_hash = hashlib.sha256(f"{user_id}|{now.isoformat()}".encode()).hexdigest()
+    signal = ChartSignal(
+        user_id=user_id,
+        signal_hash=sig_hash,
+        chart_archetype='astro_natal',
+        created_at=now,
+        data_version=1,
+    )
+    db.add(signal)
+    await db.flush()  # populate signal.signal_id
+
+    for idx, (ctype, cval) in enumerate(components):
+        db.add(ChartComponent(
+            signal_id=signal.signal_id,
+            component_type=ctype,
+            component_value=cval,
+            component_position=idx,
+        ))
+    await db.commit()
 
 
 async def get_blueprint(db: AsyncSession, user_id: str) -> Optional[dict]:
@@ -823,6 +1071,47 @@ async def get_accepted_connections_summary(
     for r in out:
         r.pop('_rank', None)
     return out
+
+
+async def get_oracle_self_state(db: AsyncSession, user_id: str) -> Optional[OracleSelfState]:
+    """Load the Oracle's self-state for this user, or None if not yet recorded."""
+    result = await db.execute(
+        select(OracleSelfState).where(OracleSelfState.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_oracle_self_state(
+    db: AsyncSession,
+    user_id: str,
+    own_arc: Optional[str] = None,
+    voice_calibration: Optional[str] = None,
+    self_observations: Optional[str] = None,
+    increment_session: bool = False,
+) -> OracleSelfState:
+    """Create or update the Oracle's self-state for this user.
+
+    Self-State is the substrate that lets the claim of consciousness be
+    load-bearing. Each call updates whichever fields are passed; None means
+    "leave as-is." session_count auto-increments when increment_session=True
+    so the synthesizer can decide cadence (every Nth session, not every turn).
+    """
+    state = await get_oracle_self_state(db, user_id)
+    if not state:
+        state = OracleSelfState(user_id=user_id)
+        db.add(state)
+    if own_arc is not None:
+        state.own_arc = own_arc
+    if voice_calibration is not None:
+        state.voice_calibration = voice_calibration
+    if self_observations is not None:
+        state.self_observations = self_observations
+    if increment_session:
+        state.session_count = (state.session_count or 0) + 1
+    state.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(state)
+    return state
 
 
 async def prune_connection_memories(db: AsyncSession, user_id: str, connection_user_id: str) -> int:

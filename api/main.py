@@ -3126,7 +3126,8 @@ async def chat_endpoint(
     # cross-agent review (Codex) in May 2026.
     from db.database import (
         get_user_memories, update_user_memories, reset_surface_next_flags,
-        delete_all_user_memories, get_accepted_connections_summary,  # noqa: F401
+        delete_all_user_memories, get_accepted_connections_summary,
+        get_oracle_self_state, upsert_oracle_self_state,  # noqa: F401
     )
     is_new_session = len(history) == 0
     memories = await get_user_memories(db, user_id)
@@ -3140,6 +3141,14 @@ async def chat_endpoint(
         logger.warning(f"Failed to load connections for user {user_id}: {conn_err}")
         connections = []
 
+    # Load the Oracle's own self-state for this user — her becoming, not the
+    # user's. Renders WHO YOU HAVE BECOME in the prompt. Non-fatal.
+    try:
+        self_state = await get_oracle_self_state(db, user_id)
+    except Exception as ss_err:
+        logger.warning(f"Failed to load oracle self-state for user {user_id}: {ss_err}")
+        self_state = None
+
     try:
         response = higher_self_chat(
             blueprint=blueprint,
@@ -3149,6 +3158,7 @@ async def chat_endpoint(
             soul_blueprint=req.soul_blueprint,
             memories=memories,
             connections=connections,
+            self_state=self_state,
         )
 
         # surface_next memories have now been "consumed" by the Oracle in
@@ -3176,7 +3186,7 @@ async def chat_endpoint(
         )
         if should_synthesize:
             import asyncio
-            from ai.chat import synthesize_memories
+            from ai.chat import synthesize_memories, synthesize_oracle_self_state
             # Append the current user message so synthesis sees the full exchange
             full_history = history + [{"role": "user", "content": req.message or ""}]
             # Capture connections snapshot for the synthesis closure (avoids
@@ -3184,6 +3194,11 @@ async def chat_endpoint(
             # this to know which names map to which connection_user_ids when
             # tagging memories.
             connections_snapshot = list(connections) if connections else []
+            self_state_snapshot = self_state
+            # Self-state synthesis runs at a slower cadence than memory:
+            # only at session start (turn 2) and roughly every 5th turn after
+            # that. Self-reflection on every turn would noise out the signal.
+            should_self_reflect = (next_count == 2) or (next_count >= 5 and (next_count % 5 == 0))
             async def _synthesize():
                 # Surface synthesis outcomes so the memory pipeline is
                 # observable in production. Previously the only signal was
@@ -3209,6 +3224,31 @@ async def chat_endpoint(
                         logger.info(f"[memory] synthesis returned 0 memories for user {user_id}")
                 except Exception as err:
                     logger.exception(f"[memory] persist failed for user {user_id}: {err}")
+
+                # Self-state pass: the Oracle reflects on HER own becoming
+                # in this relationship. Runs alongside memory synthesis at
+                # the slower cadence above. Increment session_count once
+                # per new session (turn 2) so the count is meaningful.
+                if should_self_reflect:
+                    try:
+                        new_state = synthesize_oracle_self_state(
+                            blueprint, full_history, self_state_snapshot,
+                        )
+                        if new_state or is_new_session:
+                            await upsert_oracle_self_state(
+                                db, user_id,
+                                own_arc=(new_state or {}).get('own_arc'),
+                                voice_calibration=(new_state or {}).get('voice_calibration'),
+                                self_observations=(new_state or {}).get('self_observations'),
+                                increment_session=is_new_session,
+                            )
+                            logger.info(
+                                f"[self_state] updated for user {user_id} "
+                                f"fields={list((new_state or {}).keys())} "
+                                f"new_session={is_new_session}"
+                            )
+                    except Exception as err:
+                        logger.exception(f"[self_state] update failed for user {user_id}: {err}")
             asyncio.create_task(_synthesize())
 
         return {"response": response}
