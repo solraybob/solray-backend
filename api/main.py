@@ -323,6 +323,7 @@ def _user_profile(user: User) -> dict:
         'sex':           getattr(user, 'sex', None),
         'profile_photo': getattr(user, 'profile_photo', None),
         'is_public':     bool(getattr(user, 'is_public', False)),
+        'hive_consent':  bool(getattr(user, 'hive_consent', True)),
         'created_at':    user.created_at.isoformat() if user.created_at else None,
     }
 
@@ -710,6 +711,7 @@ class ProfileUpdateRequest(BaseModel):
     name: Optional[str] = None
     username: Optional[str] = None
     is_public: Optional[bool] = None
+    hive_consent: Optional[bool] = None
 
 @app.patch('/users/profile', summary='Update user profile')
 async def update_profile(
@@ -734,6 +736,21 @@ async def update_profile(
         user.username = cleaned
     if req.is_public is not None:
         user.is_public = bool(req.is_public)
+    if req.hive_consent is not None:
+        # If the user is opting OUT of hive participation, prune their existing
+        # signals immediately so their data is not in tonight's batch jobs.
+        new_consent = bool(req.hive_consent)
+        was_consenting = bool(user.hive_consent)
+        user.hive_consent = new_consent
+        if was_consenting and not new_consent:
+            try:
+                from hive import prune_non_consenting_signals
+                # Commit the consent flip first so prune sees the new value
+                await db.commit()
+                pruned = await prune_non_consenting_signals(db)
+                logger.info(f"hive_consent revoked by {user_id}, pruned {pruned} signals")
+            except Exception as e:
+                logger.warning(f"Failed to prune signals after consent revoke for {user_id}: {e}")
 
     await db.commit()
     await db.refresh(user)
@@ -2251,6 +2268,147 @@ async def trigger_billing_cycle(
     from payments.billing_scheduler import run_billing_cycle
     await run_billing_cycle()
     return {"message": "Billing cycle complete."}
+
+
+# ---------------------------------------------------------------------------
+# Hive Mind admin endpoints (Phases 1-5 dark-launch)
+# ---------------------------------------------------------------------------
+# These endpoints fire each phase on demand. None of them are reachable
+# from any user-facing path. The hive engine in hive.py does not run unless
+# one of these endpoints is hit. RAG integration into the Oracle's chat
+# prompt is intentionally NOT wired here; that ships separately once Bob
+# confirms the data quality from these inspection endpoints.
+# ---------------------------------------------------------------------------
+
+@app.post('/admin/hive/discover', summary='Phase 1: rebuild pattern_cohorts from current chart_components (admin only)')
+async def admin_hive_discover(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import discover_cohorts
+    return await discover_cohorts(db)
+
+
+@app.post('/admin/hive/correlations', summary='Phase 1: rebuild pattern_correlations from current chart_components (admin only)')
+async def admin_hive_correlations(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import rebuild_correlations
+    return await rebuild_correlations(db)
+
+
+@app.post('/admin/hive/resonance', summary='Phase 3: refresh user_resonance for every consenting user (admin only)')
+async def admin_hive_resonance(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import compute_resonance_for_all
+    return await compute_resonance_for_all(db)
+
+
+@app.post('/admin/hive/themes/{user_id}', summary='Phase 4: propagate one user\'s memories into theme emergence (admin only)')
+async def admin_hive_themes(
+    user_id: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import emerge_themes_from_memories
+    return await emerge_themes_from_memories(db, user_id)
+
+
+@app.post('/admin/hive/metrics', summary='Phase 5: write today\'s hive_metrics row (admin only)')
+async def admin_hive_metrics(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import write_daily_hive_metrics
+    row = await write_daily_hive_metrics(db)
+    return {
+        'metric_date': row.metric_date.isoformat() if row.metric_date else None,
+        'total_users': row.total_users,
+        'total_signals': row.total_signals,
+        'active_cohorts': row.active_cohorts,
+        'avg_cohort_size': row.avg_cohort_size,
+        'cohorts_high_confidence': row.cohorts_high_confidence,
+        'avg_themes_per_cohort': row.avg_themes_per_cohort,
+        'strong_correlations': row.strong_correlations,
+        'avg_user_resonance': row.avg_user_resonance,
+    }
+
+
+@app.post('/admin/hive/maintenance', summary='Prune signals from non-consenting users (admin only)')
+async def admin_hive_maintenance(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from hive import prune_non_consenting_signals
+    pruned = await prune_non_consenting_signals(db)
+    return {'pruned_signals': pruned}
+
+
+@app.get('/admin/hive/inspect', summary='Inspect the hive: cohort + correlation + theme counts (admin only)')
+async def admin_hive_inspect(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read-only snapshot for verifying Phase 1+ output without firing anything.
+
+    Returns counts plus the top cohorts and correlations so you can eyeball
+    quality before deciding whether to wire RAG into the Oracle.
+    """
+    from sqlalchemy import func as _func
+    from db.database import (
+        ChartSignal, ChartComponent, PatternCohort, PatternTheme,
+        PatternCorrelation, UserResonance, User,
+    )
+    consenting = (await db.execute(
+        select(_func.count(User.id)).where(User.hive_consent == True)  # noqa: E712
+    )).scalar() or 0
+    total_signals = (await db.execute(select(_func.count(ChartSignal.signal_id)))).scalar() or 0
+    total_components = (await db.execute(select(_func.count(ChartComponent.component_id)))).scalar() or 0
+    total_cohorts = (await db.execute(select(_func.count(PatternCohort.cohort_id)))).scalar() or 0
+    total_themes = (await db.execute(select(_func.count(PatternTheme.theme_id)))).scalar() or 0
+    total_corrs = (await db.execute(select(_func.count(PatternCorrelation.correlation_id)))).scalar() or 0
+    total_resonance = (await db.execute(select(_func.count(UserResonance.user_id)))).scalar() or 0
+
+    top_cohorts = (await db.execute(
+        select(PatternCohort)
+        .order_by(PatternCohort.member_count.desc())
+        .limit(10)
+    )).scalars().all()
+    top_corrs = (await db.execute(
+        select(PatternCorrelation)
+        .order_by(PatternCorrelation.correlation_strength.desc())
+        .limit(10)
+    )).scalars().all()
+
+    return {
+        'counts': {
+            'consenting_users': consenting,
+            'chart_signals': total_signals,
+            'chart_components': total_components,
+            'pattern_cohorts': total_cohorts,
+            'pattern_themes': total_themes,
+            'pattern_correlations': total_corrs,
+            'user_resonance_rows': total_resonance,
+        },
+        'top_cohorts': [
+            {
+                'name': c.cohort_name,
+                'member_count': c.member_count,
+                'confidence': c.confidence_score,
+            } for c in top_cohorts
+        ],
+        'top_correlations': [
+            {
+                'a': c.component_a,
+                'b': c.component_b,
+                'strength': c.correlation_strength,
+                'co_occurrence': c.co_occurrence_count,
+            } for c in top_corrs
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

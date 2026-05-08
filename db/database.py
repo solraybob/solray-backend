@@ -123,6 +123,12 @@ class User(Base):
     profile_photo    = Column(Text,        nullable=True)    # base64 data URI
     is_public        = Column(Boolean,     nullable=False, default=False)  # show full profile to connections
     analytics_opt_out= Column(Boolean,     nullable=False, default=False)  # disable analytics event recording
+    # Hive mind participation. Defaults to True: the architecture's k-anonymity
+    # threshold (k>=10) and component-only aggregation guarantee no user is
+    # identifiable in pattern queries. Users can flip this off in settings to
+    # exclude their chart from collective participation; their existing
+    # signals are then deleted by the maintenance job.
+    hive_consent     = Column(Boolean,     nullable=False, default=True)
     email_verified   = Column(Boolean,     nullable=False, default=False)
     verification_token = Column(String(64), nullable=True)   # random token for email verify link
     password_reset_token   = Column(String(64), nullable=True)   # random token for password reset link
@@ -565,6 +571,28 @@ async def init_db():
         except Exception as e:
             print(f"[init_db] email_verified column migration note: {e}")
 
+        # hive_consent column on User. Defaults to TRUE so existing users
+        # participate in the collective by default (their data is anonymized
+        # at the cohort layer with k>=10 minimum). Users can flip this off
+        # in settings; the maintenance job will then prune their signals.
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS hive_consent BOOLEAN DEFAULT TRUE"
+                ))
+                await conn.execute(text(
+                    "UPDATE users SET hive_consent = TRUE WHERE hive_consent IS NULL"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'hive_consent' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN hive_consent BOOLEAN DEFAULT 1"
+                    ))
+        except Exception as e:
+            print(f"[init_db] hive_consent column migration note: {e}")
+
         # surface_next column on user_memory (BOOLEAN) — flags memories to surface in next session
         try:
             if _is_postgres:
@@ -844,6 +872,16 @@ async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: di
 
     if not components:
         return  # nothing meaningful to record
+
+    # Consent gate: skip the entire write if the user has opted out of hive
+    # participation. Their blueprint already saved upstream; this just stops
+    # their data from contributing to the collective layer.
+    consent_row = await db.execute(
+        select(User.hive_consent).where(User.id == user_id)
+    )
+    consent_val = consent_row.scalar_one_or_none()
+    if consent_val is False:
+        return
 
     archetype = 'astro_natal'
     now = _dt.utcnow()
