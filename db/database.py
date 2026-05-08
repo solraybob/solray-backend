@@ -197,6 +197,32 @@ class UserMemory(Base):
     updated_at   = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ChatSession(Base):
+    """A user's chat session with the Oracle, synced across devices.
+
+    Designed to mirror the frontend's existing StoredSession shape so the
+    migration from localStorage is one-for-one. messages is a JSON array
+    of {role, content, timestamp, ...} objects; we keep them in a single
+    Text column rather than a separate ChatMessage table because:
+      - Sessions are a tight unit (open/save/replay), never queried by
+        individual message
+      - Average session is under 50 messages, well within Postgres TEXT
+        limits
+      - One SELECT to fetch a full session, no JOIN needed
+    last_message_at supports sorting the session list by recency.
+    """
+    __tablename__ = 'chat_sessions'
+
+    id              = Column(String(64), primary_key=True)  # client-generated, e.g. "1747-abc12"
+    user_id         = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    custom_name     = Column(String(255), nullable=True)
+    date_label      = Column(String(64), nullable=True)
+    messages_json   = Column(Text, nullable=False, default='[]')
+    last_message_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at      = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at      = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class OracleSelfState(Base):
     """The Oracle's OWN state per user — her becoming, not the user's.
 
@@ -1164,6 +1190,96 @@ async def get_accepted_connections_summary(
     for r in out:
         r.pop('_rank', None)
     return out
+
+
+async def list_chat_sessions(db: AsyncSession, user_id: str) -> list[dict]:
+    """Lightweight list of a user's sessions for the sidebar/picker.
+    Returns id, custom_name, date_label, message_count, last_message_at.
+    """
+    result = await db.execute(
+        select(ChatSession)
+        .where(ChatSession.user_id == user_id)
+        .order_by(ChatSession.last_message_at.desc())
+        .limit(100)  # cap; older sessions stay accessible by direct id
+    )
+    rows = result.scalars().all()
+    out: list[dict] = []
+    for s in rows:
+        try:
+            msg_count = len(json.loads(s.messages_json or '[]'))
+        except Exception:
+            msg_count = 0
+        out.append({
+            'session_id': s.id,
+            'custom_name': s.custom_name,
+            'date_label': s.date_label,
+            'message_count': msg_count,
+            'last_message_at': s.last_message_at.isoformat() if s.last_message_at else None,
+        })
+    return out
+
+
+async def get_chat_session(db: AsyncSession, user_id: str, session_id: str) -> Optional[ChatSession]:
+    """Load a full session including messages. Returns None if not found
+    or if the session belongs to a different user.
+    """
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_chat_session(
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    custom_name: Optional[str],
+    date_label: Optional[str],
+    messages: list,
+) -> ChatSession:
+    """Create or update a session. messages is a Python list (we serialize).
+    Updates last_message_at to now if the session has any messages.
+    """
+    existing = await get_chat_session(db, user_id, session_id)
+    msgs_json = json.dumps(messages or [])
+    now = datetime.utcnow()
+    if existing:
+        existing.custom_name = custom_name
+        existing.date_label = date_label
+        existing.messages_json = msgs_json
+        if messages:
+            existing.last_message_at = now
+        existing.updated_at = now
+        await db.commit()
+        await db.refresh(existing)
+        return existing
+    sess = ChatSession(
+        id=session_id,
+        user_id=user_id,
+        custom_name=custom_name,
+        date_label=date_label,
+        messages_json=msgs_json,
+        last_message_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(sess)
+    await db.commit()
+    await db.refresh(sess)
+    return sess
+
+
+async def delete_chat_session(db: AsyncSession, user_id: str, session_id: str) -> bool:
+    """Delete a session. Returns True if deleted, False if not found / not owned."""
+    sess = await get_chat_session(db, user_id, session_id)
+    if not sess:
+        return False
+    await db.delete(sess)
+    await db.commit()
+    return True
 
 
 async def get_oracle_self_state(db: AsyncSession, user_id: str) -> Optional[OracleSelfState]:

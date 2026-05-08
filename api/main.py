@@ -3584,6 +3584,88 @@ async def get_memory(
     }
 
 
+# ---------------------------------------------------------------------------
+# Chat sessions — server-side storage so chat history syncs across devices
+# ---------------------------------------------------------------------------
+
+class ChatSessionUpsertRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=64)
+    custom_name: Optional[str] = Field(None, max_length=255)
+    date_label: Optional[str] = Field(None, max_length=64)
+    messages: list[dict] = Field(default_factory=list)
+
+
+@app.get('/chat/sessions', summary='List the current user\'s chat sessions (sorted by recency)')
+async def chat_sessions_list(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    from db.database import list_chat_sessions
+    sessions = await list_chat_sessions(db, user_id)
+    return {'sessions': sessions}
+
+
+@app.get('/chat/sessions/{session_id}', summary='Get a full chat session (messages included)')
+async def chat_session_get(
+    session_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    from db.database import get_chat_session
+    import json as _json
+    sess = await get_chat_session(db, user_id, session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail='Session not found')
+    try:
+        messages = _json.loads(sess.messages_json or '[]')
+    except Exception:
+        messages = []
+    return {
+        'session_id': sess.id,
+        'custom_name': sess.custom_name,
+        'date_label': sess.date_label,
+        'messages': messages,
+        'last_message_at': sess.last_message_at.isoformat() if sess.last_message_at else None,
+        'created_at': sess.created_at.isoformat() if sess.created_at else None,
+    }
+
+
+@app.put('/chat/sessions/{session_id}', summary='Upsert (create or update) a chat session')
+async def chat_session_upsert(
+    session_id: str,
+    req: ChatSessionUpsertRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    if req.session_id != session_id:
+        raise HTTPException(status_code=400, detail='Session id mismatch')
+    from db.database import upsert_chat_session
+    sess = await upsert_chat_session(
+        db, user_id,
+        session_id=session_id,
+        custom_name=req.custom_name,
+        date_label=req.date_label,
+        messages=req.messages,
+    )
+    return {
+        'session_id': sess.id,
+        'last_message_at': sess.last_message_at.isoformat() if sess.last_message_at else None,
+    }
+
+
+@app.delete('/chat/sessions/{session_id}', summary='Delete a chat session')
+async def chat_session_delete(
+    session_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    from db.database import delete_chat_session
+    ok = await delete_chat_session(db, user_id, session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'deleted': True}
+
+
 @app.delete('/memory', summary='Clear user memory')
 async def clear_memory(
     user_id: str = Depends(get_current_user_id),
