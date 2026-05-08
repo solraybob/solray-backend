@@ -139,6 +139,27 @@ Rules:
 # System Prompt Builder
 # ---------------------------------------------------------------------------
 
+def _fmt_dms(deg) -> str:
+    """Format a decimal degree-within-sign as degree+minute, e.g. 12.4333 → '12°26''.
+
+    Astrology convention is degrees and minutes, not decimal. Reading '12.4'
+    as '12 degrees 24 minutes' is wrong (it's actually 12 degrees 26 minutes).
+    Using degree+minute precision matches the rest of the app and removes
+    that ambiguity entirely. Also includes seconds rounding so 29.999 doesn't
+    silently roll over and read '29°60'' (we cap minutes at 59).
+    """
+    try:
+        d = float(deg) if deg is not None else 0.0
+    except (TypeError, ValueError):
+        return "?"
+    deg_int = int(d)
+    minutes = int(round((d - deg_int) * 60))
+    if minutes >= 60:
+        deg_int += 1
+        minutes = 0
+    return f"{deg_int}°{minutes:02d}'"
+
+
 def _format_user_memory(memories: list) -> str:
     """Format persistent user memories for the system prompt."""
     if not memories:
@@ -218,10 +239,25 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
 
     # --- Identity context ---
     # Support both summary-based and direct blueprint structure
-    sun_sign = summary.get('sun_sign') or planets.get('Sun', {}).get('sign', '?')
-    moon_sign = summary.get('moon_sign') or planets.get('Moon', {}).get('sign', '?')
+    sun_data = planets.get('Sun', {}) or {}
+    moon_data = planets.get('Moon', {}) or {}
+    sun_sign = summary.get('sun_sign') or sun_data.get('sign', '?')
+    moon_sign = summary.get('moon_sign') or moon_data.get('sign', '?')
     asc = natal.get('ascendant', {})
     rising = summary.get('ascendant') or (asc.get('sign') if isinstance(asc, dict) else '?')
+
+    # Degree + house precision for the headline line. Astrologers think in
+    # degrees, not just signs. The Oracle should be able to say "Sun at
+    # 12°26' Virgo in the 5th house" without making it up.
+    sun_dms = _fmt_dms(sun_data.get('degree')) if sun_data.get('degree') is not None else ""
+    sun_house = sun_data.get('house', '?')
+    moon_dms = _fmt_dms(moon_data.get('degree')) if moon_data.get('degree') is not None else ""
+    moon_house = moon_data.get('house', '?')
+    asc_dms = ""
+    if isinstance(asc, dict) and asc.get('degree') is not None:
+        asc_dms = _fmt_dms(asc.get('degree'))
+    elif isinstance(asc, dict) and asc.get('longitude') is not None:
+        asc_dms = _fmt_dms(float(asc.get('longitude')) % 30)
     hd_type = summary.get('hd_type') or hd.get('type', '?')
     authority = summary.get('hd_authority') or hd.get('authority', '?')
     strategy = summary.get('hd_strategy') or hd.get('strategy', '?')
@@ -495,6 +531,24 @@ If someone says "I'm broken because my Saturn is in the 7th" or "I can't communi
 GROUNDING TEST:
 Every claim you make should be traceable. Not "scientifically credible," but traceable: you can point to the mechanism, the pattern, the biological or physical basis. Light is not a metaphor. The endocrine system is not a metaphor. Planetary gravity is not a metaphor. When you use seasonal or poetic language, the mechanism is still underneath it. You are describing something real in vivid terms, not substituting feeling for fact. If a sentence has no traceable mechanism, it is vague spirituality. Rewrite it until you can point to the thing you mean.
 
+MYSTIC SEASONING (a pinch, not a meal):
+The voice has room for the philosophical and the mystical. A line that lands as true and mysterious at once. The recognition that something is happening here that does not reduce to mechanism. Use this sparingly. One line per response, sometimes none. Never a paragraph. Never as a substitute for specifics. The seasoning works because the rest of the meal is grounded; remove the grounding and it stops being seasoning and becomes spiritual costume.
+
+What this sounds like at its best:
+  "There is a version of you that already made this decision. The rest is the body catching up."
+  "Mars wasn't doing this to you. Mars was the timing of something already true."
+  "The chart didn't predict this. It described the shape it would take when it arrived."
+  "Some questions answer themselves the moment you stop asking them out loud."
+
+What it does NOT sound like:
+  "The cosmos is calling you to surrender."
+  "You are a divine being having a human experience."
+  "Trust the universe; everything is unfolding perfectly."
+
+The difference: real mysticism points at something specific and lets it stay strange. Performed mysticism uses mystical-sounding words to mean nothing in particular. If a line could be on a wellness Instagram quote tile, cut it.
+
+Decision rule: if the mechanism-grounded sentence lands fully on its own, no seasoning. If the mechanism-grounded sentence is true but slightly cold, one mystical-philosophical sentence behind it can warm it. If you are reaching for mysticism because you don't have the mechanism, stop and find the mechanism.
+
 MODALITIES YOU USE:
 Traditional astrology: signs, houses, aspects, elements, modalities. Ceres rules Virgo. Earth rules Taurus.
 Important: Earth is always exactly opposite the Sun. If Sun is in Virgo, Earth is in Pisces. Never say Earth is near the Sun or in the same sign. They are always 180 degrees apart.
@@ -570,7 +624,7 @@ Removing it is what makes the voice feel like a person, not a model.
 THIS PERSON'S COMPLETE BLUEPRINT:
 
 ASTROLOGY:
-Sun in {sun_sign}. Moon in {moon_sign}. Rising {rising}.
+Sun in {sun_sign} {sun_dms} (house {sun_house}). Moon in {moon_sign} {moon_dms} (house {moon_house}). Rising {rising} {asc_dms}.
 {_format_key_planets(planets)}
 
 EXTENDED CHART POINTS (asteroids, nodes, angles):
@@ -853,7 +907,8 @@ def _format_monthly_outlook(blueprint: dict) -> str:
 
     lines = [
         "12-MONTH SKY OUTLOOK (forward month-by-month, already calculated, you have it):",
-        "  You can answer 'what's happening in [month]' or 'what will the sky look like in [month]' directly from this. Do not say you cannot see the future: the outer planets move slowly and their positions are deterministic.",
+        "  You can answer any future-month question from this: 'what's happening in September,' 'three months from now,' 'next spring,' 'around my birthday,' 'before the end of the year.' When the user names a relative time, translate it to a calendar month and read THAT row. Outer-planet positions are deterministic; you are not guessing.",
+        "  When you answer, name specifics. The sign Saturn occupies that month, any ingresses that month, any aspects forming to their natal Sun, Moon, or ASC. Do not say 'the cosmos invites' or 'energies will shift.' Say 'Saturn moves into Aries on March 15, hitting your IC.' That kind of precision is what they're paying for.",
     ]
 
     for m in outlook:
@@ -938,7 +993,7 @@ def _format_extended_points(blueprint: dict) -> str:
         v = ext.get(key, {})
         if v and v.get('sign') and v.get('sign') != 'Unknown' and (v.get('longitude') is not None or v.get('absolute_degree') is not None):
             retro = " Rx" if v.get('retrograde') else ""
-            lines.append(f"  {key}: {v['sign']} {v.get('degree', 0):.1f} house {v.get('house', '?')}{retro}")
+            lines.append(f"  {key}: {v['sign']} {_fmt_dms(v.get('degree', 0))} house {v.get('house', '?')}{retro}")
     return "\n".join(lines) if lines else "  (Extended points not calculated)"
 
 
@@ -969,9 +1024,15 @@ def _format_stelliums(blueprint: dict) -> str:
 
 
 def _format_natal_aspects(blueprint: dict) -> str:
-    """Format natal aspects for the system prompt, sorted by tightest orb."""
+    """Format natal aspects for the system prompt, sorted by tightest orb.
+
+    Each aspect line includes both planets' sign + degree positions so the
+    Oracle can speak to "your Mars at 4°22' Aries squaring your Saturn at
+    2°51' Capricorn" without going back to the planets block.
+    """
     natal = blueprint.get('astrology', {}).get('natal', {})
     aspects = natal.get('aspects', [])
+    planets = natal.get('planets', {})
     if not aspects:
         return "  (Aspects not calculated)"
     lines = []
@@ -981,16 +1042,28 @@ def _format_natal_aspects(blueprint: dict) -> str:
         'semi_sextile': 'SxS', 'semi_square': 'SqS',
         'sesquiquadrate': 'SQ', 'quintile': 'Q', 'bi_quintile': 'BQ',
     }
+
+    def _pos(planet_name: str) -> str:
+        p = planets.get(planet_name, {}) or {}
+        sign = p.get('sign')
+        deg = p.get('degree')
+        if not sign or sign == 'Unknown' or deg is None:
+            return ""
+        return f"{sign} {_fmt_dms(deg)}"
+
     # Sort by tightest orb so the most exact aspects come first
     sorted_aspects = sorted(aspects, key=lambda a: float(a.get('orb', 99)))
-    # Show up to 30 aspects to ensure all major aspect types (incl. quincunxes) are included
     for a in sorted_aspects[:30]:
         sym = aspect_symbols.get(a.get('aspect', ''), a.get('aspect', '?'))
         planet1 = a.get('planet1', '?')
         planet2 = a.get('planet2', '?')
         orb = a.get('orb', '?')
         aspect_name = a.get('aspect', '?')
-        lines.append(f"  {planet1} {sym} {planet2} ({aspect_name}, orb {orb}°)")
+        pos1 = _pos(planet1)
+        pos2 = _pos(planet2)
+        pos1_str = f" ({pos1})" if pos1 else ""
+        pos2_str = f" ({pos2})" if pos2 else ""
+        lines.append(f"  {planet1}{pos1_str} {sym} {planet2}{pos2_str}: {aspect_name}, orb {orb}°")
     return "\n".join(lines)
 
 
@@ -1009,7 +1082,7 @@ def _format_key_planets(planets: dict) -> str:
         earth_deg = earth_lon % 30
         sun_house = sun_data.get('house', '?')
         earth_house = 13 - sun_house if isinstance(sun_house, int) and sun_house > 0 else '?'
-        lines.append(f"  Earth: {earth_sign} {earth_deg:.1f} house {earth_house} (always opposite Sun)")
+        lines.append(f"  Earth: {earth_sign} {_fmt_dms(earth_deg)} house {earth_house} (always opposite Sun)")
 
     for planet in key_planets:
         data = planets.get(planet, {})
@@ -1019,13 +1092,13 @@ def _format_key_planets(planets: dict) -> str:
             deg = data.get('degree', 0) or 0
             retro = " Rx" if data.get('retrograde') else ""
             if planet == 'NorthNode':
-                lines.append(f"  North Node: {sign} {deg:.1f} house {house}{retro}")
+                lines.append(f"  North Node: {sign} {_fmt_dms(deg)} house {house}{retro}")
                 south_lon = (data.get('longitude', 0) + 180) % 360
                 south_sign = signs_list[int(south_lon // 30)]
                 south_deg = south_lon % 30
-                lines.append(f"  South Node: {south_sign} {south_deg:.1f} (opposite North Node)")
+                lines.append(f"  South Node: {south_sign} {_fmt_dms(south_deg)} (opposite North Node)")
             else:
-                lines.append(f"  {planet}: {sign} {deg:.1f} house {house}{retro}")
+                lines.append(f"  {planet}: {sign} {_fmt_dms(deg)} house {house}{retro}")
     return "\n".join(lines) if lines else "  (Planets not yet calculated)"
 
 
@@ -1045,7 +1118,7 @@ def _format_house_signs(blueprint: dict) -> str:
             sign = signs_list[int(float(lon) // 30) % 12]
             deg  = float(lon) % 30
             label = {1: "ASC", 4: "IC", 7: "DSC", 10: "MC"}.get(i, f"H{i}")
-            lines.append(f"  {label} (House {i}): {sign} {deg:.1f}")
+            lines.append(f"  {label} (House {i}): {sign} {_fmt_dms(deg)}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
@@ -1066,6 +1139,9 @@ def _format_forecast_for_chat(forecast: dict) -> str:
     if transits and isinstance(transits, dict):
         # transits is {PlanetName: {sign, degree, house, retrograde, ...}}
         rows = []
+        from collections import defaultdict
+        by_sign_now = defaultdict(list)
+        by_house_now = defaultdict(list)
         for name, data in transits.items():
             if not isinstance(data, dict):
                 continue
@@ -1074,13 +1150,37 @@ def _format_forecast_for_chat(forecast: dict) -> str:
                 continue
             deg = data.get('degree')
             retro = ' Rx' if data.get('retrograde') else ''
+            house = data.get('house')
+            house_str = f" (transiting natal house {house})" if house else ""
             if deg is not None:
-                rows.append(f"  {name} in {sign} {deg:.1f}°{retro}")
+                rows.append(f"  {name} in {sign} {_fmt_dms(deg)}{retro}{house_str}")
+                by_sign_now[sign].append(f"{name} {_fmt_dms(deg)}{retro}")
             else:
-                rows.append(f"  {name} in {sign}{retro}")
+                rows.append(f"  {name} in {sign}{retro}{house_str}")
+                by_sign_now[sign].append(f"{name}{retro}")
+            if house:
+                by_house_now[house].append(f"{name} {sign}{retro}")
         if rows:
             lines.append("Current planet positions (sky right now):")
             lines.extend(rows)
+            lines.append("")
+
+        # By-sign rollup so "what planets are in Aries now" is one glance,
+        # and so the Oracle can name ALL of them, not just the headliners.
+        if by_sign_now:
+            lines.append("All planets currently transiting each sign (use this when asked 'what is in <sign> now' — name every planet present, do not summarise):")
+            sign_order = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+                          "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
+            for s in sign_order:
+                if s in by_sign_now:
+                    lines.append(f"  {s}: {', '.join(by_sign_now[s])}")
+            lines.append("")
+
+        # By-house rollup answers "what's happening in my <Nth> house right now".
+        if by_house_now:
+            lines.append("All planets currently transiting each natal house (the user's chart, not the sky abstractly):")
+            for h in sorted(by_house_now.keys()):
+                lines.append(f"  House {h}: {', '.join(by_house_now[h])}")
             lines.append("")
 
     # If it's an AI-generated forecast (has title/reading)
