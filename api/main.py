@@ -2460,18 +2460,27 @@ async def admin_hive_graph(
     for uid, ctype, cval in rows:
         user_comps[uid].add(f"{ctype}={cval}")
 
-    # Pull display names + first-name only for privacy in the graph label
+    # Codename by join order: Sol.00 is the first soul ever, Sol.01 is the
+    # second, etc. Carries the lineage of the collective without leaking any
+    # personal information. Stable per user — a soul's number never changes.
+    # We pad to 2 digits up to 99, then naturally grow to 3 digits past 100.
     user_ids = list(user_comps.keys())
     name_map: dict[str, str] = {}
     sign_map: dict[str, str] = {}
     type_map: dict[str, str] = {}
     if user_ids:
-        urows = (await db.execute(
-            select(User.id, User.name).where(User.id.in_(user_ids))
-        )).all()
-        for uid, name in urows:
-            first = (name or "").strip().split(" ", 1)[0] or "Soul"
-            name_map[uid] = first
+        # Get every consenting user ordered by created_at so the codename
+        # reflects true chronological position in the hive, not just within
+        # this query's result set.
+        all_consenting_ordered = (await db.execute(
+            select(User.id).where(User.hive_consent == True).order_by(User.created_at.asc())  # noqa: E712
+        )).scalars().all()
+        rank_by_id: dict[str, int] = {uid: i for i, uid in enumerate(all_consenting_ordered)}
+        for uid in user_ids:
+            rank = rank_by_id.get(uid, 0)
+            # Pad to 2 digits up to 99, then natural width past that.
+            label = f"Sol.{rank:02d}" if rank < 100 else f"Sol.{rank}"
+            name_map[uid] = label
 
     # Use sun_sign + hd_type to colour-code nodes by primary cohort dimension
     for uid, comps in user_comps.items():
