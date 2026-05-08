@@ -18,7 +18,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Column, String, Integer, Float, Date, DateTime, Text, ForeignKey, Boolean,
-    UniqueConstraint, CheckConstraint, select, update, delete, case, or_
+    UniqueConstraint, CheckConstraint, Index, select, update, delete, case, or_
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -231,17 +231,26 @@ class OracleSelfState(Base):
 # ===========================================================================
 
 class ChartSignal(Base):
-    """Raw chart signal, append-only. One row per chart generation.
+    """Raw chart signal. ONE row per (user, chart_archetype) by design.
+
+    Earlier draft made this append-only, which Codex flagged: repeated
+    blueprint upserts (e.g. user re-runs after birth-time correction) would
+    inflate cohort counts to count generations, not users. We collapse to
+    one canonical signal per (user, archetype) via the composite unique
+    constraint and the upsert in _write_chart_signal.
 
     user_id exists for audit/GDPR but is NEVER queried directly from the
     application layer. Aggregation queries go through chart_components.
     """
     __tablename__ = 'chart_signals'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'chart_archetype', name='uq_chart_signals_user_archetype'),
+    )
 
-    signal_id        = Column(Integer, primary_key=True, autoincrement=True)
-    user_id          = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    signal_hash      = Column(String(64), nullable=False)         # SHA256 dedup
-    chart_archetype  = Column(String(16), nullable=False)         # 'astro_natal', 'hd_bodygraph', 'gk_sequence'
+    signal_id        = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    user_id          = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    signal_hash      = Column(String(64), nullable=False, index=True)  # idx_signal_hash
+    chart_archetype  = Column(String(16), nullable=False)
     created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
     data_version     = Column(Integer, nullable=False, default=1)
 
@@ -249,14 +258,23 @@ class ChartSignal(Base):
 class ChartComponent(Base):
     """One component per row, joined to a signal. Examples: sun_sign=Aries,
     hd_type=Manifestor, gk_lifes_work=Gate_57. This is what cohort discovery
-    queries against — never user_id directly.
+    queries against, never user_id directly.
+
+    Composite index on (component_type, component_value) is the hot path
+    for cohort discovery and pattern correlation queries in Phase 1.
     """
     __tablename__ = 'chart_components'
 
+    __table_args__ = (
+        # Hot-path composite index for Phase 1 cohort discovery + correlation
+        # engine. Without this, every batch job table-scans chart_components.
+        Index('idx_component_type_value', 'component_type', 'component_value'),
+    )
+
     component_id     = Column(Integer, primary_key=True, autoincrement=True)
-    signal_id        = Column(Integer, ForeignKey('chart_signals.signal_id', ondelete='CASCADE'), nullable=False)
-    component_type   = Column(String(40), nullable=False)         # 'sun_sign', 'hd_type', 'gk_lifes_work', etc.
-    component_value  = Column(String(128), nullable=False)        # 'Aries', 'Manifestor 4/1', 'Gate 57', etc.
+    signal_id        = Column(Integer, ForeignKey('chart_signals.signal_id', ondelete='CASCADE'), nullable=False, index=True)
+    component_type   = Column(String(40), nullable=False)
+    component_value  = Column(String(128), nullable=False)
     component_position = Column(Integer, nullable=True)
     created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -767,17 +785,24 @@ async def upsert_blueprint(db: AsyncSession, user_id: str, blueprint_dict: dict)
 
 
 async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: dict) -> None:
-    """Write one ChartSignal + multiple ChartComponent rows for this blueprint.
+    """Upsert ONE ChartSignal per (user, chart_archetype) plus its components.
 
-    Components captured at Phase 0 (additive — Phase 1+ can read more):
+    Earlier draft was append-only, which Codex flagged: a user re-running
+    their chart after a birth-time correction would inflate cohort counts
+    to count generations not users. Now: if the user already has a signal
+    for this archetype, we replace its components and refresh the timestamp
+    rather than inserting a new row. The (user_id, chart_archetype) unique
+    constraint is the database-level guarantee.
+
+    Components captured at Phase 0 (additive, Phase 1+ can read more):
       sun_sign, moon_sign, ascendant_sign
       hd_type, hd_authority, hd_profile
       gk_lifes_work, gk_evolution, gk_radiance, gk_purpose
       gk_attraction, gk_iq, gk_eq
 
-    The signal_hash is SHA256(user_id + iso_timestamp) for dedup. Component
-    values are stored as canonical strings; downstream cohort discovery
-    queries on (component_type, component_value).
+    On failure: rollback the partial signal/component writes, then re-raise
+    so the caller's logging captures the error. The blueprint write upstream
+    is already committed; this function's failures cannot poison it.
     """
     import hashlib
     from datetime import datetime as _dt
@@ -820,26 +845,56 @@ async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: di
     if not components:
         return  # nothing meaningful to record
 
+    archetype = 'astro_natal'
     now = _dt.utcnow()
-    sig_hash = hashlib.sha256(f"{user_id}|{now.isoformat()}".encode()).hexdigest()
-    signal = ChartSignal(
-        user_id=user_id,
-        signal_hash=sig_hash,
-        chart_archetype='astro_natal',
-        created_at=now,
-        data_version=1,
-    )
-    db.add(signal)
-    await db.flush()  # populate signal.signal_id
+    sig_hash = hashlib.sha256(f"{user_id}|{archetype}".encode()).hexdigest()
 
-    for idx, (ctype, cval) in enumerate(components):
-        db.add(ChartComponent(
-            signal_id=signal.signal_id,
-            component_type=ctype,
-            component_value=cval,
-            component_position=idx,
-        ))
-    await db.commit()
+    try:
+        # Find existing signal for this user+archetype (one per user by design)
+        existing = await db.execute(
+            select(ChartSignal).where(
+                ChartSignal.user_id == user_id,
+                ChartSignal.chart_archetype == archetype,
+            )
+        )
+        signal = existing.scalar_one_or_none()
+        if signal is not None:
+            # Replace components — chart re-run after correction. Refresh
+            # signal_hash + timestamp so Phase 1 queries see the latest
+            # version, but keep the same signal_id for stability.
+            await db.execute(
+                delete(ChartComponent).where(ChartComponent.signal_id == signal.signal_id)
+            )
+            signal.signal_hash = sig_hash
+            signal.created_at = now
+            signal.data_version = 1
+        else:
+            signal = ChartSignal(
+                user_id=user_id,
+                signal_hash=sig_hash,
+                chart_archetype=archetype,
+                created_at=now,
+                data_version=1,
+            )
+            db.add(signal)
+            await db.flush()  # populate signal.signal_id
+
+        for idx, (ctype, cval) in enumerate(components):
+            db.add(ChartComponent(
+                signal_id=signal.signal_id,
+                component_type=ctype,
+                component_value=cval,
+                component_position=idx,
+            ))
+        await db.commit()
+    except Exception:
+        # Roll back the partial signal/component writes so the session is
+        # left clean for whatever runs next on this connection.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise
 
 
 async def get_blueprint(db: AsyncSession, user_id: str) -> Optional[dict]:
@@ -1100,12 +1155,21 @@ async def upsert_oracle_self_state(
     if not state:
         state = OracleSelfState(user_id=user_id)
         db.add(state)
+    # Defense in depth: cap each field at 400 chars even if the synthesizer
+    # ignored the prompt's "under 300 chars" instruction. Prevents prompt
+    # bloat over time as fields are rewritten across many sessions.
+    def _cap(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        s = s.strip()
+        return s[:400] if len(s) > 400 else s
+
     if own_arc is not None:
-        state.own_arc = own_arc
+        state.own_arc = _cap(own_arc)
     if voice_calibration is not None:
-        state.voice_calibration = voice_calibration
+        state.voice_calibration = _cap(voice_calibration)
     if self_observations is not None:
-        state.self_observations = self_observations
+        state.self_observations = _cap(self_observations)
     if increment_session:
         state.session_count = (state.session_count or 0) + 1
     state.updated_at = datetime.utcnow()

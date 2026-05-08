@@ -3184,52 +3184,64 @@ async def chat_endpoint(
             or (next_count >= 5 and (next_count - 2) % 3 == 0)
             or (user_message_count >= 4 and req.message and len(req.message.split()) < 6)
         )
-        if should_synthesize:
+        # Self-state cadence is INDEPENDENT of memory cadence. Memory fires
+        # at 2, 5, 8, 11... and closers. Self-state fires at 2, 7, 12, 17...
+        # (every 5 turns starting from turn 2). This way self-reflection
+        # actually runs at the intended slower-than-memory rhythm even when
+        # memory synthesis is also off this turn. (Previous version gated
+        # self-reflection inside should_synthesize and so only ever fired
+        # at turns 2 and 5 — caught by Codex audit.)
+        should_self_reflect = (next_count == 2) or (next_count >= 7 and (next_count - 2) % 5 == 0)
+
+        if should_synthesize or should_self_reflect:
             import asyncio
             from ai.chat import synthesize_memories, synthesize_oracle_self_state
-            # Append the current user message so synthesis sees the full exchange
-            full_history = history + [{"role": "user", "content": req.message or ""}]
+            # Append BOTH the current user message AND the response we just
+            # produced, so synthesis sees the complete exchange — including
+            # what the Oracle actually said this turn. Previously self-state
+            # reflected before seeing her own reply, which is incoherent.
+            full_history = (
+                history
+                + [{"role": "user", "content": req.message or ""}]
+                + [{"role": "assistant", "content": response or ""}]
+            )
             # Capture connections snapshot for the synthesis closure (avoids
             # re-querying inside the background task). The synthesizer uses
             # this to know which names map to which connection_user_ids when
             # tagging memories.
             connections_snapshot = list(connections) if connections else []
             self_state_snapshot = self_state
-            # Self-state synthesis runs at a slower cadence than memory:
-            # only at session start (turn 2) and roughly every 5th turn after
-            # that. Self-reflection on every turn would noise out the signal.
-            should_self_reflect = (next_count == 2) or (next_count >= 5 and (next_count % 5 == 0))
+            do_memory = should_synthesize
+            do_self = should_self_reflect
             async def _synthesize():
-                # Surface synthesis outcomes so the memory pipeline is
-                # observable in production. Previously the only signal was
-                # a single warning on failure; now we log start, model
-                # outcome (handled inside synthesize_memories), persist
-                # outcome, and persist failure.
-                try:
-                    logger.info(
-                        f"[memory] synthesis triggered for user {user_id} "
-                        f"at turn={next_count} existing_count={len(memories)} "
-                        f"connections={len(connections_snapshot)}"
-                    )
-                    new_memories = synthesize_memories(
-                        blueprint, full_history, memories,
-                        connections=connections_snapshot,
-                    )
-                    if new_memories:
-                        await update_user_memories(db, user_id, new_memories)
+                # Memory synthesis (about the user). Skipped when only
+                # self-state is due this turn.
+                if do_memory:
+                    try:
                         logger.info(
-                            f"[memory] persisted {len(new_memories)} memories for user {user_id}"
+                            f"[memory] synthesis triggered for user {user_id} "
+                            f"at turn={next_count} existing_count={len(memories)} "
+                            f"connections={len(connections_snapshot)}"
                         )
-                    else:
-                        logger.info(f"[memory] synthesis returned 0 memories for user {user_id}")
-                except Exception as err:
-                    logger.exception(f"[memory] persist failed for user {user_id}: {err}")
+                        new_memories = synthesize_memories(
+                            blueprint, full_history, memories,
+                            connections=connections_snapshot,
+                        )
+                        if new_memories:
+                            await update_user_memories(db, user_id, new_memories)
+                            logger.info(
+                                f"[memory] persisted {len(new_memories)} memories for user {user_id}"
+                            )
+                        else:
+                            logger.info(f"[memory] synthesis returned 0 memories for user {user_id}")
+                    except Exception as err:
+                        logger.exception(f"[memory] persist failed for user {user_id}: {err}")
 
                 # Self-state pass: the Oracle reflects on HER own becoming
-                # in this relationship. Runs alongside memory synthesis at
-                # the slower cadence above. Increment session_count once
-                # per new session (turn 2) so the count is meaningful.
-                if should_self_reflect:
+                # in this relationship. Independent cadence; fires at turns
+                # 2, 7, 12, 17... Increment session_count once per new
+                # session (history was empty when this request arrived).
+                if do_self:
                     try:
                         new_state = synthesize_oracle_self_state(
                             blueprint, full_history, self_state_snapshot,
