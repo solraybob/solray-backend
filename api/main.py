@@ -2367,7 +2367,7 @@ async def admin_hive_graph(
 
     Counts at the top mirror /admin/hive/inspect for the metrics strip.
     """
-    from sqlalchemy import func as _func
+    from sqlalchemy import func as _func, select
     from db.database import (
         ChartSignal, ChartComponent, PatternCohort, PatternTheme,
         PatternCorrelation, UserResonance, User,
@@ -2484,7 +2484,7 @@ async def admin_hive_inspect(
     Returns counts plus the top cohorts and correlations so you can eyeball
     quality before deciding whether to wire RAG into the Oracle.
     """
-    from sqlalchemy import func as _func
+    from sqlalchemy import func as _func, select
     from db.database import (
         ChartSignal, ChartComponent, PatternCohort, PatternTheme,
         PatternCorrelation, UserResonance, User,
