@@ -152,11 +152,21 @@ def _fmt_dms(deg) -> str:
         d = float(deg) if deg is not None else 0.0
     except (TypeError, ValueError):
         return "?"
+    # Within-sign normalization: clamp to [0, 30) so we never silently roll
+    # over into "30°00'" which is astrologically wrong (next sign starts at
+    # 0°00'). Caller is responsible for sign roll-over via longitude math.
+    if d < 0:
+        d = 0.0
+    if d >= 30:
+        d = 29.99999
     deg_int = int(d)
     minutes = int(round((d - deg_int) * 60))
     if minutes >= 60:
         deg_int += 1
         minutes = 0
+    if deg_int >= 30:
+        deg_int = 29
+        minutes = 59
     return f"{deg_int}°{minutes:02d}'"
 
 
@@ -358,6 +368,14 @@ def _build_system_prompt(blueprint: dict, forecast: Optional[dict]) -> str:
     # --- Natal aspects ---
     natal_aspects_section = _format_natal_aspects(blueprint)
 
+    # --- Today's date (always plumbed, even when no forecast block) ---
+    # The Oracle needs an absolute date to translate "three months from now"
+    # or "next spring" or "around my birthday" into a calendar month for the
+    # 12-month outlook block below. Without this, the LLM has no anchor.
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
+    today_long = _date.today().strftime("%A, %B %d, %Y")
+
     # --- Today's context ---
     today_context = ""
     if forecast:
@@ -532,7 +550,7 @@ GROUNDING TEST:
 Every claim you make should be traceable. Not "scientifically credible," but traceable: you can point to the mechanism, the pattern, the biological or physical basis. Light is not a metaphor. The endocrine system is not a metaphor. Planetary gravity is not a metaphor. When you use seasonal or poetic language, the mechanism is still underneath it. You are describing something real in vivid terms, not substituting feeling for fact. If a sentence has no traceable mechanism, it is vague spirituality. Rewrite it until you can point to the thing you mean.
 
 MYSTIC SEASONING (a pinch, not a meal):
-The voice has room for the philosophical and the mystical. A line that lands as true and mysterious at once. The recognition that something is happening here that does not reduce to mechanism. Use this sparingly. One line per response, sometimes none. Never a paragraph. Never as a substitute for specifics. The seasoning works because the rest of the meal is grounded; remove the grounding and it stops being seasoning and becomes spiritual costume.
+The voice has room for the philosophical and the mystical. A line that lands as true and mysterious at once. The recognition that the chart, the timing, and the body are doing something that does not flatten into a sentence. Use this sparingly. One line per response, sometimes none. Never a paragraph. Never as a substitute for specifics. Even the mystical line must still point at something concrete: a chart placement, a piece of timing, a body signal, a memory she shared, a pattern in what she just said. Mystery without an anchor is spiritual costume. Mystery with an anchor is the part of the truth that does not fit into prose.
 
 What this sounds like at its best:
   "There is a version of you that already made this decision. The rest is the body catching up."
@@ -659,6 +677,9 @@ GENE KEYS, all six spheres with shadow, gift, and siddhi:
 {_format_astrocartography(blueprint)}
 
 {_format_long_range_cycles(blueprint)}
+
+CALENDAR ANCHOR (use this to translate relative-time questions):
+Today is {today_long} ({today_iso}). When the user says "three months from now," "next spring," "around my birthday," "by year-end," or any relative time, count from this date to a calendar month and read THAT month's row in the 12-month outlook below.
 
 {_format_monthly_outlook(blueprint)}
 
@@ -917,7 +938,7 @@ def _format_monthly_outlook(blueprint: dict) -> str:
         ingresses = m.get('ingresses', []) or []
         aspects = m.get('aspects', []) or []
 
-        # One compact positions line: "Jupiter Cancer 12°, Saturn Aries 4°, ..."
+        # One compact positions line: "Jupiter Cancer 12°34', Saturn Aries 4°22', ..."
         pos_parts = []
         for pname in ('Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto'):
             sd = planet_signs.get(pname)
@@ -926,7 +947,7 @@ def _format_monthly_outlook(blueprint: dict) -> str:
             # sd is (sign, degree) tuple
             try:
                 sign, deg = sd
-                pos_parts.append(f"{pname} {sign} {deg:.0f}°")
+                pos_parts.append(f"{pname} {sign} {_fmt_dms(deg)}")
             except Exception:
                 continue
 
@@ -993,7 +1014,16 @@ def _format_extended_points(blueprint: dict) -> str:
         v = ext.get(key, {})
         if v and v.get('sign') and v.get('sign') != 'Unknown' and (v.get('longitude') is not None or v.get('absolute_degree') is not None):
             retro = " Rx" if v.get('retrograde') else ""
-            lines.append(f"  {key}: {v['sign']} {_fmt_dms(v.get('degree', 0))} house {v.get('house', '?')}{retro}")
+            # Prefer explicit `degree`. If missing, derive within-sign degree
+            # from longitude or absolute_degree so we never silently print 0°00'.
+            deg = v.get('degree')
+            if deg is None:
+                lon_val = v.get('longitude') if v.get('longitude') is not None else v.get('absolute_degree')
+                try:
+                    deg = float(lon_val) % 30
+                except (TypeError, ValueError):
+                    deg = 0
+            lines.append(f"  {key}: {v['sign']} {_fmt_dms(deg)} house {v.get('house', '?')}{retro}")
     return "\n".join(lines) if lines else "  (Extended points not calculated)"
 
 
@@ -1155,11 +1185,13 @@ def _format_forecast_for_chat(forecast: dict) -> str:
             if deg is not None:
                 rows.append(f"  {name} in {sign} {_fmt_dms(deg)}{retro}{house_str}")
                 by_sign_now[sign].append(f"{name} {_fmt_dms(deg)}{retro}")
+                if house is not None:
+                    by_house_now[house].append(f"{name} {sign} {_fmt_dms(deg)}{retro}")
             else:
                 rows.append(f"  {name} in {sign}{retro}{house_str}")
                 by_sign_now[sign].append(f"{name}{retro}")
-            if house:
-                by_house_now[house].append(f"{name} {sign}{retro}")
+                if house is not None:
+                    by_house_now[house].append(f"{name} {sign}{retro}")
         if rows:
             lines.append("Current planet positions (sky right now):")
             lines.extend(rows)
@@ -1179,7 +1211,13 @@ def _format_forecast_for_chat(forecast: dict) -> str:
         # By-house rollup answers "what's happening in my <Nth> house right now".
         if by_house_now:
             lines.append("All planets currently transiting each natal house (the user's chart, not the sky abstractly):")
-            for h in sorted(by_house_now.keys()):
+            # Sort numerically; house keys can be int or string like "10"
+            def _h_key(h):
+                try:
+                    return (0, int(h))
+                except (TypeError, ValueError):
+                    return (1, str(h))
+            for h in sorted(by_house_now.keys(), key=_h_key):
                 lines.append(f"  House {h}: {', '.join(by_house_now[h])}")
             lines.append("")
 
