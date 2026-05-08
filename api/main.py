@@ -2341,6 +2341,62 @@ async def admin_hive_metrics(
     }
 
 
+@app.post('/admin/hive/backfill', summary='Backfill chart_signals for every consenting user with a blueprint (admin only)')
+async def admin_hive_backfill(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """One-time-ish backfill. Existing users created before Hive Phase 0
+    shipped have a Blueprint row but no chart_signals row. Walk every
+    consenting user, load their blueprint, write a signal. Idempotent —
+    _write_chart_signal upserts by (user_id, archetype) so re-running this
+    just refreshes the existing rows.
+
+    Returns counts: scanned, written, skipped (no blueprint or no consent),
+    failed.
+    """
+    from sqlalchemy import select
+    from db.database import User, Blueprint, _write_chart_signal
+    import json as _json
+
+    # Pull every consenting user
+    user_rows = (await db.execute(
+        select(User.id).where(User.hive_consent == True)  # noqa: E712
+    )).scalars().all()
+
+    scanned = 0
+    written = 0
+    skipped_no_blueprint = 0
+    failed = 0
+
+    for uid in user_rows:
+        scanned += 1
+        try:
+            bp_row = (await db.execute(
+                select(Blueprint).where(Blueprint.user_id == uid)
+            )).scalar_one_or_none()
+            if not bp_row or not bp_row.blueprint_json:
+                skipped_no_blueprint += 1
+                continue
+            try:
+                blueprint = _json.loads(bp_row.blueprint_json)
+            except Exception:
+                failed += 1
+                continue
+            await _write_chart_signal(db, uid, blueprint)
+            written += 1
+        except Exception as e:
+            logger.warning(f"hive backfill failed for user {uid}: {e}")
+            failed += 1
+
+    return {
+        'scanned': scanned,
+        'written': written,
+        'skipped_no_blueprint': skipped_no_blueprint,
+        'failed': failed,
+    }
+
+
 @app.post('/admin/hive/maintenance', summary='Prune signals from non-consenting users (admin only)')
 async def admin_hive_maintenance(
     admin_id: str = Depends(require_admin),
