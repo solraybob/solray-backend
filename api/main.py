@@ -2351,6 +2351,129 @@ async def admin_hive_maintenance(
     return {'pruned_signals': pruned}
 
 
+@app.get('/admin/hive/graph', summary='Hive visualization graph: nodes (users) and edges (shared components) for the dashboard')
+async def admin_hive_graph(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the collective as a node-edge graph for the dashboard.
+
+    Each consenting user is a node carrying their user_id, display name (first
+    name only), and the set of components on their chart (sun_sign, hd_type,
+    etc). Edges connect users who share at least one component, weighted by
+    how many components they share. The frontend renders a force-directed
+    layout: central Solray sun, user nodes radiating out, edges drawn between
+    chart neighbours, denser as the population grows.
+
+    Counts at the top mirror /admin/hive/inspect for the metrics strip.
+    """
+    from sqlalchemy import func as _func
+    from db.database import (
+        ChartSignal, ChartComponent, PatternCohort, PatternTheme,
+        PatternCorrelation, UserResonance, User,
+    )
+
+    # Counts row
+    consenting = (await db.execute(
+        select(_func.count(User.id)).where(User.hive_consent == True)  # noqa: E712
+    )).scalar() or 0
+    total_signals = (await db.execute(select(_func.count(ChartSignal.signal_id)))).scalar() or 0
+    total_components = (await db.execute(select(_func.count(ChartComponent.component_id)))).scalar() or 0
+    total_cohorts = (await db.execute(select(_func.count(PatternCohort.cohort_id)))).scalar() or 0
+    total_themes = (await db.execute(select(_func.count(PatternTheme.theme_id)))).scalar() or 0
+    total_corrs = (await db.execute(select(_func.count(PatternCorrelation.correlation_id)))).scalar() or 0
+    high_conf_cohorts = (await db.execute(
+        select(_func.count(PatternCohort.cohort_id)).where(PatternCohort.confidence_score >= 0.8)
+    )).scalar() or 0
+
+    # Pull every consenting user's components
+    rows = (await db.execute(
+        select(
+            ChartSignal.user_id,
+            ChartComponent.component_type,
+            ChartComponent.component_value,
+        )
+        .join(ChartSignal, ChartSignal.signal_id == ChartComponent.signal_id)
+        .join(User, User.id == ChartSignal.user_id)
+        .where(User.hive_consent == True)  # noqa: E712
+    )).all()
+
+    # Group components per user
+    from collections import defaultdict
+    user_comps: dict[str, set[str]] = defaultdict(set)
+    for uid, ctype, cval in rows:
+        user_comps[uid].add(f"{ctype}={cval}")
+
+    # Pull display names + first-name only for privacy in the graph label
+    user_ids = list(user_comps.keys())
+    name_map: dict[str, str] = {}
+    sign_map: dict[str, str] = {}
+    type_map: dict[str, str] = {}
+    if user_ids:
+        urows = (await db.execute(
+            select(User.id, User.name).where(User.id.in_(user_ids))
+        )).all()
+        for uid, name in urows:
+            first = (name or "").strip().split(" ", 1)[0] or "Soul"
+            name_map[uid] = first
+
+    # Use sun_sign + hd_type to colour-code nodes by primary cohort dimension
+    for uid, comps in user_comps.items():
+        for c in comps:
+            if c.startswith("sun_sign="):
+                sign_map[uid] = c.split("=", 1)[1]
+            if c.startswith("hd_type="):
+                type_map[uid] = c.split("=", 1)[1]
+
+    # Build nodes
+    nodes = []
+    for uid in user_ids:
+        nodes.append({
+            "id": uid,
+            "name": name_map.get(uid, "Soul"),
+            "sun_sign": sign_map.get(uid),
+            "hd_type": type_map.get(uid),
+            "component_count": len(user_comps[uid]),
+        })
+
+    # Build edges: pair users who share at least one component, weight =
+    # count of shared components. For N users this is O(N^2) but at our
+    # scale (under a few hundred for a long time) this is trivial.
+    edges = []
+    for i in range(len(user_ids)):
+        for j in range(i + 1, len(user_ids)):
+            a, b = user_ids[i], user_ids[j]
+            shared = user_comps[a] & user_comps[b]
+            if shared:
+                edges.append({"a": a, "b": b, "weight": len(shared)})
+
+    # Top cohorts for the side panel
+    top_cohorts_rows = (await db.execute(
+        select(PatternCohort)
+        .order_by(PatternCohort.member_count.desc())
+        .limit(8)
+    )).scalars().all()
+    top_cohorts = [
+        {"name": c.cohort_name, "member_count": c.member_count, "confidence": c.confidence_score}
+        for c in top_cohorts_rows
+    ]
+
+    return {
+        "counts": {
+            "consenting_users": consenting,
+            "chart_signals": total_signals,
+            "chart_components": total_components,
+            "pattern_cohorts": total_cohorts,
+            "pattern_themes": total_themes,
+            "pattern_correlations": total_corrs,
+            "high_confidence_cohorts": high_conf_cohorts,
+        },
+        "nodes": nodes,
+        "edges": edges,
+        "top_cohorts": top_cohorts,
+    }
+
+
 @app.get('/admin/hive/inspect', summary='Inspect the hive: cohort + correlation + theme counts (admin only)')
 async def admin_hive_inspect(
     admin_id: str = Depends(require_admin),
