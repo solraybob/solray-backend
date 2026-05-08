@@ -7,7 +7,7 @@ and refers to it directly. Never generic.
 """
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import anthropic
 
