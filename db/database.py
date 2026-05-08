@@ -18,7 +18,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Column, String, Integer, Float, Date, DateTime, Text, ForeignKey, Boolean,
-    UniqueConstraint, CheckConstraint, select, update, delete
+    UniqueConstraint, CheckConstraint, select, update, delete, case, or_
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -176,9 +176,17 @@ class UserMemory(Base):
 
     id           = Column(String(36), primary_key=True)
     user_id      = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    category     = Column(String(50), nullable=False)   # life_event, theme, insight, preference, communication_style, etc.
+    category     = Column(String(50), nullable=False)   # life_event, theme, insight, preference, communication_style, connection_dynamic, etc.
     content      = Column(Text, nullable=False)          # The memory itself
     surface_next = Column(Boolean, nullable=False, default=False)  # actively reference in next session
+    # Connection linkage. When a memory is specifically about a person the user
+    # is connected to (a "soul"), connection_user_id holds the other user's id
+    # and connection_name caches their display name for prompt rendering even
+    # if the connection is later removed. Both nullable: most memories are
+    # about the user themselves and have neither field set. ON DELETE SET NULL
+    # so deleting a connected user does not nuke memories that reference them.
+    connection_user_id = Column(String(36), ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    connection_name    = Column(String(100), nullable=True)
     created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at   = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -405,6 +413,33 @@ async def init_db():
                     ))
         except Exception as e:
             print(f"[init_db] surface_next column migration note: {e}")
+
+        # connection_user_id + connection_name columns on user_memory
+        # Tags memories that are specifically about a connection (soul) so the
+        # Oracle can recall context about each known person. Nullable. The FK
+        # to users uses SET NULL on delete, so memories about a removed user
+        # remain readable as raw text but lose the live linkage.
+        try:
+            if _is_postgres:
+                await conn.execute(text(
+                    "ALTER TABLE user_memory ADD COLUMN IF NOT EXISTS connection_user_id VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE user_memory ADD COLUMN IF NOT EXISTS connection_name VARCHAR(100)"
+                ))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(user_memory)"))
+                cols = [row[1] for row in result.fetchall()]
+                if 'connection_user_id' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE user_memory ADD COLUMN connection_user_id VARCHAR(36)"
+                    ))
+                if 'connection_name' not in cols:
+                    await conn.execute(text(
+                        "ALTER TABLE user_memory ADD COLUMN connection_name VARCHAR(100)"
+                    ))
+        except Exception as e:
+            print(f"[init_db] connection_user_id column migration note: {e}")
 
         # analytics_opt_out column on User. Defaults to FALSE so existing
         # users are tracked unless they explicitly opt out from settings.
@@ -677,6 +712,142 @@ async def get_accepted_souls(db: AsyncSession, user_id: str) -> list[SoulConnect
     return result.scalars().all()
 
 
+async def get_accepted_connections_summary(
+    db: AsyncSession,
+    user_id: str,
+    limit: int = 12,
+) -> list[dict]:
+    """Return a compact summary of each accepted connection for the Oracle.
+
+    For each accepted connection, return {user_id, name, sun_sign, moon_sign,
+    ascendant, hd_type, hd_authority, hd_profile}. This is the chip-level info
+    the Oracle needs to recognize each person without bloating the prompt
+    with full blueprints. The full blueprint is still available via the
+    dedicated compatibility endpoint when the user opens a connection's
+    profile.
+
+    Single LEFT JOIN query (no N+1) across SoulConnection -> User -> Blueprint,
+    capped at `limit` most-recent connections. Ordered with the most active
+    relationships first by ranking tagged-memory recency on top of accept
+    date — populated connections beat empty ones at the cap boundary.
+    """
+    from sqlalchemy.orm import aliased
+    OtherUser = aliased(User)
+    OtherBP = aliased(Blueprint)
+
+    # Compute the "other" user id via CASE expression.
+    other_id_expr = case(
+        (SoulConnection.requester_id == user_id, SoulConnection.recipient_id),
+        else_=SoulConnection.requester_id,
+    ).label('other_id')
+
+    stmt = (
+        select(
+            other_id_expr,
+            OtherUser.name.label('name'),
+            OtherBP.summary.label('summary'),
+            SoulConnection.created_at.label('connected_at'),
+        )
+        .select_from(SoulConnection)
+        .join(OtherUser, OtherUser.id == case(
+            (SoulConnection.requester_id == user_id, SoulConnection.recipient_id),
+            else_=SoulConnection.requester_id,
+        ))
+        .outerjoin(OtherBP, OtherBP.user_id == OtherUser.id)
+        .where(SoulConnection.status == 'accepted')
+        .where(or_(
+            SoulConnection.requester_id == user_id,
+            SoulConnection.recipient_id == user_id,
+        ))
+        .order_by(SoulConnection.created_at.desc())
+    )
+
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        return []
+
+    # Tagged-memory recency boost. Connections with surface_next memories or
+    # recently-touched memories rank higher at the cap.
+    mem_rows = (await db.execute(
+        select(
+            UserMemory.connection_user_id,
+            UserMemory.surface_next,
+            UserMemory.updated_at,
+        ).where(
+            UserMemory.user_id == user_id,
+            UserMemory.connection_user_id.is_not(None),
+        )
+    )).all()
+    recency: dict[str, tuple[bool, datetime]] = {}
+    for cid, surf, upd in mem_rows:
+        cur = recency.get(cid)
+        if cur is None:
+            recency[cid] = (bool(surf), upd or datetime.min)
+        else:
+            recency[cid] = (cur[0] or bool(surf), max(cur[1], upd or datetime.min))
+
+    import json as _json
+    out: list[dict] = []
+    for other_id, name, summary_raw, connected_at in rows:
+        if not other_id:
+            continue
+        summary = {}
+        if summary_raw:
+            try:
+                if isinstance(summary_raw, str):
+                    summary = _json.loads(summary_raw)
+                elif isinstance(summary_raw, dict):
+                    summary = summary_raw
+            except Exception:
+                summary = {}
+        rec = recency.get(other_id, (False, datetime.min))
+        out.append({
+            'user_id': other_id,
+            'name': name or 'Unnamed',
+            'sun_sign': summary.get('sun_sign'),
+            'moon_sign': summary.get('moon_sign'),
+            'ascendant': summary.get('ascendant'),
+            'hd_type': summary.get('hd_type'),
+            'hd_authority': summary.get('hd_authority'),
+            'hd_profile': summary.get('hd_profile'),
+            '_rank': (
+                1 if rec[0] else 0,            # surface_next outranks all
+                rec[1].timestamp() if rec[1] != datetime.min else 0,
+                connected_at.timestamp() if connected_at else 0,
+            ),
+        })
+
+    # Sort by rank desc, then take top `limit`. Strip the internal _rank.
+    out.sort(key=lambda r: r['_rank'], reverse=True)
+    out = out[:limit]
+    for r in out:
+        r.pop('_rank', None)
+    return out
+
+
+async def prune_connection_memories(db: AsyncSession, user_id: str, connection_user_id: str) -> int:
+    """Delete all memories the user has tagged to a specific connection.
+
+    Called when:
+      - The connection is revoked (status changes from accepted)
+      - The connected user deletes their account (covered by ON DELETE)
+      - The user explicitly removes a soul
+
+    This protects against the leak where untagging via SET NULL would promote
+    a connection-tagged memory into the user's first-party WHAT YOU KNOW
+    ABOUT THEM block. Returns the number of memories deleted.
+    """
+    from sqlalchemy import delete as sql_delete
+    result = await db.execute(
+        sql_delete(UserMemory).where(
+            UserMemory.user_id == user_id,
+            UserMemory.connection_user_id == connection_user_id,
+        )
+    )
+    await db.commit()
+    return getattr(result, 'rowcount', 0) or 0
+
+
 # ---------------------------------------------------------------------------
 # CRUD — User Memory
 # ---------------------------------------------------------------------------
@@ -692,8 +863,16 @@ async def get_user_memories(db: AsyncSession, user_id: str) -> list[UserMemory]:
     return result.scalars().all()
 
 
-async def add_user_memory(db: AsyncSession, user_id: str, category: str, content: str, surface_next: bool = False) -> UserMemory:
-    """Add a new memory for a user."""
+async def add_user_memory(
+    db: AsyncSession,
+    user_id: str,
+    category: str,
+    content: str,
+    surface_next: bool = False,
+    connection_user_id: Optional[str] = None,
+    connection_name: Optional[str] = None,
+) -> UserMemory:
+    """Add a new memory for a user, optionally tagged to a connection (soul)."""
     import uuid
     memory = UserMemory(
         id=str(uuid.uuid4()),
@@ -701,6 +880,8 @@ async def add_user_memory(db: AsyncSession, user_id: str, category: str, content
         category=category,
         content=content,
         surface_next=surface_next,
+        connection_user_id=connection_user_id,
+        connection_name=connection_name,
     )
     db.add(memory)
     await db.commit()
@@ -758,11 +939,81 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
 
     now = datetime.utcnow()
 
+    # Pre-fetch the user's accepted connections so we can:
+    #   1. Build a name -> user_id map for server-side resolution. The LLM is
+    #      not trusted with database ids; it emits names, we resolve.
+    #   2. Validate any connection_user_id the synthesizer attached against
+    #      the actual accepted set. Stops a hallucinated id from being
+    #      persisted, which would either silently break the FK or pollute
+    #      the prompt with a false connection.
+    # Empty accepted set means no resolution possible — drop linkage rather
+    # than passing through unvalidated, per Codex audit finding B.
+    accepted_ids: set[str] = set()
+    name_to_id: dict[str, str] = {}
+    name_seen: dict[str, int] = {}
+    try:
+        accepted_rows = await db.execute(
+            select(SoulConnection).where(
+                SoulConnection.status == 'accepted',
+            ).where(or_(
+                SoulConnection.requester_id == user_id,
+                SoulConnection.recipient_id == user_id,
+            ))
+        )
+        accepted = accepted_rows.scalars().all()
+        for c in accepted:
+            other = c.recipient_id if c.requester_id == user_id else c.requester_id
+            if other:
+                accepted_ids.add(other)
+        # Resolve names -> ids. Drop name from the map if it collides (two
+        # connections with the same display name) so we never guess.
+        if accepted_ids:
+            user_rows = await db.execute(
+                select(User.id, User.name).where(User.id.in_(accepted_ids))
+            )
+            for uid, uname in user_rows:
+                if not uname:
+                    continue
+                k = uname.strip().lower()
+                if not k:
+                    continue
+                name_seen[k] = name_seen.get(k, 0) + 1
+            user_rows2 = await db.execute(
+                select(User.id, User.name).where(User.id.in_(accepted_ids))
+            )
+            for uid, uname in user_rows2:
+                if not uname:
+                    continue
+                k = uname.strip().lower()
+                if name_seen.get(k, 0) == 1:
+                    name_to_id[k] = uid
+    except Exception:
+        accepted_ids = set()
+        name_to_id = {}
+
     for new in new_memories:
         cat = new.get('category', 'general')
         content = (new.get('content') or '').strip()
         if not content:
             continue
+        # Connection linkage. Two paths:
+        #   a) Synthesizer emitted a connection_user_id directly. We accept
+        #      ONLY if it is in the accepted-set (and accepted-set lookup
+        #      succeeded — empty accepted_ids means we skip linkage entirely
+        #      rather than letting unvalidated ids through).
+        #   b) Synthesizer emitted only a connection_name. We resolve via
+        #      name_to_id (case-insensitive, trimmed). If the name collides
+        #      between two connections, we drop linkage.
+        raw_uid = new.get('connection_user_id') or None
+        raw_name = (new.get('connection_name') or '').strip() or None
+        conn_uid: Optional[str] = None
+        if raw_uid and raw_uid in accepted_ids:
+            conn_uid = raw_uid
+        elif raw_name:
+            resolved = name_to_id.get(raw_name.lower())
+            if resolved:
+                conn_uid = resolved
+        conn_name = raw_name
         key = (cat, _memory_fingerprint(content))
         hit = existing_by_key.get(key)
         if hit is not None:
@@ -770,6 +1021,13 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
             hit.content = content
             hit.updated_at = now
             hit.surface_next = bool(new.get('surface_next', False))
+            # Refresh connection linkage if the new synthesis tagged one. We
+            # don't blank a previously-set linkage if the new entry omitted it,
+            # since the older entry's tag is more likely correct than missing.
+            if conn_uid:
+                hit.connection_user_id = conn_uid
+            if conn_name:
+                hit.connection_name = conn_name
         else:
             memory = UserMemory(
                 id=str(uuid.uuid4()),
@@ -777,6 +1035,8 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
                 category=cat,
                 content=content,
                 surface_next=bool(new.get('surface_next', False)),
+                connection_user_id=conn_uid,
+                connection_name=conn_name,
             )
             db.add(memory)
             # Also add to the dict so subsequent duplicates within the new set merge

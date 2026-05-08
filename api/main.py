@@ -3124,9 +3124,21 @@ async def chat_endpoint(
     # Oracle never actually saw the flagged memories on a new session,
     # defeating the entire surface_next mechanism. Surfaced by a
     # cross-agent review (Codex) in May 2026.
-    from db.database import get_user_memories, update_user_memories, reset_surface_next_flags, delete_all_user_memories  # noqa: F401
+    from db.database import (
+        get_user_memories, update_user_memories, reset_surface_next_flags,
+        delete_all_user_memories, get_accepted_connections_summary,  # noqa: F401
+    )
     is_new_session = len(history) == 0
     memories = await get_user_memories(db, user_id)
+
+    # Load the user's accepted connections (souls) with chart chips so the
+    # Oracle reads them as YOUR PEOPLE in the prompt. Failure to load is
+    # non-fatal: the Oracle falls back to user-only memory.
+    try:
+        connections = await get_accepted_connections_summary(db, user_id)
+    except Exception as conn_err:
+        logger.warning(f"Failed to load connections for user {user_id}: {conn_err}")
+        connections = []
 
     try:
         response = higher_self_chat(
@@ -3136,6 +3148,7 @@ async def chat_endpoint(
             user_message=req.message,
             soul_blueprint=req.soul_blueprint,
             memories=memories,
+            connections=connections,
         )
 
         # surface_next memories have now been "consumed" by the Oracle in
@@ -3166,6 +3179,11 @@ async def chat_endpoint(
             from ai.chat import synthesize_memories
             # Append the current user message so synthesis sees the full exchange
             full_history = history + [{"role": "user", "content": req.message or ""}]
+            # Capture connections snapshot for the synthesis closure (avoids
+            # re-querying inside the background task). The synthesizer uses
+            # this to know which names map to which connection_user_ids when
+            # tagging memories.
+            connections_snapshot = list(connections) if connections else []
             async def _synthesize():
                 # Surface synthesis outcomes so the memory pipeline is
                 # observable in production. Previously the only signal was
@@ -3175,9 +3193,13 @@ async def chat_endpoint(
                 try:
                     logger.info(
                         f"[memory] synthesis triggered for user {user_id} "
-                        f"at turn={next_count} existing_count={len(memories)}"
+                        f"at turn={next_count} existing_count={len(memories)} "
+                        f"connections={len(connections_snapshot)}"
                     )
-                    new_memories = synthesize_memories(blueprint, full_history, memories)
+                    new_memories = synthesize_memories(
+                        blueprint, full_history, memories,
+                        connections=connections_snapshot,
+                    )
                     if new_memories:
                         await update_user_memories(db, user_id, new_memories)
                         logger.info(
