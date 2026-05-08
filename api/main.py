@@ -2478,9 +2478,9 @@ async def admin_hive_graph(
         rank_by_id: dict[str, int] = {uid: i for i, uid in enumerate(all_consenting_ordered)}
         for uid in user_ids:
             rank = rank_by_id.get(uid, 0)
-            # Pad to 2 digits up to 99, then natural width past that.
-            label = f"Sol.{rank:02d}" if rank < 100 else f"Sol.{rank}"
-            name_map[uid] = label
+            # Natural width, no zero-padding: Sol.0, Sol.1, ..., Sol.9,
+            # Sol.10, Sol.99, Sol.100. Reads cleaner than fixed-width.
+            name_map[uid] = f"Sol.{rank}"
 
     # Use sun_sign + hd_type to colour-code nodes by primary cohort dimension
     for uid, comps in user_comps.items():
