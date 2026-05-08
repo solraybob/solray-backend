@@ -195,6 +195,7 @@ class RegisterRequest(BaseModel):
     sex:        Optional[str] = Field(None, example='female', description="'male' or 'female'")
     tz_offset:  float      = Field(0.0, example=1.0, description='UTC offset at birth (e.g. 1.0 for BST)')
     username:   Optional[str] = Field(None, example='alicesun', description='Optional username (auto-generated if omitted)')
+    hive_consent: Optional[bool] = Field(True, example=True, description='Consent to chart joining the anonymized collective. Defaults to True; set False to opt out at signup.')
 
 
 class SoulBlueprintRequest(BaseModel):
@@ -395,6 +396,9 @@ async def register(
         'sex':           sex_clean,
         'email_verified': False,
         'verification_token': v_token,
+        # Honor the consent choice from onboarding. None defaults to True
+        # via the column default, matching how existing users were treated.
+        'hive_consent':  True if req.hive_consent is None else bool(req.hive_consent),
     })
 
     # Auto-detect timezone from coordinates (ignores any client-supplied tz_offset)
