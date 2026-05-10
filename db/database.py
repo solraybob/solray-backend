@@ -485,6 +485,51 @@ class IntegrationCredential(Base):
     updated_at        = Column(DateTime,    nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class OracleAudit(Base):
+    """One row per audited Oracle reply.
+
+    A different model (GPT-4o) reads each Oracle reply fresh and scores
+    it against the voice rules. Background QA: the chat already shipped
+    to the user before this row was written, so the audit never affects
+    user latency. The point is to surface drift over time, not to gate
+    individual replies.
+
+    Score is 0-100. Violations is a JSON-encoded list of tags from
+    KNOWN_VIOLATION_TAGS in ai/audit.py. Notes is one short sentence
+    describing the dominant issue, or "clean".
+
+    user_id is nullable to support morning greetings (which fire before
+    the auth context is fully bound, so user_id may be unknown at write
+    time) and the cleanup tail on user delete.
+
+    On user delete we CASCADE, not SET NULL. Codex audit (May 2026)
+    flagged that keeping reply_excerpt + user_message_excerpt with only
+    user_id nulled is not GDPR-defensible. Free-text excerpts of a
+    user's intimate chat content remain identifying even after the FK
+    is gone. Cascade ensures a user's right-to-be-forgotten request
+    actually erases their audit trail too. We accept the cost of
+    losing some pre-deletion drift signal in exchange for a clean
+    privacy posture.
+
+    oracle_prompt_version + audit_prompt_version let us correlate score
+    shifts with prompt changes vs. genuine drift. Bump the relevant
+    version string in the source when meaningful changes ship.
+    """
+    __tablename__ = 'oracle_audit'
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    user_id               = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    created_at            = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    user_message_excerpt  = Column(Text, nullable=True)
+    reply_excerpt         = Column(Text, nullable=False)
+    score                 = Column(Integer, nullable=False, index=True)
+    violations_json       = Column(Text, nullable=False, default='[]')
+    notes                 = Column(Text, nullable=True)
+    model_used            = Column(String(64), nullable=False, default='claude-haiku-4-5-20251001')
+    oracle_prompt_version = Column(String(32), nullable=False, default='unknown')
+    audit_prompt_version  = Column(String(32), nullable=False, default='audit-v1')
+
+
 # ---------------------------------------------------------------------------
 # DB Initialisation
 # ---------------------------------------------------------------------------

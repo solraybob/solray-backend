@@ -34,6 +34,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Background-task registry
+# ---------------------------------------------------------------------------
+# asyncio.create_task returns a task that the event loop only weakly
+# references; if the caller doesn't keep a strong reference, the task can
+# be garbage-collected mid-flight, leaving "Task was destroyed but it is
+# pending" warnings and silently dropped audit rows. Codex audit (May
+# 2026) caught this on the new audit-pipeline call sites. Pattern is the
+# canonical Python advice: a module-level set holds strong refs, and each
+# task removes itself when done.
+import asyncio as _aio_bg
+_BACKGROUND_TASKS: set[_aio_bg.Task] = set()
+
+def _spawn_background(coro):
+    """Schedule a fire-and-forget coroutine and retain a strong reference.
+
+    Returns the created Task so callers can attach error callbacks if they
+    want, but most callers should just let it run. The discard callback
+    cleans the set as tasks complete so it doesn't grow unbounded.
+    """
+    task = _aio_bg.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+# ---------------------------------------------------------------------------
 # Sentry — Error Monitoring (graceful: no-op if SENTRY_DSN not set)
 # ---------------------------------------------------------------------------
 try:
@@ -1735,6 +1760,25 @@ async def group_chat_endpoint(
             sender_name=req.sender_username,
             message=req.message,
         )
+
+        # Voice-consistency audit. Same fire-and-forget pattern as /chat,
+        # using _spawn_background so the Task is held by a strong ref
+        # and cannot be GC'd mid-flight (Codex audit). Tagged group_chat
+        # in the model_used field so the dashboard can separate
+        # one-on-one drift from group-conversation drift, since the
+        # rules apply differently when two charts are present.
+        try:
+            from ai.audit import audit_oracle_reply
+            _spawn_background(audit_oracle_reply(
+                user_id=user_id,
+                user_message=req.message,
+                oracle_reply=response or "",
+                model_used="claude-haiku-4-5-20251001-group",
+                oracle_prompt_version="v3-softened",
+            ))
+        except Exception as _audit_err:
+            logger.warning(f"[audit] schedule failed for group chat: {_audit_err}")
+
         return {'response': response}
     except Exception as e:
         logger.exception(f"Group chat error for connection {req.soul_connection_id}")
@@ -2601,6 +2645,172 @@ async def admin_hive_inspect(
             } for c in top_corrs
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Oracle voice audit endpoints
+# ---------------------------------------------------------------------------
+# Powered by oracle_audit rows written by ai/audit.audit_oracle_reply on
+# every Oracle response. The dashboard uses these to render the rolling
+# 7-day voice-quality picture: score distribution, top recurring
+# violations, recent low-scoring chats. Admin-only.
+# ---------------------------------------------------------------------------
+
+@app.get('/admin/oracle-audit/summary', summary='Rolling 7-day Oracle voice-audit summary (admin only)')
+async def admin_oracle_audit_summary(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Score distribution and top violations over the last 7 days.
+
+    Returns:
+      total_audited:    int, count of audit rows in window
+      avg_score:        float, mean score in window
+      median_score:     int, median score in window
+      score_buckets:    dict, count per [0-39, 40-59, 60-79, 80-99, 100]
+      top_violations:   list of {tag, count}, sorted descending
+      by_day:           list of {date, count, avg_score} for sparkline
+      by_prompt_version: dict, {version: avg_score} so we can see whether
+                        the latest prompt version is moving the score
+    """
+    from sqlalchemy import func as _func, select
+    from db.database import OracleAudit
+    from datetime import timedelta
+    import json as _json
+
+    cutoff = datetime.utcnow() - timedelta(days=7)
+
+    rows = (await db.execute(
+        select(OracleAudit).where(OracleAudit.created_at >= cutoff)
+    )).scalars().all()
+
+    total = len(rows)
+    if total == 0:
+        return {
+            'total_audited': 0,
+            'avg_score': None,
+            'median_score': None,
+            'score_buckets': {'0-39': 0, '40-59': 0, '60-79': 0, '80-99': 0, '100': 0},
+            'top_violations': [],
+            'by_day': [],
+            'by_prompt_version': {},
+            'window_days': 7,
+        }
+
+    scores = sorted(r.score for r in rows)
+    avg = sum(scores) / total
+    mid = total // 2
+    median = scores[mid] if total % 2 == 1 else (scores[mid - 1] + scores[mid]) // 2
+
+    buckets = {'0-39': 0, '40-59': 0, '60-79': 0, '80-99': 0, '100': 0}
+    for s in scores:
+        if s == 100:           buckets['100'] += 1
+        elif s >= 80:          buckets['80-99'] += 1
+        elif s >= 60:          buckets['60-79'] += 1
+        elif s >= 40:          buckets['40-59'] += 1
+        else:                  buckets['0-39'] += 1
+
+    # Violation tally — flatten violations_json across all rows.
+    violation_counts: dict[str, int] = {}
+    for r in rows:
+        try:
+            tags = _json.loads(r.violations_json or '[]')
+        except Exception:
+            tags = []
+        for t in tags:
+            if isinstance(t, str):
+                violation_counts[t] = violation_counts.get(t, 0) + 1
+    top_violations = sorted(
+        [{'tag': k, 'count': v} for k, v in violation_counts.items()],
+        key=lambda x: x['count'], reverse=True,
+    )
+
+    # Per-day breakdown for the sparkline. Bucket by UTC date.
+    by_day_map: dict[str, dict] = {}
+    for r in rows:
+        d = r.created_at.date().isoformat()
+        slot = by_day_map.setdefault(d, {'date': d, 'count': 0, 'sum': 0})
+        slot['count'] += 1
+        slot['sum'] += r.score
+    by_day = sorted([
+        {'date': v['date'], 'count': v['count'], 'avg_score': round(v['sum'] / v['count'], 1)}
+        for v in by_day_map.values()
+    ], key=lambda x: x['date'])
+
+    # Per-prompt-version average — useful when a prompt change ships,
+    # to see whether scores moved up or down vs. the prior version.
+    by_pv_map: dict[str, dict] = {}
+    for r in rows:
+        pv = r.oracle_prompt_version or 'unknown'
+        slot = by_pv_map.setdefault(pv, {'count': 0, 'sum': 0})
+        slot['count'] += 1
+        slot['sum'] += r.score
+    by_pv = {
+        pv: {'count': v['count'], 'avg_score': round(v['sum'] / v['count'], 1)}
+        for pv, v in by_pv_map.items()
+    }
+
+    return {
+        'total_audited': total,
+        'avg_score': round(avg, 1),
+        'median_score': median,
+        'score_buckets': buckets,
+        'top_violations': top_violations,
+        'by_day': by_day,
+        'by_prompt_version': by_pv,
+        'window_days': 7,
+    }
+
+
+@app.get('/admin/oracle-audit/lowest', summary='Recent lowest-scoring Oracle replies (admin only)')
+async def admin_oracle_audit_lowest(
+    limit: int = 20,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The N lowest-scoring chats in the last 7 days, with full reply text.
+
+    Use this to read what the auditor actually flagged. Each row shows the
+    user message, the Oracle reply, the score, the violations list, and
+    the auditor's one-sentence note. Reading 5-10 of these after a prompt
+    change is the fastest way to verify the change actually moved
+    the right needle.
+    """
+    from sqlalchemy import select
+    from db.database import OracleAudit
+    from datetime import timedelta
+    import json as _json
+
+    if limit < 1 or limit > 100:
+        limit = 20
+    cutoff = datetime.utcnow() - timedelta(days=7)
+
+    rows = (await db.execute(
+        select(OracleAudit)
+        .where(OracleAudit.created_at >= cutoff)
+        .order_by(OracleAudit.score.asc(), OracleAudit.created_at.desc())
+        .limit(limit)
+    )).scalars().all()
+
+    items = []
+    for r in rows:
+        try:
+            tags = _json.loads(r.violations_json or '[]')
+        except Exception:
+            tags = []
+        items.append({
+            'id': r.id,
+            'created_at': r.created_at.isoformat(),
+            'user_id': r.user_id,
+            'score': r.score,
+            'violations': tags,
+            'notes': r.notes,
+            'user_message_excerpt': r.user_message_excerpt,
+            'reply_excerpt': r.reply_excerpt,
+            'model_used': r.model_used,
+            'oracle_prompt_version': r.oracle_prompt_version,
+        })
+    return {'items': items, 'count': len(items)}
 
 
 # ---------------------------------------------------------------------------
@@ -3612,6 +3822,27 @@ async def chat_endpoint(
                     except Exception as err:
                         logger.exception(f"[self_state] update failed for user {user_id}: {err}")
             asyncio.create_task(_synthesize())
+
+        # Voice-consistency audit. Fire-and-forget on every reply. Runs a
+        # GPT-4o pass against the Oracle's voice rules and persists the
+        # score + flagged violations. Zero impact on user latency: the
+        # response is already on its way back to the user. Logs and dies
+        # silently on any failure (no key, OpenAI down, etc.) so it can
+        # never break the chat path. Surfaces in /admin/oracle-audit
+        # endpoints + the Oracle Voice Health section on /admin/hive.
+        # Uses _spawn_background so the Task is held by a strong ref and
+        # cannot be garbage-collected mid-flight (Codex audit).
+        try:
+            from ai.audit import audit_oracle_reply
+            _spawn_background(audit_oracle_reply(
+                user_id=user_id,
+                user_message=req.message,
+                oracle_reply=response or "",
+                model_used="claude-haiku-4-5-20251001",
+                oracle_prompt_version="v3-softened",
+            ))
+        except Exception as _audit_err:
+            logger.warning(f"[audit] schedule failed for user {user_id}: {_audit_err}")
 
         return {"response": response}
     except Exception as e:
