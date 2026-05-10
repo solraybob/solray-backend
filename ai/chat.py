@@ -1,15 +1,111 @@
 """
-ai/chat.py — Higher Self Chat for Solray AI
+ai/chat.py: Higher Self Chat for Solray AI
 
-The core conversational AI experience. Speaks as the user's Higher Self —
+The core conversational AI experience. Speaks as the user's Higher Self,
 intimate, specific, poetic but grounded. Knows the user's complete chart
 and refers to it directly. Never generic.
 """
 
+import contextvars
+import hashlib
 import os
 from typing import Any, Optional
 
 import anthropic
+
+# ---------------------------------------------------------------------------
+# Reply provenance: which model produced the reply, for audit governance
+# ---------------------------------------------------------------------------
+# When the audit pipeline persists a row, it needs to know whether the reply
+# came from primary Claude, the GPT-4o break-glass, or the honest in-voice
+# fallback. Otherwise GPT-4o ends up grading its own break-glass output,
+# which Gemini caught as a structural blind spot in the May 2026 three-way
+# audit roundtable.
+#
+# Implemented as a ContextVar so the chat() function (sync, called from
+# FastAPI's threadpool) can record the model used and the FastAPI route
+# handler (async) can read it after the call returns. ContextVar is
+# request-scoped automatically: each FastAPI request has its own context,
+# so two concurrent users can't see each other's value.
+LAST_MODEL_USED: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "solray_last_model_used", default="unknown",
+)
+
+# Constants the audit pipeline uses to filter break-glass output. Keep in
+# sync with the strings written via LAST_MODEL_USED.set() below.
+MODEL_CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
+MODEL_GPT4O_BREAKGLASS = "gpt-4o-via-break-glass"
+MODEL_HONEST_FALLBACK = "honest-fallback-text"
+
+
+# ---------------------------------------------------------------------------
+# Prompt version tag, for audit governance
+# ---------------------------------------------------------------------------
+# Bump ORACLE_PROMPT_TAG whenever a substantive change ships to the Oracle's
+# voice rules. This is human-driven on purpose: the version bump is a
+# deliberate signal that "what we are about to measure now is different
+# from what we measured before." The audit dashboard groups scores by this
+# tag so we can read score deltas before vs. after a prompt change.
+#
+# To catch accidental drift (someone edits the prompt rules but forgets to
+# bump the tag), we ALSO compute a stable hash of the relevant source so
+# the persisted version string carries both the human tag and the hash.
+# A human-bumped tag without a hash change is suspicious. A hash change
+# without a human-bumped tag is even more suspicious. The dashboard can
+# surface both.
+#
+# CHANGELOG (most recent at top):
+#   v3-softened (2026-05-10): demoted 5-part identity backbone from
+#     numbered template to presence checklist, after Bob caught the
+#     rigidity risk. Order optional, headers optional, voice has to feel
+#     like conversation not architecture.
+#   v3 (2026-05-10): added five voice-deepening rules distilled from
+#     original GPT prompt: adult-not-child, shadow + integrated, practice
+#     + stop-feeding, deep-identity 5-element backbone, questions as
+#     vision tool. Resilience layer + GPT-4o break-glass shipped same day.
+#   v2 (2026-05-09): voice anchors, brevity bias, push-back permission,
+#     identity coherence.
+#   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
+#     the moment, overreading guard.
+
+ORACLE_PROMPT_TAG = "v3-softened"
+
+
+def _compute_prompt_hash() -> str:
+    """Hash a stable subset of chat.py source so prompt drift is detectable.
+
+    Hashes the source code of the system-prompt builder functions plus the
+    voice-related constants. Returns the first 8 hex chars, enough to
+    distinguish meaningful changes without producing churn from comment
+    edits or whitespace differences in unrelated code.
+
+    If introspection fails for any reason (e.g. running from a frozen build
+    where source isn't accessible), returns "nohash". The dashboard treats
+    this as "unable to verify" rather than as a separate version.
+    """
+    try:
+        import inspect
+        sources = []
+        for fn_name in ("_build_system_prompt", "build_system_prompt_with_memory"):
+            fn = globals().get(fn_name)
+            if fn is not None:
+                sources.append(inspect.getsource(fn))
+        sources.append(ORACLE_PROMPT_TAG)
+        joined = "\n---\n".join(sources)
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
+    except Exception:
+        return "nohash"
+
+
+def get_oracle_prompt_version() -> str:
+    """Return the human-tagged version plus the source-hash suffix.
+
+    Format: "<tag>.<hash>". The audit pipeline persists this string with
+    every audit row so the dashboard can group and trend by it. When the
+    hash changes without the tag changing, that's a signal someone edited
+    the prompt without bumping the tag, i.e. drifted without governance.
+    """
+    return f"{ORACLE_PROMPT_TAG}.{_compute_prompt_hash()}"
 
 # ---------------------------------------------------------------------------
 # Client
@@ -1115,32 +1211,97 @@ Today is {today_long} ({today_iso}). When the user says "three months from now,"
     return prompt
 
 
+def _format_hive_context(hive_context: Optional[dict]) -> str:
+    """Render the user's collective-intelligence context into a prompt section.
+
+    The hive context comes from db.get_user_hive_context(). Closing the loop
+    Codex flagged: the Hive Mind tables exist and pattern jobs populate them,
+    but the Oracle never read from them, so the collective-intelligence
+    promise was structurally unmet.
+
+    Returns empty string when there's no signal yet (fresh hive, sparse
+    cohorts, or the user opted out of hive_consent), so the prompt
+    degrades gracefully back to chart-only behaviour.
+
+    Tone-conscious: the section instructs the Oracle to use the field as
+    quiet seasoning, not announcement. She should never say "according to
+    the hive" or "other users with your gate". Real friends weave context
+    in without naming the source.
+    """
+    if not hive_context:
+        return ""
+    correlations = hive_context.get("correlations") or []
+    themes = hive_context.get("themes") or []
+    resonance = hive_context.get("resonance")
+    # No signal worth surfacing? Skip the section entirely so we don't
+    # paste an empty header into the prompt.
+    if not correlations and not themes and resonance is None:
+        return ""
+
+    lines = ["WHAT THE FIELD KNOWS (collective context, use as quiet seasoning, never announce or quote):"]
+    lines.append(
+        "Speak from this only when it lands naturally. Never say 'the hive' or 'other users' "
+        "or 'data shows'. Never give numbers. Treat it as a soft sense of what people sharing "
+        "her configuration tend to be working through, the way a friend who knows many people "
+        "sometimes mentions a pattern she's seen before. If it does not serve this turn, leave it."
+    )
+    if correlations:
+        lines.append("")
+        lines.append("Patterns associated with her chart, in others who share these components:")
+        for c in correlations:
+            user_side = c.get("user_component", "?")
+            other = c.get("other_component", "?")
+            strength = c.get("strength", 0.0)
+            lines.append(f"  her {user_side} tends to co-occur with {other} (strength {strength}).")
+    if themes:
+        lines.append("")
+        lines.append("Themes currently emerging across the field she is part of:")
+        for t in themes:
+            content = (t.get("content") or "").strip()
+            confidence = t.get("confidence", 0.0)
+            if content:
+                lines.append(f"  ({confidence}) {content}")
+    if resonance is not None:
+        lines.append("")
+        lines.append(
+            f"Her resonance with the field is {resonance} on a 0 to 1 scale. "
+            "Higher means her chart shares texture with many others; lower means her configuration is rare."
+        )
+    return "\n".join(lines)
+
+
 def build_system_prompt_with_memory(
     blueprint: dict,
     forecast: Optional[dict],
     memories: list,
     connections: Optional[list] = None,
     self_state: Optional[Any] = None,
+    hive_context: Optional[dict] = None,
 ) -> str:
     """Build system prompt including persistent user memory, the user's people,
-    and the Oracle's own self-state.
+    the Oracle's own self-state, and (when available) the collective hive layer.
 
     Layout into the prompt:
       1. The static realism + voice rules (always)
-      2. WHO YOU HAVE BECOME (the Oracle's self-state — about HER, not the user)
+      2. WHO YOU HAVE BECOME (the Oracle's self-state, about HER not the user)
       3. WHAT YOU KNOW ABOUT THEM (memories about the user themselves)
       4. YOUR PEOPLE (each accepted connection + memories tagged to them)
-      5. THIS PERSON'S COMPLETE BLUEPRINT (the chart)
+      5. WHAT THE FIELD KNOWS (the hive layer; quiet seasoning only)
+      6. THIS PERSON'S COMPLETE BLUEPRINT (the chart)
 
-    All three context blocks are inserted before the blueprint so the Oracle
-    reads the chart already knowing herself, the person, and the orbit.
+    Context blocks are inserted before the blueprint so the Oracle reads
+    the chart already knowing herself, the person, the orbit, and the
+    field. The hive section is the newest of the five and is the one
+    that finally closes the loop on the collective-intelligence promise
+    on the landing page.
     """
     base = _build_system_prompt(blueprint, forecast)
     self_section = _format_oracle_self_state(self_state)
     memory_section = _format_user_memory(memories)
     people_section = _format_connections(connections or [], memories or [])
+    hive_section = _format_hive_context(hive_context)
 
-    sections = [s for s in (self_section, memory_section, people_section) if s]
+    sections = [s for s in (self_section, memory_section, people_section, hive_section) if s]
     if not sections:
         return base
 
@@ -1775,11 +1936,14 @@ Begin."""
         # _sanitize_output is defined below; using it here is fine because the
         # function is module-level and Python resolves names at call time.
         # It runs the frame-leak guard plus em-dash strip in the right order.
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, greeting_messages, max_tokens=300)
         if gpt_text:
+            LAST_MODEL_USED.set(MODEL_GPT4O_BREAKGLASS)
             return _sanitize_output(gpt_text)
+        LAST_MODEL_USED.set(MODEL_HONEST_FALLBACK)
         return _HONEST_FALLBACK_TEXT
 
 
@@ -2060,11 +2224,14 @@ def group_chat(
             system=system,
             messages=messages,
         )
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, messages, max_tokens=700)
         if gpt_text:
+            LAST_MODEL_USED.set(MODEL_GPT4O_BREAKGLASS)
             return _sanitize_output(gpt_text)
+        LAST_MODEL_USED.set(MODEL_HONEST_FALLBACK)
         return _HONEST_FALLBACK_TEXT
 
 
@@ -2328,6 +2495,7 @@ def chat(
     memories: Optional[list] = None,
     connections: Optional[list] = None,
     self_state: Optional[Any] = None,
+    hive_context: Optional[dict] = None,
 ) -> str:
     """
     Generate a Higher Self chat response.
@@ -2345,6 +2513,14 @@ def chat(
         connections:          List of dicts from get_accepted_connections_summary,
                               each {user_id, name, sun_sign, ..., hd_type, ...}.
                               Renders YOUR PEOPLE block.
+        hive_context:         Optional dict from db.get_user_hive_context()
+                              with the user's collective-intelligence layer:
+                              top correlations involving their components,
+                              top emerging themes, resonance score. None or
+                              empty fields are fine; the prompt simply omits
+                              the corresponding section. Closes the loop on
+                              the Hive Mind RAG that Codex flagged in the
+                              May 2026 audit roundtable.
 
     Returns:
         The assistant's response text.
@@ -2359,6 +2535,7 @@ def chat(
         blueprint, forecast, memories or [],
         connections=connections or [],
         self_state=self_state,
+        hive_context=hive_context,
     )
 
     # If a soul blueprint is provided, inject the compatibility section
@@ -2412,6 +2589,7 @@ def chat(
             messages=messages,
         )
         raw_text = response.content[0].text.strip()
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(raw_text)
     except OracleUnavailable:
         # Three retries to Claude exhausted. Try the GPT-4o break-glass
@@ -2420,7 +2598,9 @@ def chat(
         # 500 and never a fictional read.
         gpt_text = _gpt4o_break_glass(final_system, messages, max_tokens=1600)
         if gpt_text:
+            LAST_MODEL_USED.set(MODEL_GPT4O_BREAKGLASS)
             return _sanitize_output(gpt_text)
+        LAST_MODEL_USED.set(MODEL_HONEST_FALLBACK)
         return _HONEST_FALLBACK_TEXT
 
 

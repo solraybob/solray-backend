@@ -187,9 +187,14 @@ async def test_cap_at_50_keeps_surface_next_and_recent(db, user):
         )
 
     # New synthesis: 5 ordinary + 1 critical surface_next entry. The
-    # critical one MUST survive the cap.
+    # critical one MUST survive the cap. Each new insight is sized
+    # past the 30-char floor enforced by the May 2026 quality filter.
     new_synthesis = [
-        {"category": "insight", "content": f"new insight {i}", "surface_next": False}
+        {
+            "category": "insight",
+            "content": f"New insight number {i}: she keeps circling the question of whether to commit before being certain.",
+            "surface_next": False,
+        }
         for i in range(5)
     ]
     new_synthesis.append({
@@ -225,12 +230,21 @@ async def test_update_memories_resets_existing_surface_next_flags(db, user):
     per-turn; fresh flags come from the new synthesis. This is the
     db-level companion to the api-level reset_surface_next_flags
     call."""
-    await add_user_memory(db, user.id, "theme", "old flagged theme", surface_next=True)
+    await add_user_memory(db, user.id, "theme", "old flagged theme noted earlier", surface_next=True)
+    # Use a substantive synthesis stub: the May 2026 quality filter
+    # rejects content under 30 chars, so a one-word "new" no longer
+    # makes it through. Real syntheses are full sentences anyway.
     new_synthesis = [
-        {"category": "insight", "content": "new", "surface_next": True},
+        {
+            "category": "insight",
+            "content": "Realised she repeats the same question in different costumes when she is stalling on a decision.",
+            "surface_next": True,
+        },
     ]
     await update_user_memories(db, user.id, new_synthesis)
 
     after = await get_user_memories(db, user.id)
     flagged = {m.content for m in after if m.surface_next}
-    assert flagged == {"new"}, "old flagged memory should have been reset"
+    assert flagged == {
+        "Realised she repeats the same question in different costumes when she is stalling on a decision."
+    }, "old flagged memory should have been reset and new flagged memory should have landed"

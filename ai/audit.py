@@ -258,6 +258,24 @@ async def audit_oracle_reply(
         # Honest in-voice fallback, not a real Oracle reply. Skip.
         return
 
+    # Skip GPT-4o break-glass output entirely. Gemini caught this in the
+    # May 2026 three-way audit roundtable: GPT-4o is BOTH the rescuer
+    # when Claude is down AND the auditor of Claude's normal output.
+    # If we let GPT-4o grade its own break-glass replies, score drift in
+    # a direction GPT-4o would write similarly is structurally invisible.
+    # Better to have a small gap in the audit signal during outages than
+    # to taint the metric. When break-glass volume becomes meaningful we
+    # can route those replies to a different auditor (e.g. Gemini or a
+    # second Claude model). For now: skip + log so operators can see how
+    # often the break-glass actually fires.
+    model_lower = (model_used or "").lower()
+    if "gpt-4o" in model_lower or "break-glass" in model_lower:
+        log.info(
+            f"[audit] skipping break-glass reply (model={model_used}); "
+            f"refusing to let GPT-4o grade GPT-4o output"
+        )
+        return
+
     result = await _audit_with_gpt4o(user_message or "", oracle_reply)
     if result is None:
         return

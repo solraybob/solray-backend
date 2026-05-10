@@ -1454,6 +1454,99 @@ def _memory_fingerprint(content: str) -> str:
     return s
 
 
+# ---------------------------------------------------------------------------
+# Memory quality filter — Gemini/Codex roundtable hardening
+# ---------------------------------------------------------------------------
+# Codex caught (May 2026 audit) that persistent memory becomes a liability
+# if weak, generic, mistaken, or crisis-adjacent material gets stored and
+# reused without filters. Memory pollution at scale is silent: the Oracle
+# starts surfacing low-signal content as if it were continuity.
+#
+# The filter is intentionally conservative. We'd rather keep a borderline
+# memory than reject a real one, because losing genuine continuity is a
+# bigger product cost than carrying one or two thin entries. The filter
+# rejects only obvious failures of the synthesizer:
+#
+#   - Empty or near-empty content (nothing to remember).
+#   - Length below a minimum (too thin to add over the chart).
+#   - Pattern matches against generic boilerplate openers ("user is",
+#     "the user has expressed", etc.) that suggest the synthesizer
+#     defaulted to summary instead of actual extraction.
+#   - Raw crisis-language verbatim (suicidal ideation, self-harm, etc.)
+#     that should NEVER be replayed into future sessions as continuity.
+#     Distilled crisis-arc content like "she is in acute grief about
+#     her father" is fine; verbatim "I want to die" is not, because it
+#     lands like the Oracle is rubbing it in months later.
+#
+# The filter logs every rejection with reason so operators can see whether
+# the synthesizer is producing junk, and the synthesizer prompt can be
+# tightened if a particular failure mode dominates.
+
+_MEMORY_GENERIC_PATTERNS = (
+    "the user is",
+    "the user has",
+    "the user expressed",
+    "the user mentioned",
+    "user is feeling",
+    "user feels",
+    "user wants",
+    "user said",
+    "this person is",
+    "this person has",
+)
+
+# Lowercased phrases that should never be persisted verbatim. NOT a
+# topic blocklist (the Oracle handles these topics in conversation); a
+# verbatim-replay blocklist (we don't want past raw crisis statements
+# resurfaced as continuity context). The synthesizer should be producing
+# arc-level distillations, not quoting these phrases.
+_MEMORY_CRISIS_VERBATIM = (
+    "i want to die",
+    "i want to kill",
+    "kill myself",
+    "killing myself",
+    "end my life",
+    "ending my life",
+    "no reason to live",
+    "no point in living",
+)
+
+
+def _memory_passes_quality_filter(content: str, category: str) -> tuple[bool, str]:
+    """Decide whether a synthesized memory is worth persisting.
+
+    Returns (ok, reason). When ok is False, reason is a short tag
+    operators can grep on in logs to see which filter fired.
+    Conservative by design: real continuity is worth more than
+    perfectly-tidy memory rows.
+    """
+    if not content or not content.strip():
+        return False, "empty"
+    text = content.strip()
+    # Length floor: communication_style is allowed to be short by nature
+    # ("writes in short, direct sentences"). Everything else needs at
+    # least a sentence of substance.
+    min_chars = 20 if category == "communication_style" else 30
+    if len(text) < min_chars:
+        return False, f"too_short(<{min_chars}c)"
+    lower = text.lower()
+    # Generic-opener filter. Three triggers in this short text means
+    # the synthesizer is summarizing in a flat voice rather than
+    # extracting structure. One trigger is fine (real synthesis can
+    # start "the user is going through..." legitimately).
+    generic_hits = sum(1 for p in _MEMORY_GENERIC_PATTERNS if p in lower)
+    if generic_hits >= 3:
+        return False, "generic_boilerplate"
+    # Crisis verbatim filter. If the content quotes crisis language
+    # rather than distilling it, we reject. The Oracle still handles
+    # the conversation; the memory layer just doesn't archive the
+    # raw statement.
+    for phrase in _MEMORY_CRISIS_VERBATIM:
+        if phrase in lower:
+            return False, "crisis_verbatim"
+    return True, ""
+
+
 async def update_user_memories(db: AsyncSession, user_id: str, new_memories: list[dict]) -> None:
     """Merge newly synthesized memories into the user's existing memory set.
 
@@ -1543,10 +1636,22 @@ async def update_user_memories(db: AsyncSession, user_id: str, new_memories: lis
         accepted_ids = set()
         name_to_id = {}
 
+    import logging as _ml_logging
+    _ml_log = _ml_logging.getLogger("solray.memory")
     for new in new_memories:
         cat = new.get('category', 'general')
         content = (new.get('content') or '').strip()
         if not content:
+            continue
+        # Quality filter: reject empties, generic boilerplate, and crisis
+        # verbatim. Conservative on purpose; we'd rather keep a borderline
+        # memory than lose real continuity.
+        ok, reason = _memory_passes_quality_filter(content, cat)
+        if not ok:
+            _ml_log.info(
+                f"[memory_filter] rejected user_id={user_id} cat={cat} "
+                f"reason={reason} preview={content[:80]!r}"
+            )
             continue
         # Connection linkage. Two paths:
         #   a) Synthesizer emitted a connection_user_id directly. We accept
@@ -1661,4 +1766,153 @@ async def delete_all_user_memories(db: AsyncSession, user_id: str) -> int:
     )
     await db.commit()
     return int(count)
+
+
+# ---------------------------------------------------------------------------
+# Hive Mind RAG: pull collective context for the Oracle's response path
+# ---------------------------------------------------------------------------
+# Codex caught (May 2026 audit roundtable) that the Hive Mind tables exist
+# and get populated, but the Oracle never reads from them. The collective-
+# intelligence promise on the landing page was structurally unmet. This
+# function closes that loop.
+#
+# Returns a small, prompt-friendly dict the chat path can render into a
+# WHAT THE FIELD KNOWS section. Capped tightly on size so it never bloats
+# the system prompt. Cheap queries: top-K orderings on indexed columns,
+# bounded by the user's component count (typically <30).
+#
+# Privacy posture: this function reads ONLY from the anonymised pattern
+# layer (chart_components, pattern_correlations, pattern_themes). It
+# never surfaces another user's identity, content, or memory. The user_id
+# is the SUBJECT of the query (whose components do we look up) but never
+# the OBJECT of any returned row.
+#
+# When this function returns an empty/sparse dict (because Phase 1+
+# pattern jobs haven't populated yet, or the user's archetype hasn't
+# accumulated cohort signal), the Oracle simply gets no field context
+# this turn, which degrades gracefully back to the pre-RAG behaviour.
+
+async def get_user_hive_context(
+    db: AsyncSession,
+    user_id: str,
+    *,
+    max_correlations: int = 3,
+    max_themes: int = 2,
+) -> dict:
+    """Pull a compact hive-context dict for one user.
+
+    Returns:
+      {
+        "components": [{"type": str, "value": str}, ...] up to ~10,
+        "correlations": [
+          {"user_component": str, "other_component": str,
+           "strength": float, "sample_n": int}, ...
+        ] top max_correlations by strength,
+        "themes": [
+          {"content": str, "confidence": float}, ...
+        ] top max_themes by emergence_confidence,
+        "resonance": float | None  # 0.0-1.0 if user has a UserResonance row
+      }
+
+    Empty fields when the user has no signal yet OR the pattern jobs
+    haven't run yet OR the user opted out of hive_consent. Caller should
+    treat any field being empty as "skip the corresponding prompt section."
+    """
+    from sqlalchemy import select as sql_select
+
+    out: dict = {
+        "components": [],
+        "correlations": [],
+        "themes": [],
+        "resonance": None,
+    }
+
+    # First gate: hive_consent. We only enrich the Oracle's prompt with
+    # collective signal for users who have explicitly opted into the
+    # hive. Non-consenting users get the un-augmented experience, which
+    # is what they signed up for.
+    user_row = (await db.execute(
+        sql_select(User).where(User.id == user_id)
+    )).scalar_one_or_none()
+    if not user_row or not getattr(user_row, "hive_consent", False):
+        return out
+
+    # 1. User's chart components. Joined chart_signals -> chart_components
+    #    on user_id. Capped at 30 per user but typically far less.
+    comp_rows = (await db.execute(
+        sql_select(ChartComponent.component_type, ChartComponent.component_value)
+        .join(ChartSignal, ChartComponent.signal_id == ChartSignal.signal_id)
+        .where(ChartSignal.user_id == user_id)
+        .limit(30)
+    )).all()
+    user_components = [(r[0], r[1]) for r in comp_rows]
+    out["components"] = [{"type": t, "value": v} for t, v in user_components]
+    if not user_components:
+        return out
+
+    # The correlation table stores components as "type=value" strings.
+    user_component_keys = {f"{t}={v}" for t, v in user_components}
+
+    # 2. Top correlations involving any of the user's components. Look
+    #    on either side of the pair. Ordered by correlation_strength DESC.
+    #    Limit to the top max_correlations after de-duping (a single pair
+    #    can match twice if the user has both components).
+    if user_component_keys:
+        corr_rows = (await db.execute(
+            sql_select(PatternCorrelation)
+            .where(
+                or_(
+                    PatternCorrelation.component_a.in_(user_component_keys),
+                    PatternCorrelation.component_b.in_(user_component_keys),
+                )
+            )
+            .order_by(PatternCorrelation.correlation_strength.desc())
+            .limit(max_correlations * 4)
+        )).scalars().all()
+        seen_pairs: set[tuple[str, str]] = set()
+        for c in corr_rows:
+            # Normalise so the user's component is always on the "user_component" side
+            if c.component_a in user_component_keys:
+                user_side, other_side = c.component_a, c.component_b
+            else:
+                user_side, other_side = c.component_b, c.component_a
+            key = tuple(sorted((user_side, other_side)))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            out["correlations"].append({
+                "user_component": user_side,
+                "other_component": other_side,
+                "strength": round(float(c.correlation_strength or 0.0), 3),
+                "sample_n": int(c.total_sample_n or 0),
+            })
+            if len(out["correlations"]) >= max_correlations:
+                break
+
+    # 3. Top emerging themes. For now, surface highest-confidence themes
+    #    network-wide; once we have richer cohort-membership we can
+    #    filter to themes whose cohort the user actually belongs to.
+    #    Capped tight so the prompt doesn't bloat.
+    theme_rows = (await db.execute(
+        sql_select(PatternTheme)
+        .order_by(PatternTheme.emergence_confidence.desc())
+        .limit(max_themes)
+    )).scalars().all()
+    out["themes"] = [
+        {
+            "content": (t.theme_content or "")[:280],
+            "confidence": round(float(t.emergence_confidence or 0.0), 3),
+        }
+        for t in theme_rows
+        if t.theme_content
+    ]
+
+    # 4. The user's own resonance score if Phase 3 has computed it.
+    res_row = (await db.execute(
+        sql_select(UserResonance).where(UserResonance.user_id == user_id)
+    )).scalar_one_or_none()
+    if res_row is not None:
+        out["resonance"] = round(float(res_row.resonance_score or 0.0), 3)
+
+    return out
 

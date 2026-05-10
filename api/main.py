@@ -1763,18 +1763,19 @@ async def group_chat_endpoint(
 
         # Voice-consistency audit. Same fire-and-forget pattern as /chat,
         # using _spawn_background so the Task is held by a strong ref
-        # and cannot be GC'd mid-flight (Codex audit). Tagged group_chat
-        # in the model_used field so the dashboard can separate
+        # and cannot be GC'd mid-flight (Codex audit). Suffix the
+        # model_used with -group so the dashboard can separate
         # one-on-one drift from group-conversation drift, since the
         # rules apply differently when two charts are present.
         try:
             from ai.audit import audit_oracle_reply
+            from ai.chat import LAST_MODEL_USED, get_oracle_prompt_version
             _spawn_background(audit_oracle_reply(
                 user_id=user_id,
                 user_message=req.message,
                 oracle_reply=response or "",
-                model_used="claude-haiku-4-5-20251001-group",
-                oracle_prompt_version="v3-softened",
+                model_used=f"{LAST_MODEL_USED.get()}-group",
+                oracle_prompt_version=get_oracle_prompt_version(),
             ))
         except Exception as _audit_err:
             logger.warning(f"[audit] schedule failed for group chat: {_audit_err}")
@@ -3709,6 +3710,18 @@ async def chat_endpoint(
         logger.warning(f"Failed to load oracle self-state for user {user_id}: {ss_err}")
         self_state = None
 
+    # Load hive context (collective-intelligence layer). Closes the loop
+    # Codex flagged in the May 2026 audit roundtable: the Hive Mind tables
+    # exist but the Oracle never read from them. Failure is non-fatal,
+    # the Oracle just gets the un-augmented prompt for this turn. Will
+    # return empty for users without hive_consent or with no signal yet.
+    try:
+        from db.database import get_user_hive_context
+        hive_context = await get_user_hive_context(db, user_id)
+    except Exception as hv_err:
+        logger.warning(f"Failed to load hive context for user {user_id}: {hv_err}")
+        hive_context = None
+
     try:
         response = higher_self_chat(
             blueprint=blueprint,
@@ -3719,6 +3732,7 @@ async def chat_endpoint(
             memories=memories,
             connections=connections,
             self_state=self_state,
+            hive_context=hive_context,
         )
 
         # surface_next memories have now been "consumed" by the Oracle in
@@ -3832,14 +3846,18 @@ async def chat_endpoint(
         # endpoints + the Oracle Voice Health section on /admin/hive.
         # Uses _spawn_background so the Task is held by a strong ref and
         # cannot be garbage-collected mid-flight (Codex audit).
+        # Provenance: read which model produced the reply via chat.py's
+        # LAST_MODEL_USED ContextVar, so the audit can skip break-glass
+        # output (Gemini caught: do not let GPT-4o grade GPT-4o).
         try:
             from ai.audit import audit_oracle_reply
+            from ai.chat import LAST_MODEL_USED, get_oracle_prompt_version
             _spawn_background(audit_oracle_reply(
                 user_id=user_id,
                 user_message=req.message,
                 oracle_reply=response or "",
-                model_used="claude-haiku-4-5-20251001",
-                oracle_prompt_version="v3-softened",
+                model_used=LAST_MODEL_USED.get(),
+                oracle_prompt_version=get_oracle_prompt_version(),
             ))
         except Exception as _audit_err:
             logger.warning(f"[audit] schedule failed for user {user_id}: {_audit_err}")
