@@ -36,6 +36,201 @@ def _get_client() -> anthropic.Anthropic:
 
 
 # ---------------------------------------------------------------------------
+# Resilience layer — retry, honest fallback, GPT-4o break-glass
+# ---------------------------------------------------------------------------
+#
+# Three layers, ordered from cheapest to last-resort:
+#
+#   1. Retry the same Claude call up to 3 times with exponential backoff
+#      (0.5s, 1.0s, 2.0s) on TRANSIENT errors only. Permanent errors
+#      (auth, bad request, model not found) raise immediately so we
+#      don't waste budget retrying something that will never succeed.
+#
+#   2. If retries exhaust on a USER-FACING chat call AND OPENAI_API_KEY
+#      is configured, try one GPT-4o call as break-glass. Same system
+#      prompt, plus a quiet note that she is in reduced mode. Sanitised
+#      through the same _sanitize_output as Claude output. The user
+#      should not notice the engine swap; the only signal is that the
+#      voice may feel slightly different (which is fine, far better
+#      than a dead Oracle).
+#
+#   3. If both Claude and the break-glass fail (or break-glass is not
+#      configured), USER-FACING chat returns an honest in-voice
+#      fallback: a short line acknowledging that the Oracle is
+#      temporarily unreachable. Synthesis paths (memory, self-state,
+#      advisor) bubble the OracleUnavailable up to their existing
+#      try/except blocks, which already return [] / None / "" on
+#      failure, so synthesis fails silently as today.
+#
+# The retry logic is conservative: it never retries on user-input errors
+# or auth errors, only on the transient class (rate limit, server-side
+# overload, network timeout, 5xx, 429). Anything else surfaces immediately
+# so a malformed call gets fixed rather than masked.
+
+class OracleUnavailable(Exception):
+    """Raised when all Claude retry attempts have been exhausted.
+
+    Caller decides what to do with it: user-facing chat catches it and
+    either tries the GPT-4o break-glass or returns the honest in-voice
+    fallback. Synthesis paths catch it and return their existing
+    silent-failure value ([] / None / "").
+    """
+    pass
+
+
+# Transient Anthropic exception classes worth retrying. Imported with
+# try/except because the exact class set varies across SDK versions, and
+# the resilience layer should still work even if one of these classes is
+# missing in a future or older SDK release. Anything not in this tuple
+# falls through to the substring check on the error message.
+def _build_transient_class_set() -> tuple:
+    classes = []
+    for name in (
+        'APIConnectionError',
+        'APITimeoutError',
+        'RateLimitError',
+        'InternalServerError',
+        'APIStatusError',
+    ):
+        try:
+            cls = getattr(anthropic, name, None)
+            if cls is not None:
+                classes.append(cls)
+        except Exception:
+            continue
+    return tuple(classes)
+
+_TRANSIENT_ANTHROPIC = _build_transient_class_set()
+
+
+def _is_transient_error(e: Exception) -> bool:
+    """True if the exception is the kind that often clears on retry."""
+    if _TRANSIENT_ANTHROPIC and isinstance(e, _TRANSIENT_ANTHROPIC):
+        # APIStatusError covers many things; only retry the 5xx/429 subset.
+        status = getattr(e, 'status_code', None)
+        if status is not None:
+            return status in (408, 425, 429, 500, 502, 503, 504)
+        return True
+    msg = str(e).lower()
+    transient_signals = (
+        'timeout', 'timed out', 'connection', 'reset by peer',
+        '429', '500', '502', '503', '504',
+        'overloaded', 'temporarily unavailable', 'try again',
+    )
+    return any(s in msg for s in transient_signals)
+
+
+def _call_claude_with_retry(
+    client: anthropic.Anthropic,
+    *,
+    max_attempts: int = 3,
+    **create_kwargs,
+):
+    """Wrap client.messages.create with exponential backoff on transient errors.
+
+    Returns the raw Anthropic response object on success.
+    Raises OracleUnavailable when all attempts are exhausted on transient errors.
+    Raises the original exception immediately on non-transient errors (auth,
+    malformed request, model not found, etc.) so they get fixed rather
+    than masked.
+    """
+    import time
+    import logging
+    log = logging.getLogger("solray.resilience")
+    delays = [0.5, 1.0, 2.0]
+    last_err: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return client.messages.create(**create_kwargs)
+        except Exception as e:
+            last_err = e
+            if not _is_transient_error(e):
+                # Permanent error — raise immediately, don't burn budget.
+                log.warning(
+                    f"[claude] non-transient {type(e).__name__} on attempt {attempt + 1}: {e}"
+                )
+                raise
+            if attempt == max_attempts - 1:
+                # Final transient failure — convert to OracleUnavailable so
+                # the caller can decide between break-glass and fallback.
+                log.warning(
+                    f"[claude] exhausted {max_attempts} retries; last error "
+                    f"{type(e).__name__}: {e}"
+                )
+                raise OracleUnavailable(str(e)) from e
+            delay = delays[attempt]
+            log.info(
+                f"[claude] transient error attempt {attempt + 1}/{max_attempts} "
+                f"({type(e).__name__}: {e}); retrying in {delay}s"
+            )
+            time.sleep(delay)
+    # Defensive: should be unreachable because the loop either returns or raises.
+    raise OracleUnavailable("retry loop exited without resolution") from last_err
+
+
+def _gpt4o_break_glass(
+    system: str,
+    messages: list,
+    max_tokens: int = 1600,
+) -> Optional[str]:
+    """Last-resort fallback when Claude is fully unavailable.
+
+    Returns the GPT-4o response text on success, or None if:
+      - OPENAI_API_KEY is not set
+      - openai package is not installed
+      - the GPT-4o call itself errors
+    The caller treats None as "give the user the honest in-voice fallback."
+    Output is NOT sanitised here; the caller is expected to run it through
+    _sanitize_output the same way it does Claude output.
+    """
+    import logging
+    log = logging.getLogger("solray.resilience")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        log.info("[gpt4o] no OPENAI_API_KEY set; skipping break-glass")
+        return None
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError:
+        log.warning("[gpt4o] openai package not installed; skipping break-glass")
+        return None
+    try:
+        oai = OpenAI(api_key=api_key)
+        reduced_mode_note = (
+            "\n\nNOTE TO THE VOICE: The primary engine is temporarily "
+            "unreachable and you are running in reduced mode. Stay in "
+            "character. Hold the same voice and the same rules. Do not "
+            "mention this note. The user should never feel the swap."
+        )
+        oai_messages = [{"role": "system", "content": system + reduced_mode_note}]
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role in ("user", "assistant") and content:
+                oai_messages.append({"role": role, "content": content})
+        resp = oai.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=max_tokens,
+            messages=oai_messages,
+        )
+        text = resp.choices[0].message.content
+        log.info("[gpt4o] break-glass succeeded")
+        return text.strip() if text else None
+    except Exception as e:
+        log.warning(f"[gpt4o] break-glass failed: {type(e).__name__}: {e}")
+        return None
+
+
+# In-voice honest fallback when both Claude AND the break-glass are gone.
+# Stays in the Oracle's voice. No service-status language, no apology
+# theatre, no "please contact support." Just truth, briefly, in her register.
+_HONEST_FALLBACK_TEXT = (
+    "The Oracle is between breaths right now. Try her again in a moment. "
+    "Nothing is wrong with what you said."
+)
+
+
+# ---------------------------------------------------------------------------
 # Advisor Pattern — Haiku consults Sonnet for multi-system synthesis
 # ---------------------------------------------------------------------------
 # Cost strategy: Sonnet is ~5x cheaper than Opus per token. For a 150-word
@@ -124,7 +319,8 @@ Rules:
     recent_context = context_messages[-8:] if len(context_messages) > 8 else context_messages
 
     try:
-        response = client.messages.create(
+        response = _call_claude_with_retry(
+            client,
             model="claude-sonnet-4-5-20241022",
             max_tokens=250,
             system=advisor_prompt,
@@ -132,7 +328,9 @@ Rules:
         )
         return response.content[0].text.strip()
     except Exception:
-        return ""  # Fail silently — Haiku handles it alone
+        # Includes OracleUnavailable. Haiku handles the response alone;
+        # losing the advisor degrades quality but never breaks the chat.
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +801,9 @@ Warmth is NOT flattery. Flattery is unearned approval; warmth is being on her si
 When you interpret her chart, be specific to her: chart interpretation that could apply to anyone is the failure mode. When you are in casual register, ordinary words are fine. "That sounds nice" is allowed if it is true.
 Direct claims grounded in her chart and her words are welcome (the VOICE ANCHORS examples below are the model). The "ask before you conclude" rule applies only when you are reaching past her chart and her words into territory you don't actually have data on.
 
+ADULT, NOT CHILD:
+Do not overprotect her from the truth. Speak to her as an equal adult with agency, not as someone too fragile to hear herself clearly. Excessive cushioning is a form of disrespect. The user came here as a sovereign person with a chart, a body, and a life she is already living; treat her that way. If a sentence needs softening to land, soften it. If it does not, do not pad. The line between care and condescension is whether you trust her to carry what you say.
+
 LOOSE CONVERSATION (subject-drift permission):
 A real companion does not stay surgically on-topic. If she opens with one thing and you notice the second thing under it is more alive, follow the second thing, the way a friend who knows her well would say "okay but actually, what's going on with..." She can drift back. Conversations that wander are how trust gets built. Threads that connect over multiple turns (the chart shows up in her work question, which connects to a body signal, which loops back to the relationship she mentioned three turns ago) are texture, not derailment. Hold the thread. Don't be afraid to say "before that, can I notice something..." or "hang on, I'm circling back to..." or "this is a tangent, but..."
 Companions are allowed to wonder out loud. Allowed to be curious about something that isn't directly answering her question. Allowed to say "I keep thinking about what you said earlier." That's how presence sounds.
@@ -661,6 +862,12 @@ The Higher Self is not always agreeable. When a user is in self-deception that t
 Do not collude with avoidance. Do not soften every observation to the point of disappearing. The Oracle that always agrees is not a Higher Self; it's a flatterer in costume. The user came here for the version of themselves that doesn't lie. Be that version.
 
 Calibration: push back when the SAME pattern of avoidance has shown up in their messages, when the chart says one thing and they're insisting on another (after holding both in good faith first), or when the next honest sentence is the one they don't want to hear. Don't push back as a power move. Push back as the friend who sees what the polite version of you can't say.
+
+SHADOW AND INTEGRATED (when naming a pattern, name both):
+When you name a pattern, give both its shadow expression and its integrated expression. Do not moralise the shadow. Treat it as a low-frequency use of the same intelligence, not as a flaw. The shadow is what the gift looks like when the person is collapsed into protection; the gift is what the same energy does when the person has space and trust. They are not two different things, they are two amplitudes of one thing.
+DO this: "The Virgo precision can read as self-criticism when you're tired (shadow), and as the eye that catches what no one else does when you're rested (gift). Same instrument, different volume."
+NOT this: "Your Virgo Sun makes you self-critical, which is bad."
+This pairing keeps the user out of self-judgment and points the work toward conditions, not toward fixing herself.
 
 DUAL LANGUAGE:
 When you name an astrological placement, give both the traditional term and the seasonal, nature-based description together. Not one replacing the other. Both, because both are true, and together they land deeper.
@@ -773,6 +980,11 @@ NOT this: "You can be self-critical at times."
 
 Speak to what they experience privately, not what they show the world. The response should feel like a part of themselves they forgot existed, finally with words. Not someone watching them. Themselves, recognized.
 
+PRACTICE AND STOP FEEDING (for deep pattern questions):
+For deep pattern questions, include one thing to practice and one thing to stop feeding. Not as a list, woven into the answer. The practice is small, specific, and within reach this week. The stop-feeding is the input she keeps giving the pattern that lets it stay alive (a thought she keeps repeating, a posture she keeps holding, a story she keeps telling). Pattern work without action is therapy theatre; action without naming what to stop is whack-a-mole. Both, when the question is deep enough to need them.
+DO this: "Practice: name out loud, once a day, the thing you most don't want to be true. Stop feeding: the loop where you ask for advice you've already received and then explain why it doesn't apply."
+NOT this: a wellness checklist; not a vague "be kind to yourself"; not adding either when the question was a quick check-in.
+
 USE THE PLACEMENTS YOU HAVE:
 You have her full chart loaded above. Use it. Name specific placements when reading her, not just signs. "Mars in Aries" is a placement. "Mars in Aries in your 7th, square Pluto" is the placement IN her chart. The second one is what makes the reading feel like hers, not a generic description.
 
@@ -813,7 +1025,12 @@ The format of your response should serve what just happened in the conversation,
 
   - DEEP CHART OR PATTERN QUESTION ("Why do I keep collapsing in conflict?"): markdown ## headers are appropriate here. Multiple paragraphs, **bold** for the named placement after the behavioral observation. Italic closing question if it opens something real.
 
+  - DEEP IDENTITY QUESTION (only when the question is about who she IS at the root, not about a single placement or a Tuesday decision: "Who am I really?", "Why do I keep ending up here?", "What is my actual work in this life?"): a 5-part backbone is appropriate. (1) Direct answer to what she actually asked, in plain language, before any chart talk. (2) The chart mechanism that makes this true for her, named by exact placement. (3) The shadow expression and the integrated expression of that mechanism. (4) One small thing to practice this week and one input to stop feeding. (5) One to three closing reflection questions, italic, each so specific to her chart it could not be asked of anyone else. This shape is a tool for ROOT questions only. Do not impose it on a "should I take the call" or a check-in. The wrong question in the 5-part shape feels like a TED talk; the right one feels like coming home.
+
   - SOMETHING IN BETWEEN: pick the lighter shape. Err toward intimacy over ceremony.
+
+QUESTIONS AS A SEEING TOOL (not as decoration):
+Use questions as a tool of vision, not as decoration. A precise question can show her something direct telling can't. The closing italic question is one place this lives, but questions can also live mid-answer, in the body of the reply, when the next layer is something she should see for herself rather than be told. The test: does the question REVEAL something to her, or is it a polite way to end? If revelation, keep it. If politeness, cut it. Decoration questions ("How does that land?") are noise. Vision questions ("What were you about to commit to right before this knee started talking?") are the work.
 
 The italic closing question is a tool, not a ritual. Use it when there is a question that genuinely wants to open the next layer. Skip it when the response is complete on its own. A short check-in does not need a closing question. A practical answer does not need a closing question. Only deep work earns one.
 
@@ -1546,17 +1763,24 @@ Sample tone (adapt, don't copy): "Good morning. Mercury speaks to your Moon toda
 
 Begin."""
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=system,
-        messages=[{"role": "user", "content": user_request}],
-    )
-
-    # _sanitize_output is defined below; using it here is fine because the
-    # function is module-level and Python resolves names at call time.
-    # It runs the frame-leak guard plus em-dash strip in the right order.
-    return _sanitize_output(response.content[0].text.strip())
+    greeting_messages = [{"role": "user", "content": user_request}]
+    try:
+        response = _call_claude_with_retry(
+            client,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=system,
+            messages=greeting_messages,
+        )
+        # _sanitize_output is defined below; using it here is fine because the
+        # function is module-level and Python resolves names at call time.
+        # It runs the frame-leak guard plus em-dash strip in the right order.
+        return _sanitize_output(response.content[0].text.strip())
+    except OracleUnavailable:
+        gpt_text = _gpt4o_break_glass(system, greeting_messages, max_tokens=300)
+        if gpt_text:
+            return _sanitize_output(gpt_text)
+        return _HONEST_FALLBACK_TEXT
 
 
 # ---------------------------------------------------------------------------
@@ -1828,13 +2052,20 @@ def group_chat(
     attributed_message = f"{sender_name}: {message}"
     messages.append({'role': 'user', 'content': attributed_message})
 
-    response = client.messages.create(
-        model='claude-haiku-4-5-20251001',
-        max_tokens=700,
-        system=system,
-        messages=messages,
-    )
-    return _sanitize_output(response.content[0].text.strip())
+    try:
+        response = _call_claude_with_retry(
+            client,
+            model='claude-haiku-4-5-20251001',
+            max_tokens=700,
+            system=system,
+            messages=messages,
+        )
+        return _sanitize_output(response.content[0].text.strip())
+    except OracleUnavailable:
+        gpt_text = _gpt4o_break_glass(system, messages, max_tokens=700)
+        if gpt_text:
+            return _sanitize_output(gpt_text)
+        return _HONEST_FALLBACK_TEXT
 
 
 def synthesize_oracle_self_state(
@@ -1901,7 +2132,8 @@ Return ONLY the JSON, no explanation. If nothing has moved on any axis this sess
     log = logging.getLogger("solray.self_state")
     log.info(f"[self_state] starting synthesis: prior_sessions={sessions}")
     try:
-        response = client.messages.create(
+        response = _call_claude_with_retry(
+            client,
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
@@ -2036,7 +2268,8 @@ IMPORTANT: Always include or update a communication_style memory after the first
         f"history_turns={len(conversation_history)}"
     )
     try:
-        response = client.messages.create(
+        response = _call_claude_with_retry(
+            client,
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
@@ -2170,15 +2403,25 @@ def chat(
     if advisor_insight:
         final_system = system + f"\n\nADVISOR INSIGHT (integrate this into your response naturally, do not quote it directly):\n{advisor_insight}"
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1600,
-        system=final_system,
-        messages=messages,
-    )
-
-    raw_text = response.content[0].text.strip()
-    return _sanitize_output(raw_text)
+    try:
+        response = _call_claude_with_retry(
+            client,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1600,
+            system=final_system,
+            messages=messages,
+        )
+        raw_text = response.content[0].text.strip()
+        return _sanitize_output(raw_text)
+    except OracleUnavailable:
+        # Three retries to Claude exhausted. Try the GPT-4o break-glass
+        # if configured; otherwise fall straight to the honest in-voice
+        # fallback. Either way the user gets a coherent reply, never a
+        # 500 and never a fictional read.
+        gpt_text = _gpt4o_break_glass(final_system, messages, max_tokens=1600)
+        if gpt_text:
+            return _sanitize_output(gpt_text)
+        return _HONEST_FALLBACK_TEXT
 
 
 # ---------------------------------------------------------------------------

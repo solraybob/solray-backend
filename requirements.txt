@@ -32,6 +32,13 @@ pytz==2024.1
 
 # AI
 anthropic==0.25.0
+# GPT-4o is the break-glass fallback when Claude is fully unavailable.
+# Wired in ai/chat.py via _gpt4o_break_glass(). The break-glass only
+# fires after Claude exhausts its 3-retry exponential backoff AND
+# OPENAI_API_KEY is set, so this dependency is safe to ship even if
+# the key is not configured (the fallback returns None and the
+# honest in-voice text takes over).
+openai==1.40.0
 
 # Dev utilities
 python-dotenv==1.0.1
