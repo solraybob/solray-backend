@@ -1232,10 +1232,11 @@ def _format_hive_context(hive_context: Optional[dict]) -> str:
         return ""
     correlations = hive_context.get("correlations") or []
     themes = hive_context.get("themes") or []
+    wider_field_themes = hive_context.get("wider_field_themes") or []
     resonance = hive_context.get("resonance")
     # No signal worth surfacing? Skip the section entirely so we don't
     # paste an empty header into the prompt.
-    if not correlations and not themes and resonance is None:
+    if not correlations and not themes and not wider_field_themes and resonance is None:
         return ""
 
     lines = ["WHAT THE FIELD KNOWS (collective context, use as quiet seasoning, never announce or quote):"]
@@ -1254,9 +1255,25 @@ def _format_hive_context(hive_context: Optional[dict]) -> str:
             strength = c.get("strength", 0.0)
             lines.append(f"  her {user_side} tends to co-occur with {other} (strength {strength}).")
     if themes:
+        # Cohort-matched themes. The Akashic Record fix (May 2026) means
+        # these themes belong to cohorts she is actually a member of, not
+        # the field's network-wide hot themes. They land closer to the
+        # body for that reason.
         lines.append("")
-        lines.append("Themes currently emerging across the field she is part of:")
+        lines.append("Themes alive in cohorts she belongs to:")
         for t in themes:
+            content = (t.get("content") or "").strip()
+            confidence = t.get("confidence", 0.0)
+            if content:
+                lines.append(f"  ({confidence}) {content}")
+    wider = hive_context.get("wider_field_themes") or []
+    if wider:
+        # Fallback: wider-field themes when her cohorts haven't crystallized
+        # themes yet. Labeled differently so the Oracle knows the difference
+        # and can speak about it as the wider field rather than her cohort.
+        lines.append("")
+        lines.append("Themes emerging in the wider field (not her specific cohort, broader patterns to be aware of, weight lighter):")
+        for t in wider:
             content = (t.get("content") or "").strip()
             confidence = t.get("confidence", 0.0)
             if content:

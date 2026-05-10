@@ -2649,6 +2649,37 @@ async def admin_hive_inspect(
 
 
 # ---------------------------------------------------------------------------
+# Akashic Record foundation: consent backfill admin endpoint
+# ---------------------------------------------------------------------------
+# One-shot helper to migrate every existing user's legacy hive_consent
+# boolean into ConsentGrant rows for the eight-scope tiered model.
+# Idempotent: re-running is safe (the unique constraint on consent_grants
+# silently swallows duplicates). Manual trigger only; no scheduled call.
+
+@app.post('/admin/akashic/backfill-consent', summary='Migrate legacy hive_consent into tiered ConsentGrant rows (admin only)')
+async def admin_akashic_backfill_consent(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mirror legacy users.hive_consent into the new ConsentGrant table.
+
+    For each existing user:
+      - hive_consent=True -> grants for: private_oracle_use,
+        personalization_memory, anonymous_cohort_learning,
+        anonymous_retrieval_training, anonymous_product_analytics
+      - hive_consent=False -> grants for: private_oracle_use,
+        personalization_memory only
+
+    Returns counts so the dashboard can verify the migration. Safe to
+    re-run; existing grants are not duplicated.
+    """
+    from db.database import backfill_legacy_consent
+    result = await backfill_legacy_consent(db)
+    logger.info(f"[akashic] consent backfill complete: {result}")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Oracle voice audit endpoints
 # ---------------------------------------------------------------------------
 # Powered by oracle_audit rows written by ai/audit.audit_oracle_reply on

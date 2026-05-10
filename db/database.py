@@ -133,6 +133,18 @@ class User(Base):
     verification_token = Column(String(64), nullable=True)   # random token for email verify link
     password_reset_token   = Column(String(64), nullable=True)   # random token for password reset link
     password_reset_expires = Column(DateTime,   nullable=True)   # token expiry (typically NOW + 1h)
+    # Identity-model split columns (Akashic Record foundation, May 2026).
+    # Additive only; default to NULL so existing behavior is preserved
+    # (existing code reads users.id as the universal handle). Future code
+    # reads through these columns; they let us eventually separate one
+    # human's account from their chart-as-identity, their public Sol.0
+    # face, and their billing identity. See project memory
+    # project_akashic_record_foundation.md for the full reasoning.
+    account_id            = Column(String(36), nullable=True)
+    person_id             = Column(String(36), nullable=True)
+    primary_chart_id      = Column(String(36), nullable=True)
+    public_identity_id    = Column(String(36), nullable=True)
+    billing_identity_id   = Column(String(36), nullable=True)
     created_at       = Column(DateTime,    nullable=False, default=datetime.utcnow)
 
     blueprint     = relationship('Blueprint', back_populates='user', uselist=False, cascade='all, delete-orphan')
@@ -308,6 +320,13 @@ class ChartComponent(Base):
     component_type   = Column(String(40), nullable=False)
     component_value  = Column(String(128), nullable=False)
     component_position = Column(Integer, nullable=True)
+    # Akashic Record foundation classification (May 2026). All default to
+    # backwards-compatible values so legacy components are still treated
+    # the same way; new writes get classified at creation time.
+    privacy_class       = Column(String(32), nullable=False, default='aggregate_safe')
+    identity_relevance  = Column(String(20), nullable=False, default='profile')
+    confidence_level    = Column(Float, nullable=False, default=1.0)
+    calculation_version = Column(Integer, nullable=False, default=1)
     created_at       = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -483,6 +502,261 @@ class IntegrationCredential(Base):
     last_error        = Column(Text,        nullable=True)
     created_at        = Column(DateTime,    nullable=False, default=datetime.utcnow)
     updated_at        = Column(DateTime,    nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ===========================================================================
+# AKASHIC RECORD FOUNDATION (Phase 1)
+# ===========================================================================
+# These tables implement the foundation spec distilled from the May 2026
+# three-way audit roundtable (Claude + Codex + Gemini). They turn the
+# collective layer from a fragile pattern toy into a substrate that the
+# long-arc vision (Oracle on X, internal governance lab, eventual opt-in
+# governance protocol) can rest on.
+#
+# Core architectural commitment: every piece of user data, the moment it
+# is created, must know its audience class, its sensitivity class, and
+# its consent scope. Stamped at creation. Never retrofitted.
+#
+# All tables are ADDITIVE; nothing breaks for existing users. The legacy
+# users.hive_consent boolean stays as a fallback while consent_grants
+# rows accumulate. _write_chart_signal continues to write
+# chart_components AND now also chart_component_events (parallel write).
+# get_user_hive_context's signature is unchanged; only its internal
+# query logic improves.
+# ===========================================================================
+
+class ConsentGrant(Base):
+    """One row per (user, scope) consent grant. Replaces the boolean
+    users.hive_consent over time, but does NOT remove it; legacy users
+    fall back to the boolean until a consent backfill writes their
+    rows here. Eight scopes are defined as constants below.
+
+    Each grant carries enough metadata to reconstruct the legal basis
+    later: which policy text the user accepted (policy_text_hash),
+    where they accepted it (source_surface), what data classes the
+    grant covers, what the retention class is, and what happens to
+    derived data when consent is withdrawn (withdrawal_effect).
+
+    Revocation is soft: setting revoked_at preserves the grant history
+    so we can prove what the user had agreed to at any point in time.
+    Code that gates behavior on consent reads through get_user_consent()
+    which returns False once revoked_at is set.
+    """
+    __tablename__ = 'consent_grants'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'scope', 'version', name='uq_consent_user_scope_version'),
+    )
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    user_id               = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    scope                 = Column(String(64), nullable=False, index=True)
+    version               = Column(Integer, nullable=False, default=1)
+    granted_at            = Column(DateTime, nullable=False, default=datetime.utcnow)
+    revoked_at            = Column(DateTime, nullable=True)
+    source_surface        = Column(String(64), nullable=True)   # 'onboarding', 'profile_settings', 'admin_backfill', etc.
+    policy_text_hash      = Column(String(64), nullable=True)   # sha256 of the consent text presented at grant time
+    data_classes_covered  = Column(Text, nullable=True)         # JSON array of strings (e.g. ["chat", "memory", "chart"])
+    retention_class       = Column(String(32), nullable=True)   # 'session', 'user_lifetime', 'aggregate_indefinite'
+    withdrawal_effect     = Column(String(32), nullable=True)   # 'delete_raw', 'anonymize_only', 'preserve_aggregate'
+
+
+# Canonical scope names. Code should reference these constants rather
+# than hardcoding strings, so a typo in one site can't silently grant
+# the wrong consent class.
+CONSENT_PRIVATE_ORACLE_USE = "private_oracle_use"
+CONSENT_PERSONALIZATION_MEMORY = "personalization_memory"
+CONSENT_ANONYMOUS_PRODUCT_ANALYTICS = "anonymous_product_analytics"
+CONSENT_ANONYMOUS_COHORT_LEARNING = "anonymous_cohort_learning"
+CONSENT_ANONYMOUS_RETRIEVAL_TRAINING = "anonymous_retrieval_training"
+CONSENT_PUBLIC_ORACLE_QUOTE_ELIGIBLE = "public_oracle_quote_eligible"
+CONSENT_RESEARCH_OR_PROTOCOL_EXPERIMENTS = "research_or_protocol_experiments"
+CONSENT_GOVERNANCE_PARTICIPATION_ELIGIBLE = "governance_participation_eligible"
+
+ALL_CONSENT_SCOPES = (
+    CONSENT_PRIVATE_ORACLE_USE,
+    CONSENT_PERSONALIZATION_MEMORY,
+    CONSENT_ANONYMOUS_PRODUCT_ANALYTICS,
+    CONSENT_ANONYMOUS_COHORT_LEARNING,
+    CONSENT_ANONYMOUS_RETRIEVAL_TRAINING,
+    CONSENT_PUBLIC_ORACLE_QUOTE_ELIGIBLE,
+    CONSENT_RESEARCH_OR_PROTOCOL_EXPERIMENTS,
+    CONSENT_GOVERNANCE_PARTICIPATION_ELIGIBLE,
+)
+
+
+class ChartComponentEvent(Base):
+    """Append-only history of every change to a user's chart_components.
+
+    The current chart_components table stays as the materialized "what is
+    true now" layer for fast cohort queries. This table records every
+    transition: when a component first appeared, when its value changed
+    after a birth-time correction, when it was reclassified by a new
+    calculation_version. Together they let us answer queries the snapshot
+    layer alone cannot: "what were the dominant Saturn placements in
+    cohorts that emerged in 2026," or "how did this user's chart drift
+    after they updated their birth time."
+
+    Codex's design: keep the materialized current layer for cohort
+    discovery throughput; add this immutable history for temporal queries
+    and identity provenance. Never UPDATE rows here; only INSERT.
+
+    privacy_class: 'aggregate_safe' (fine for cohort math),
+    'identifying_in_combination' (must be coarsened for surfacing),
+    'identifying_alone' (never surfaced cross-user without consent).
+
+    identity_relevance: 'profile' (chart-as-personality),
+    'identity' (chart-as-self for governance/Phase 4),
+    'derived' (computed from primary placements, weak provenance).
+    """
+    __tablename__ = 'chart_component_events'
+    __table_args__ = (
+        Index('idx_cce_user_created', 'user_id', 'created_at'),
+        Index('idx_cce_component', 'component_type', 'component_value'),
+    )
+
+    event_id              = Column(Integer, primary_key=True, autoincrement=True)
+    user_id               = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    signal_id             = Column(Integer, ForeignKey('chart_signals.signal_id', ondelete='CASCADE'), nullable=True)
+    event_type            = Column(String(20), nullable=False)         # 'created' | 'replaced' | 'recalculated'
+    component_type        = Column(String(40), nullable=False)
+    component_value       = Column(String(128), nullable=False)
+    previous_value        = Column(String(128), nullable=True)
+    reason                = Column(String(64), nullable=True)          # 'signup', 'birth_time_correction', 'recalc_version_bump'
+    actor_type            = Column(String(20), nullable=False, default='system')  # 'system' | 'user' | 'admin'
+    calculation_version   = Column(Integer, nullable=False, default=1)
+    privacy_class         = Column(String(32), nullable=False, default='aggregate_safe')
+    identity_relevance    = Column(String(20), nullable=False, default='profile')
+    confidence_level      = Column(Float, nullable=False, default=1.0)
+    supersedes_event_id   = Column(Integer, ForeignKey('chart_component_events.event_id', ondelete='SET NULL'), nullable=True)
+    created_at            = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class NarrativeEvent(Base):
+    """The canonical lived-narrative substrate. Codex flagged that
+    user_memory is summaries, not narrative; this table is the missing
+    spine. Every chat user-message and every notable Oracle reply gets
+    a row here, classified at creation by audience and sensitivity.
+
+    Without these classes stamped at creation, future surfaces (Oracle
+    on X, internal governance simulations, research access) cannot tell
+    private content apart from publishable content, and the system
+    either over-leaks or throws away the most valuable history.
+
+    audience_class:
+      'private'           - only the user and their Oracle ever see this
+      'user_visible'      - shareable back to the user but not aggregated
+      'anonymous_cohort'  - may inform anonymized cohort math
+      'internal_research' - solray-internal product/voice research only
+      'public'            - quotable on Oracle's public surfaces
+      'protocol'          - eligible as input to governance experiments
+
+    sensitivity_class:
+      'low'                  - mundane content
+      'personal'             - identifying or relational specifics
+      'intimate'             - inner-life, sexuality, partner detail
+      'birth_data'           - precise birth time/place
+      'health_adjacent'      - body, mental health, treatment
+      'spiritual_identity'   - chart-grounded identity claims
+      'governance_sensitive' - claims about authority, legitimacy
+    """
+    __tablename__ = 'narrative_events'
+    __table_args__ = (
+        Index('idx_ne_user_created', 'user_id', 'created_at'),
+        Index('idx_ne_audience_sensitivity', 'audience_class', 'sensitivity_class'),
+    )
+
+    event_id                = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                 = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    chat_session_id         = Column(String(64), nullable=True, index=True)
+    role                    = Column(String(20), nullable=False)        # 'user' | 'oracle' | 'system'
+    content                 = Column(Text, nullable=False)
+    audience_class          = Column(String(32), nullable=False, default='private')
+    sensitivity_class       = Column(String(32), nullable=False, default='personal')
+    consent_scope_required  = Column(String(64), nullable=True)
+    origin_surface          = Column(String(40), nullable=False, default='chat')   # 'chat', 'morning_greeting', 'group_chat', 'today_card'
+    derived_from_event_ids  = Column(Text, nullable=True)               # JSON array of upstream event_ids
+    redaction_status        = Column(String(20), nullable=False, default='none')   # 'none', 'partial', 'redacted'
+    publishability_status   = Column(String(20), nullable=False, default='not_eligible')  # 'not_eligible', 'eligible_with_redaction', 'eligible'
+    extraction_model        = Column(String(64), nullable=True)
+    extraction_prompt_version = Column(String(32), nullable=True)
+    created_at              = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class ChartIdentity(Base):
+    """Future-facing identity layer. Lays the groundwork for Phase 4
+    (chart-grounded anonymous governance participation) without
+    committing to it now. Never read in the chat path today.
+
+    chart_identity_hash is a deterministic hash of the user's natal
+    placements at calculation_version. Two users with identical births
+    would have the same hash; this is fine because the hash itself is
+    not personally identifying. It just lets later code prove "this
+    chart-identity matches the chart-identity that signed message X"
+    without re-storing birth data everywhere.
+
+    birth_record_hash is the hash of the raw birth record (date, time,
+    place) at the precision the user supplied. Used only for proof
+    flows; never surfaced. Different from chart_identity_hash in that
+    two charts with identical placements but different births would
+    have the same chart_identity_hash but different birth_record_hash.
+
+    identity_proof_status starts at 'unproven'. Future flows might
+    move it to 'self_attested', 'cosmically_witnessed', etc. The
+    fields are placeholders so the schema is ready when we are.
+    """
+    __tablename__ = 'chart_identities'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'calculation_version', name='uq_chart_identity_user_calc'),
+        Index('idx_ci_chart_hash', 'chart_identity_hash'),
+    )
+
+    id                       = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                  = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    chart_identity_hash      = Column(String(64), nullable=False)
+    birth_record_hash        = Column(String(64), nullable=True)
+    identity_proof_status    = Column(String(32), nullable=False, default='unproven')
+    identity_proof_method    = Column(String(64), nullable=True)
+    identity_proof_version   = Column(Integer, nullable=False, default=1)
+    calculation_version      = Column(Integer, nullable=False, default=1)
+    created_at               = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class JobRun(Base):
+    """Append-only ledger of every batch job run. Replaces the implicit
+    "I clicked the admin button last Tuesday" model with a durable
+    record of what ran, when, with what input/output counts, and why
+    it succeeded or failed.
+
+    job_name is the canonical job identifier ('hive_discover',
+    'hive_correlations', 'hive_resonance', 'hive_metrics',
+    'hive_backfill', 'memory_synthesis', 'audit_pass'). status moves
+    forward only: pending -> running -> succeeded | failed | timed_out.
+    run_id is a uuid the trigger generates so the dashboard can
+    correlate a "this run I just kicked off" with the row that lands.
+
+    Without this, scaling past a few hundred users breaks the manual
+    operations model: you cannot tell whether the last cohort
+    discovery succeeded, when correlations were last refreshed, or
+    whether resonance is stale relative to the current population.
+    """
+    __tablename__ = 'job_runs'
+    __table_args__ = (
+        Index('idx_job_runs_name_started', 'job_name', 'started_at'),
+    )
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    run_id          = Column(String(36), nullable=False, unique=True)
+    job_name        = Column(String(64), nullable=False, index=True)
+    status          = Column(String(20), nullable=False, default='pending')
+    triggered_by    = Column(String(40), nullable=True)             # 'admin_button', 'scheduled', 'event_signup', etc.
+    started_at      = Column(DateTime, nullable=False, default=datetime.utcnow)
+    finished_at     = Column(DateTime, nullable=True)
+    duration_ms     = Column(Integer, nullable=True)
+    retry_count     = Column(Integer, nullable=False, default=0)
+    input_count     = Column(Integer, nullable=True)
+    output_count    = Column(Integer, nullable=True)
+    failure_reason  = Column(Text, nullable=True)
+    metadata_json   = Column(Text, nullable=True)
 
 
 class OracleAudit(Base):
@@ -748,6 +1022,64 @@ async def init_db():
         except Exception as e:
             print(f"[init_db] password_reset columns migration note: {e}")
 
+        # Akashic Record foundation, May 2026: identity-model split columns
+        # on users. Pure preparation; nothing reads them yet. Defaults to
+        # NULL so existing user rows keep behaving as before. Future
+        # surfaces (Oracle on X, governance) read through these columns
+        # so users.id stops meaning everything at once. See project memory
+        # project_akashic_record_foundation.md for the full reasoning.
+        try:
+            if _is_postgres:
+                for col in (
+                    "account_id VARCHAR(36)",
+                    "person_id VARCHAR(36)",
+                    "primary_chart_id VARCHAR(36)",
+                    "public_identity_id VARCHAR(36)",
+                    "billing_identity_id VARCHAR(36)",
+                ):
+                    await conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}"))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(users)"))
+                cols = [row[1] for row in result.fetchall()]
+                for col_name, col_def in (
+                    ("account_id", "VARCHAR(36)"),
+                    ("person_id", "VARCHAR(36)"),
+                    ("primary_chart_id", "VARCHAR(36)"),
+                    ("public_identity_id", "VARCHAR(36)"),
+                    ("billing_identity_id", "VARCHAR(36)"),
+                ):
+                    if col_name not in cols:
+                        await conn.execute(text(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}"))
+        except Exception as e:
+            print(f"[init_db] identity-split columns migration note: {e}")
+
+        # Akashic Record foundation: classification columns on
+        # chart_components (the materialized current layer). Defaults
+        # match legacy behavior so existing rows are still treated as
+        # aggregate-safe profile components at calculation_version 1.
+        try:
+            if _is_postgres:
+                for col in (
+                    "privacy_class VARCHAR(32) NOT NULL DEFAULT 'aggregate_safe'",
+                    "identity_relevance VARCHAR(20) NOT NULL DEFAULT 'profile'",
+                    "confidence_level DOUBLE PRECISION NOT NULL DEFAULT 1.0",
+                    "calculation_version INTEGER NOT NULL DEFAULT 1",
+                ):
+                    await conn.execute(text(f"ALTER TABLE chart_components ADD COLUMN IF NOT EXISTS {col}"))
+            else:
+                result = await conn.execute(text("PRAGMA table_info(chart_components)"))
+                cols = [row[1] for row in result.fetchall()]
+                for col_name, col_def in (
+                    ("privacy_class", "VARCHAR(32) DEFAULT 'aggregate_safe'"),
+                    ("identity_relevance", "VARCHAR(20) DEFAULT 'profile'"),
+                    ("confidence_level", "REAL DEFAULT 1.0"),
+                    ("calculation_version", "INTEGER DEFAULT 1"),
+                ):
+                    if col_name not in cols:
+                        await conn.execute(text(f"ALTER TABLE chart_components ADD COLUMN {col_name} {col_def}"))
+        except Exception as e:
+            print(f"[init_db] chart_components classification columns migration note: {e}")
+
         # analytics_events table. Stores the event stream that powers
         # the funnel dashboard, retention cohorts, and the canary alerts.
         # 90-day auto-purge handled by the cron in analytics/retention.py;
@@ -944,39 +1276,86 @@ async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: di
     if not components:
         return  # nothing meaningful to record
 
-    # Consent gate: skip the entire write if the user has opted out of hive
-    # participation. Their blueprint already saved upstream; this just stops
-    # their data from contributing to the collective layer.
-    consent_row = await db.execute(
-        select(User.hive_consent).where(User.id == user_id)
+    # Consent gate (Akashic Foundation, May 2026 — Codex P1 fix). Reads
+    # through the tiered consent helper instead of users.hive_consent
+    # directly. This way future grants via ConsentGrant gate signal
+    # writes correctly, and a legacy hive_consent=False vetoes
+    # signals exactly as before because the helper honors it.
+    cohort_consent_ok = await get_user_consent_state(
+        db, user_id, CONSENT_ANONYMOUS_COHORT_LEARNING,
     )
-    consent_val = consent_row.scalar_one_or_none()
-    if consent_val is False:
+    if not cohort_consent_ok:
         return
 
     archetype = 'astro_natal'
     now = _dt.utcnow()
     sig_hash = hashlib.sha256(f"{user_id}|{archetype}".encode()).hexdigest()
 
+    # Privacy classification per component type (Codex P1.7 fix).
+    # Defaults are conservative: components that narrow uniqueness in
+    # combination get 'identifying_in_combination' so downstream code
+    # knows to coarsen them before public surfacing. Sun and moon
+    # signs are aggregate-safe at the population level. Rising sign
+    # plus precise time can identify; flag it. Gene Keys gates are
+    # finer-grained and combine to narrow identity, so flag those too.
+    _PRIVACY_CLASS_BY_TYPE = {
+        'sun_sign': 'aggregate_safe',
+        'moon_sign': 'aggregate_safe',
+        'ascendant_sign': 'identifying_in_combination',
+        'hd_type': 'aggregate_safe',
+        'hd_authority': 'aggregate_safe',
+        'hd_profile': 'identifying_in_combination',
+        'gk_lifes_work': 'identifying_in_combination',
+        'gk_evolution': 'identifying_in_combination',
+        'gk_radiance': 'identifying_in_combination',
+        'gk_purpose': 'identifying_in_combination',
+        'gk_attraction': 'identifying_in_combination',
+        'gk_iq': 'identifying_in_combination',
+        'gk_eq': 'identifying_in_combination',
+    }
+    def _classify(ctype: str) -> tuple[str, str]:
+        return (_PRIVACY_CLASS_BY_TYPE.get(ctype, 'aggregate_safe'), 'profile')
+
+    # Step 1: snapshot prior component state BEFORE we touch anything,
+    # so the append-only event layer can record real previous_value
+    # transitions on the replacement path. Codex P1.5 caught that the
+    # original code captured nothing because the delete ran before the
+    # capture, leaving previous_value perpetually NULL and event_type
+    # always 'created' even for chart corrections.
+    prior_components: dict[str, str] = {}
     try:
-        # Find existing signal for this user+archetype (one per user by design)
-        existing = await db.execute(
+        existing_signal_lookup = await db.execute(
             select(ChartSignal).where(
                 ChartSignal.user_id == user_id,
                 ChartSignal.chart_archetype == archetype,
             )
         )
-        signal = existing.scalar_one_or_none()
-        if signal is not None:
-            # Replace components — chart re-run after correction. Refresh
-            # signal_hash + timestamp so Phase 1 queries see the latest
-            # version, but keep the same signal_id for stability.
+        prior_signal = existing_signal_lookup.scalar_one_or_none()
+        if prior_signal is not None:
+            prior_comp_rows = (await db.execute(
+                select(ChartComponent.component_type, ChartComponent.component_value)
+                .where(ChartComponent.signal_id == prior_signal.signal_id)
+            )).all()
+            prior_components = {row[0]: row[1] for row in prior_comp_rows}
+    except Exception:
+        # Snapshot failures are tolerable; provenance just gets weaker
+        # for this transition. Continue with the main write.
+        prior_components = {}
+
+    # Step 2: the materialized write (the existing transaction). This
+    # MUST succeed for the user's chart to be visible to cohort
+    # discovery. Events are written in a SEPARATE transaction below
+    # so any event-write failure cannot poison the materialized layer.
+    materialized_signal_id: Optional[int] = None
+    try:
+        if prior_signal is not None:
             await db.execute(
-                delete(ChartComponent).where(ChartComponent.signal_id == signal.signal_id)
+                delete(ChartComponent).where(ChartComponent.signal_id == prior_signal.signal_id)
             )
-            signal.signal_hash = sig_hash
-            signal.created_at = now
-            signal.data_version = 1
+            prior_signal.signal_hash = sig_hash
+            prior_signal.created_at = now
+            prior_signal.data_version = 1
+            signal = prior_signal
         else:
             signal = ChartSignal(
                 user_id=user_id,
@@ -989,21 +1368,72 @@ async def _write_chart_signal(db: AsyncSession, user_id: str, blueprint_dict: di
             await db.flush()  # populate signal.signal_id
 
         for idx, (ctype, cval) in enumerate(components):
+            privacy_class, identity_relevance = _classify(ctype)
             db.add(ChartComponent(
                 signal_id=signal.signal_id,
                 component_type=ctype,
                 component_value=cval,
                 component_position=idx,
+                privacy_class=privacy_class,
+                identity_relevance=identity_relevance,
+                confidence_level=1.0,
+                calculation_version=1,
             ))
         await db.commit()
+        materialized_signal_id = signal.signal_id
     except Exception:
-        # Roll back the partial signal/component writes so the session is
-        # left clean for whatever runs next on this connection.
         try:
             await db.rollback()
         except Exception:
             pass
         raise
+
+    # Step 3: append-only event log, in its own try/commit so failures
+    # here cannot affect the materialized layer above. Codex P1.3 fix.
+    if materialized_signal_id is not None:
+        try:
+            for ctype, cval in components:
+                privacy_class, identity_relevance = _classify(ctype)
+                prev_value = prior_components.get(ctype)
+                if prev_value is None:
+                    event_type = 'created'
+                    reason = 'signup_or_recalc'
+                elif prev_value != cval:
+                    event_type = 'replaced'
+                    reason = 'birth_data_correction'
+                else:
+                    # Value unchanged across a re-save (idempotent rerun).
+                    # Still record the event so we have proof the chart
+                    # was confirmed at this moment.
+                    event_type = 'recalculated'
+                    reason = 'idempotent_resave'
+                db.add(ChartComponentEvent(
+                    user_id=user_id,
+                    signal_id=materialized_signal_id,
+                    event_type=event_type,
+                    component_type=ctype,
+                    component_value=cval,
+                    previous_value=prev_value,
+                    reason=reason,
+                    actor_type='system',
+                    calculation_version=1,
+                    privacy_class=privacy_class,
+                    identity_relevance=identity_relevance,
+                    confidence_level=1.0,
+                ))
+            await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            # Swallow: event layer failure is supplementary. The
+            # materialized signal is already durably persisted.
+            import logging as _evlog
+            _evlog.getLogger(__name__).warning(
+                f"chart_component_events write failed for user {user_id}; "
+                f"materialized chart_components is unaffected"
+            )
 
 
 async def get_blueprint(db: AsyncSession, user_id: str) -> Optional[dict]:
@@ -1745,6 +2175,224 @@ async def reset_surface_next_flags(db: AsyncSession, user_id: str) -> None:
     await db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Akashic Record foundation: consent helpers
+# ---------------------------------------------------------------------------
+# Read and write tiered consent grants. Code that gates behavior on
+# consent should ALWAYS go through get_user_consent_state(), never read
+# users.hive_consent or ConsentGrant rows directly. The helper handles
+# the legacy fallback so existing users keep working while the new
+# system rolls out.
+
+async def get_user_consent_state(
+    db: AsyncSession,
+    user_id: str,
+    scope: str,
+) -> bool:
+    """Resolve whether a user has currently-active consent for a scope.
+
+    Resolution order:
+      1. If a ConsentGrant row exists for (user_id, scope) with revoked_at IS NULL,
+         consent is True.
+      2. If revoked_at IS NOT NULL, consent is False (explicit revocation
+         wins over any legacy default).
+      3. If no row exists, fall back to the legacy users.hive_consent
+         boolean for the scopes that were historically gated by it
+         (anonymous_cohort_learning, anonymous_retrieval_training,
+         anonymous_product_analytics). Any other scope without an
+         explicit grant defaults to False.
+
+    This function is the single read path for consent decisions across
+    the app. The fallback exists so existing users continue to behave
+    exactly as they did pre-foundation; only when their consent is
+    formally captured (via the upcoming consent UI or the backfill
+    script) does the new path take over.
+    """
+    from sqlalchemy import select as sql_select, desc as sql_desc
+
+    if scope not in ALL_CONSENT_SCOPES:
+        # Unknown scope. Refuse rather than silently grant or revoke.
+        return False
+
+    # CRITICAL: legacy hive_consent=False ALWAYS wins for legacy-gated
+    # scopes, regardless of ConsentGrant state. Codex caught (May 2026
+    # pre-ship audit) that without this, after the backfill writes
+    # grants, a user who toggles hive_consent off via /users/profile
+    # would still have active grants and continue to see hive context.
+    # The user's opt-out has to be authoritative until the new consent
+    # UI ships and starts revoking grants on toggle.
+    legacy_gated_scopes = {
+        CONSENT_ANONYMOUS_COHORT_LEARNING,
+        CONSENT_ANONYMOUS_RETRIEVAL_TRAINING,
+        CONSENT_ANONYMOUS_PRODUCT_ANALYTICS,
+    }
+    if scope in legacy_gated_scopes:
+        user_row_legacy_check = (await db.execute(
+            sql_select(User).where(User.id == user_id)
+        )).scalar_one_or_none()
+        if user_row_legacy_check is None:
+            return False
+        if not bool(getattr(user_row_legacy_check, "hive_consent", False)):
+            # Hard veto. The user opted out; ConsentGrant rows do not
+            # override that until they're explicitly revoked.
+            return False
+
+    # Look for the most-recent grant for this (user, scope)
+    grant = (await db.execute(
+        sql_select(ConsentGrant)
+        .where(ConsentGrant.user_id == user_id, ConsentGrant.scope == scope)
+        .order_by(sql_desc(ConsentGrant.granted_at))
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if grant is not None:
+        return grant.revoked_at is None
+
+    # No grant exists. Legacy fallback for the cohort-family scopes:
+    # treat hive_consent=True as a positive signal. (We already returned
+    # False above if hive_consent=False, so this only fires for True.)
+    if scope in legacy_gated_scopes:
+        return True
+    # Private oracle use is implicit for any logged-in user (it's the
+    # core product). All other scopes default to False until granted.
+    if scope == CONSENT_PRIVATE_ORACLE_USE:
+        return True
+    return False
+
+
+async def grant_user_consent(
+    db: AsyncSession,
+    user_id: str,
+    scope: str,
+    *,
+    source_surface: Optional[str] = None,
+    policy_text_hash: Optional[str] = None,
+    data_classes_covered: Optional[list[str]] = None,
+    retention_class: Optional[str] = None,
+    withdrawal_effect: Optional[str] = None,
+    version: int = 1,
+) -> Optional[int]:
+    """Record a fresh consent grant. Returns the new ConsentGrant.id, or
+    None if the scope is unknown.
+
+    Idempotent in the sense that a second call with the same (user, scope,
+    version) is a no-op (UniqueConstraint on the table). To re-grant
+    after a revocation, bump the version. This preserves the full
+    grant history per user, which is what makes the consent record
+    legally defensible.
+    """
+    import json as _json
+
+    if scope not in ALL_CONSENT_SCOPES:
+        return None
+
+    grant = ConsentGrant(
+        user_id=user_id,
+        scope=scope,
+        version=version,
+        source_surface=source_surface,
+        policy_text_hash=policy_text_hash,
+        data_classes_covered=_json.dumps(data_classes_covered) if data_classes_covered else None,
+        retention_class=retention_class,
+        withdrawal_effect=withdrawal_effect,
+    )
+    db.add(grant)
+    try:
+        await db.commit()
+    except Exception:
+        # If the unique constraint fires, that's the idempotent case;
+        # roll back and treat as success.
+        await db.rollback()
+        return None
+    return grant.id
+
+
+async def revoke_user_consent(
+    db: AsyncSession,
+    user_id: str,
+    scope: str,
+) -> bool:
+    """Mark all active grants for (user, scope) as revoked. Returns True
+    if any rows were updated, False otherwise.
+
+    Soft revocation: rows stay in the table with revoked_at populated, so
+    the historical record is preserved. Code reading via
+    get_user_consent_state() will see consent as False after this fires.
+    """
+    from sqlalchemy import update as sql_update, select as sql_select
+    from datetime import datetime as _dt
+
+    if scope not in ALL_CONSENT_SCOPES:
+        return False
+
+    now = _dt.utcnow()
+    result = await db.execute(
+        sql_update(ConsentGrant)
+        .where(
+            ConsentGrant.user_id == user_id,
+            ConsentGrant.scope == scope,
+            ConsentGrant.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    await db.commit()
+    return (result.rowcount or 0) > 0
+
+
+async def backfill_legacy_consent(db: AsyncSession) -> dict:
+    """One-shot helper that creates ConsentGrant rows for every existing
+    user, mirroring their legacy users.hive_consent boolean. Idempotent:
+    re-runs are no-ops thanks to the unique constraint.
+
+    Maps legacy True -> grants for the three cohort-family scopes:
+      - anonymous_cohort_learning
+      - anonymous_retrieval_training
+      - anonymous_product_analytics
+    Plus private_oracle_use + personalization_memory which are core to
+    the product they signed up for.
+
+    Legacy False -> grants ONLY for private_oracle_use + personalization_memory.
+    The user opted out of cohort participation, so we honor that.
+
+    Returns a small dict {users_processed, grants_inserted} so the admin
+    endpoint that triggers it can report progress.
+    """
+    from sqlalchemy import select as sql_select
+
+    user_rows = (await db.execute(sql_select(User))).scalars().all()
+    users_processed = 0
+    grants_inserted = 0
+    for u in user_rows:
+        users_processed += 1
+        legacy_consent = bool(getattr(u, "hive_consent", False))
+        # Always grant the core product scopes
+        core_scopes = [
+            CONSENT_PRIVATE_ORACLE_USE,
+            CONSENT_PERSONALIZATION_MEMORY,
+        ]
+        # If legacy True, also grant the cohort family
+        if legacy_consent:
+            core_scopes.extend([
+                CONSENT_ANONYMOUS_COHORT_LEARNING,
+                CONSENT_ANONYMOUS_RETRIEVAL_TRAINING,
+                CONSENT_ANONYMOUS_PRODUCT_ANALYTICS,
+            ])
+        for scope in core_scopes:
+            new_id = await grant_user_consent(
+                db, u.id, scope,
+                source_surface="legacy_backfill",
+                retention_class="aggregate_indefinite" if scope.startswith("anonymous_") else "user_lifetime",
+                withdrawal_effect="anonymize_only" if scope.startswith("anonymous_") else "delete_raw",
+                version=1,
+            )
+            if new_id is not None:
+                grants_inserted += 1
+    return {
+        "users_processed": users_processed,
+        "grants_inserted": grants_inserted,
+    }
+
+
 async def delete_all_user_memories(db: AsyncSession, user_id: str) -> int:
     """Hard-delete every memory row for a user. Returns the count deleted.
 
@@ -1824,17 +2472,25 @@ async def get_user_hive_context(
         "components": [],
         "correlations": [],
         "themes": [],
+        "wider_field_themes": [],
         "resonance": None,
     }
 
     # First gate: hive_consent. We only enrich the Oracle's prompt with
     # collective signal for users who have explicitly opted into the
     # hive. Non-consenting users get the un-augmented experience, which
-    # is what they signed up for.
+    # is what they signed up for. Reads through get_user_consent_state
+    # which honors both the new ConsentGrant rows and the legacy
+    # users.hive_consent boolean for users who haven't been migrated yet.
     user_row = (await db.execute(
         sql_select(User).where(User.id == user_id)
     )).scalar_one_or_none()
-    if not user_row or not getattr(user_row, "hive_consent", False):
+    if not user_row:
+        return out
+    cohort_consent = await get_user_consent_state(
+        db, user_id, CONSENT_ANONYMOUS_COHORT_LEARNING,
+    )
+    if not cohort_consent:
         return out
 
     # 1. User's chart components. Joined chart_signals -> chart_components
@@ -1889,23 +2545,102 @@ async def get_user_hive_context(
             if len(out["correlations"]) >= max_correlations:
                 break
 
-    # 3. Top emerging themes. For now, surface highest-confidence themes
-    #    network-wide; once we have richer cohort-membership we can
-    #    filter to themes whose cohort the user actually belongs to.
-    #    Capped tight so the prompt doesn't bloat.
-    theme_rows = (await db.execute(
-        sql_select(PatternTheme)
-        .order_by(PatternTheme.emergence_confidence.desc())
-        .limit(max_themes)
-    )).scalars().all()
-    out["themes"] = [
-        {
-            "content": (t.theme_content or "")[:280],
-            "confidence": round(float(t.emergence_confidence or 0.0), 3),
-        }
-        for t in theme_rows
-        if t.theme_content
-    ]
+    # 3. Top emerging themes, COHORT-MATCHED (Akashic Record foundation,
+    #    May 2026). Codex caught the prior version's conceptual bug:
+    #    ordering themes by network-wide emergence_confidence let the
+    #    Oracle speak from "the field's hottest topics" rather than from
+    #    "themes in cohorts the user actually belongs to." That broke
+    #    the field-knowledge contract.
+    #
+    #    The fix: find which cohorts the user is a member of by matching
+    #    their components against pattern_cohorts.cohort_definition
+    #    filters, then surface themes only from those cohorts. Falls back
+    #    to a clearly-labeled wider_field_themes bucket when a user's
+    #    cohorts haven't accumulated themes yet, so we don't lose all
+    #    field signal during the early-data phase. The renderer in
+    #    chat.py distinguishes the two so the Oracle knows which is which.
+    import json as _json
+    user_cohort_ids: set[int] = set()
+    try:
+        # Order by member_count DESC so the most populated cohorts are
+        # checked first. Codex caught that an unordered limit could
+        # silently miss the user's actual cohorts at scale.
+        cohort_rows = (await db.execute(
+            sql_select(PatternCohort)
+            .order_by(PatternCohort.member_count.desc())
+            .limit(2000)
+        )).scalars().all()
+        for cohort in cohort_rows:
+            if not cohort.cohort_definition:
+                continue
+            try:
+                definition = _json.loads(cohort.cohort_definition)
+            except Exception:
+                continue
+            filters = definition.get('filters') if isinstance(definition, dict) else None
+            if not filters or not isinstance(filters, list):
+                continue
+            # User belongs to the cohort iff every filter in the definition
+            # matches one of their components. Filter shape from the cohort
+            # discovery job: {"type": "...", "value": "..."}.
+            user_match = True
+            for f in filters:
+                if not isinstance(f, dict):
+                    user_match = False
+                    break
+                ftype = f.get('type')
+                fval = f.get('value')
+                if not ftype or not fval:
+                    user_match = False
+                    break
+                if (ftype, fval) not in {(t, v) for t, v in user_components}:
+                    user_match = False
+                    break
+            if user_match:
+                user_cohort_ids.add(cohort.cohort_id)
+    except Exception:
+        # If cohort matching fails for any reason, fall through with an
+        # empty user_cohort_ids set; the wider-field fallback covers it.
+        user_cohort_ids = set()
+
+    cohort_themes: list = []
+    if user_cohort_ids:
+        cohort_theme_rows = (await db.execute(
+            sql_select(PatternTheme)
+            .where(PatternTheme.cohort_id.in_(user_cohort_ids))
+            .order_by(PatternTheme.emergence_confidence.desc())
+            .limit(max_themes)
+        )).scalars().all()
+        cohort_themes = [
+            {
+                "content": (t.theme_content or "")[:280],
+                "confidence": round(float(t.emergence_confidence or 0.0), 3),
+                "k_value": int(t.emergence_count or 0),
+                "scope": "your_cohort",
+            }
+            for t in cohort_theme_rows if t.theme_content
+        ]
+    out["themes"] = cohort_themes
+
+    # Wider-field fallback: only populated when the cohort-matched
+    # themes are empty AND we have at least one user_component to anchor
+    # the user's relationship to the field. The renderer labels this
+    # differently so the Oracle knows it's wider-field, not your-cohort.
+    if not cohort_themes:
+        wider_theme_rows = (await db.execute(
+            sql_select(PatternTheme)
+            .order_by(PatternTheme.emergence_confidence.desc())
+            .limit(max_themes)
+        )).scalars().all()
+        out["wider_field_themes"] = [
+            {
+                "content": (t.theme_content or "")[:280],
+                "confidence": round(float(t.emergence_confidence or 0.0), 3),
+                "k_value": int(t.emergence_count or 0),
+                "scope": "wider_field",
+            }
+            for t in wider_theme_rows if t.theme_content
+        ]
 
     # 4. The user's own resonance score if Phase 3 has computed it.
     res_row = (await db.execute(
