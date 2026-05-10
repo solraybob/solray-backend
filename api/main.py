@@ -3889,6 +3889,7 @@ async def chat_endpoint(
                 oracle_reply=response or "",
                 model_used=LAST_MODEL_USED.get(),
                 oracle_prompt_version=get_oracle_prompt_version(),
+                blueprint=blueprint,
             ))
         except Exception as _audit_err:
             logger.warning(f"[audit] schedule failed for user {user_id}: {_audit_err}")
