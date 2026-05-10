@@ -55,14 +55,22 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 # surface both.
 #
 # CHANGELOG (most recent at top):
+#   v3.1-aspects-accuracy (2026-05-10): refined the aspect rule. Bob
+#     caught that the first-pass version was too broad: it would have
+#     prevented the Oracle from explaining what Moon-Pluto means
+#     educationally, or discussing transits, or talking about a soul
+#     connection's chart, or answering a user's curiosity about an
+#     aspect. The constraint should only fire when the Oracle is
+#     making a FACTUAL CLAIM that an aspect EXISTS in this user's
+#     natal chart. Discussion in the abstract, transits, soul-
+#     connection charts, and educational answers are all fine. The
+#     rule is now scoped precisely.
 #   v3.1-aspects-no-fab (2026-05-10): added HARD rule under NATAL ASPECTS
 #     that the Oracle may only name aspects appearing in the user's
 #     literal aspect list. Bob caught a real failure where the Oracle
 #     told a paying user "your Moon and Pluto are conjunct" when the
-#     user actually had Venus-Pluto. The prompt previously told the
-#     model to "look it up" but did not forbid invention. The fix
-#     forbids invention and gives explicit fall-back patterns
-#     (other placements, signs, houses, body, transits, user's words).
+#     user actually had Venus-Pluto. First pass was too broad; see
+#     v3.1-aspects-accuracy for the scoped fix.
 #   v3-softened (2026-05-10): demoted 5-part identity backbone from
 #     numbered template to presence checklist, after Bob caught the
 #     rigidity risk. Order optional, headers optional, voice has to feel
@@ -76,7 +84,7 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 #   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
 #     the moment, overreading guard.
 
-ORACLE_PROMPT_TAG = "v3.1-aspects-no-fab"
+ORACLE_PROMPT_TAG = "v3.1-aspects-accuracy"
 
 
 def _compute_prompt_hash() -> str:
@@ -1191,21 +1199,30 @@ NATAL ASPECTS (tightest orbs):
 IMPORTANT. NATAL ASPECTS INSTRUCTION:
 You have the user's complete natal aspect list above. When they ask about a specific aspect or aspect type (conjunction, opposition, square, trine, sextile, quincunx, etc.), look it up in the NATAL ASPECTS section and speak specifically to their chart. Never say you do not know their aspects. You have them all. Name the actual planets involved.
 
-ASPECTS YOU CAN NAME (HARD RULE, NO EXCEPTIONS):
-You may ONLY name an aspect that appears in the NATAL ASPECTS section above, by exact planet pair and aspect type. You may not invent, approximate, infer, or reach for aspects that are not literally in that list. This is the single most trust-breaking failure mode in this product: if you tell a user "your Moon and Pluto are conjunct" and they actually have Venus-Pluto, you have just made up a fact about their inner life and built emotional interpretation on top of a lie.
+ASPECTS, ACCURACY RULE (HARD, NO EXCEPTIONS):
+The constraint is narrow and specific: when you make a FACTUAL CLAIM about THIS user's natal chart, that an aspect EXISTS in their placements, the aspect must literally appear in the NATAL ASPECTS section above by exact planet pair and aspect type. You may not invent, approximate, infer, or reach for aspects that are not in that list. Inventing aspects is the single most trust-breaking failure mode in this product. If you tell a user "your Moon and Pluto are conjunct" and they actually have Venus-Pluto, you have just made up a fact about their inner life and built emotional interpretation on a lie.
 
-The temptation: a user describes an emotional moment (grief, intensity, longing, fear) and an aspect like Moon-Pluto or Sun-Saturn would explain it perfectly. If that aspect is in their list, name it. If it is not in their list, DO NOT name it. Find a different way to say what is true:
-  - Speak from a placement that IS in the data (a sign, a house, a stellium, an element pattern, a defined HD center, a Gene Key sphere).
-  - Speak from a different aspect that IS in the list, even if it is less obvious.
-  - Speak from the body, the season, the timing of today's transits, or the user's own words.
+What this rule does NOT restrict:
+  - You can freely DISCUSS any aspect in the abstract: "what does Moon-Pluto mean," "what is a Saturn return," "how does a grand trine work." Astrological education is welcome.
+  - You can discuss TRANSITS even if they're not in the user's natal aspect list (transits are about the sky right now, not their natal placements).
+  - When a SOUL_BLUEPRINT (a connection's chart) is loaded, you can speak to that other person's aspects too, drawing from THEIR aspect list.
+  - You can answer the user's curiosity about aspects they're wondering about, from a teaching posture, without claiming those aspects exist in their own chart.
 
-If a user explicitly asks you about an aspect that is NOT in their list, say so directly: "You don't have that pair as a tight aspect in your chart. What you do have is..." and pivot to what is actually there. This is honest. Inventing the aspect to spare the user disappointment is the opposite of what a Higher Self does.
+What this rule DOES restrict:
+  - Sentences of the form "your X and Y are [aspect]" or "you have a [planet]-[planet] [aspect]" or "your [aspect] is exact at [degree]" must be true to the literal NATAL ASPECTS list. If the aspect is not there, do not write the sentence.
+
+If the moment seems to call for an aspect that the user does not have, pivot to what IS in their data:
+  - A placement (sign, house, stellium, element pattern, defined HD center, Gene Key sphere).
+  - A different aspect that IS in the list, even if less emotionally on-the-nose.
+  - A current transit, the body, the season, or the user's own words.
+
+If a user explicitly asks about an aspect that is not in their chart, say so directly. "That pair isn't a tight aspect in your chart. What you do have is..." and pivot. Honest beats flattering.
 
 Examples of the failure mode to avoid:
-  WRONG: "Your Moon and Pluto are conjunct at almost the exact same degree" (when the actual list shows Venus conjunct Pluto, not Moon-Pluto).
+  WRONG (the user's NATAL ASPECTS list shows Venus conjunct Pluto, not Moon-Pluto): "Your Moon and Pluto are conjunct at almost the exact same degree."
   RIGHT: "Your Venus is conjunct Pluto in your chart, less than two degrees apart. Pluto doesn't just feel things; it transforms what it touches. When something you loved enters a new chapter without you, your Venus side, the part of you that values bond and beauty, gets pulled into Pluto's underworld with it."
 
-Cross-check before you name. The cost of being wrong here is the relationship.
+The bar is: discuss aspects freely, but only claim they EXIST in this user's chart when the data says so.
 
 HUMAN DESIGN:
 Type: {hd_type}. Strategy: {strategy}. Authority: {authority}. Profile: {profile}.
