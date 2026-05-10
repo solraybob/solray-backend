@@ -42,7 +42,7 @@ log = logging.getLogger("solray.audit")
 # subset of the user's actual chart (aspects, placements, HD, GK,
 # numerology) so it can verify chart-fact claims against the data.
 # Adds the FACT_* family of violation tags.
-AUDIT_PROMPT_VERSION = "audit-v2-chart-verify"
+AUDIT_PROMPT_VERSION = "audit-v2.1-codex-followups"
 
 # The set of violation tags GPT-4o is allowed to use. Kept short on purpose:
 # every tag must map to a concrete voice rule the Oracle prompt establishes,
@@ -77,8 +77,10 @@ KNOWN_VIOLATION_TAGS = [
     "FACT_WRONG_HD_TYPE",           # claimed wrong HD type
     "FACT_WRONG_HD_AUTHORITY",      # claimed wrong HD authority
     "FACT_WRONG_HD_PROFILE",        # claimed wrong HD profile
+    "FACT_WRONG_HD_CENTER_OR_CHANNEL",  # claimed wrong defined center or channel
     "FACT_WRONG_GK_SPHERE",         # claimed wrong gate for any GK sphere
     "FACT_WRONG_NUMEROLOGY",        # claimed wrong life path or numerology number
+    "FACT_UNVERIFIABLE_PRECISION",  # claimed degree-precision (e.g. "29 degrees", "early Libra", "exact") that CHART FACTS does not carry
     "FACT_FABRICATED_SPECIFIC",     # any other specific claim about the chart that the data doesn't support
 ]
 
@@ -86,7 +88,9 @@ _AUDIT_PROMPT = """You are the silent auditor for Solray's Oracle. Your job is t
 
 CHART-FACT VERIFICATION IS THE HIGHEST-STAKES PART OF YOUR JOB. The single most trust-breaking failure mode in this product is the Oracle inventing facts about a user's chart. You will be given a CHART FACTS block below containing the user's literal placements, aspects, Human Design configuration, Gene Keys spheres, and numerology. Cross-check every concrete claim in the reply against this block. If the reply says "your Moon-Pluto conjunction" and Moon-Pluto is not in the natal aspect list, flag FACT_ASPECT_NOT_IN_CHART. If the reply says "your Sacral authority" and the actual authority is Emotional, flag FACT_WRONG_HD_AUTHORITY. Be precise. The same rule applies even when the reply quotes something the Oracle herself said in an earlier turn (the conversation history is not authoritative; the CHART FACTS block is).
 
-When CHART FACTS is empty or absent (typically a group chat where the question of whose chart is ambiguous), skip chart-fact verification and only audit the voice rules.
+MISSING DATA IS NOT CONTRADICTION (important). Only flag a chart fact when it CONTRADICTS what the CHART FACTS block says. If the block does not contain a particular precision (e.g. degree, orb, exact minute) and the reply makes a precision claim ("your Sun is at 29 degrees Scorpio", "early Libra", "exact at less than a degree"), the auditor cannot verify it from the data provided. In that case flag FACT_UNVERIFIABLE_PRECISION (a milder violation than a confirmed contradiction) rather than treating it as a wrong claim. If the reply says "your Mars is in Cancer" and the CHART FACTS block says "Mars: Cancer", that is correct even if the reply omits the house. Absence of detail is not falsity.
+
+When CHART FACTS is empty or absent (typically a group chat where the question of whose chart is ambiguous), skip chart-fact verification entirely and only audit the voice rules.
 
 THE ORACLE'S VOICE RULES (compressed):
 1. Warm, precise, present. Speaks as the user's higher self, not as an AI assistant.
@@ -252,7 +256,11 @@ def _format_chart_facts_for_audit(blueprint: Optional[dict]) -> str:
                 if isinstance(c, (list, tuple)) and len(c) == 2:
                     ch_strs.append(f"{c[0]}-{c[1]}")
                 elif isinstance(c, dict):
-                    a_, b_ = c.get("gate1") or c.get("a"), c.get("gate2") or c.get("b")
+                    # The HD engine emits `gate_a` / `gate_b` (Codex caught
+                    # this in audit-v2 review; previous code only checked
+                    # gate1/gate2 and a/b so channels silently dropped).
+                    a_ = c.get("gate_a") or c.get("gate1") or c.get("a")
+                    b_ = c.get("gate_b") or c.get("gate2") or c.get("b")
                     if a_ and b_:
                         ch_strs.append(f"{a_}-{b_}")
                 else:

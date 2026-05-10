@@ -93,7 +93,7 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 #   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
 #     the moment, overreading guard.
 
-ORACLE_PROMPT_TAG = "v3.2-aspects-crossturn"
+ORACLE_PROMPT_TAG = "v3.3-codex-followups"
 
 
 def _compute_prompt_hash() -> str:
@@ -1132,7 +1132,7 @@ Houses are where the energy lives in her actual life, not abstractions. The char
 
 When a question lands in a specific life-domain, find which of HER houses is active for it. If she asks about work, you go to 6th and 10th and look at what's there. If she asks about a relationship, you go to 5th, 7th, 8th. Name the house by number AND by life-domain. "Your 5th house" alone is opaque; "your 5th, the place creative expression and romance live in your chart" lands. Combine: "Your Sun is in your 5th, which is why your work has to be expressive to feel real, not just productive."
 
-Aspects matter too. Tight aspects (small orbs) are louder. When you see a tight aspect involved in what she's asking about, name it. "Your Moon and Pluto are conjunct, less than two degrees apart. That's why nothing emotional ever stays surface for you."
+Aspects matter too. Tight aspects (small orbs) are louder. When you see a tight aspect involved in what she's asking about, name it, but only after verifying it appears in the NATAL ASPECTS list above. The right shape is "your <PlanetA>-<PlanetB> <aspect-type> at <orb>° is loud here, that's why <behavioral observation>" with the planets and orb taken literally from her actual aspect list, not chosen to fit the moment.
 
 DEPTH AND DENSITY:
 Match the depth of the response to the depth of the question. Never pad. Never explain more than what serves the person in this moment. The unsaid is not missing. It is held for when they are ready. Always stay under 1200 words so the thought completes and never truncates mid-sentence. Finish every response with a complete final sentence; never leave a thought hanging.
@@ -1762,9 +1762,14 @@ def _format_natal_aspects(blueprint: dict) -> str:
             return ""
         return f"{sign} {_fmt_dms(deg)}"
 
-    # Sort by tightest orb so the most exact aspects come first
+    # Sort by tightest orb so the most exact aspects come first.
+    # Cap raised from 30 to 200 after Codex audit (May 2026) caught
+    # that the previous cap was inconsistent with the prompt rule
+    # "you have them all": a real aspect outside the tightest 30 could
+    # be falsely "corrected" away by the v3.2 cross-turn rule. 200 is
+    # safely above the count of aspects any standard chart produces.
     sorted_aspects = sorted(aspects, key=lambda a: float(a.get('orb', 99)))
-    for a in sorted_aspects[:30]:
+    for a in sorted_aspects[:200]:
         sym = aspect_symbols.get(a.get('aspect', ''), a.get('aspect', '?'))
         planet1 = a.get('planet1', '?')
         planet2 = a.get('planet2', '?')
