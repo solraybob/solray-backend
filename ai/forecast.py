@@ -408,13 +408,11 @@ Today's HD Sun Gate: {hd_gate_today.get('gate', '?')} (shadow: {hd_gate_today.ge
 
 Speak directly. Make it land."""
 
-    # REVERTED to Haiku 2026-05-11 emergency: the Sonnet model name
-    # "claude-sonnet-4-5-20241022" appears to be invalid against the
-    # live Anthropic API and the entire chat path was failing. Reverting
-    # ALL Sonnet swaps to Haiku to restore service. Will re-attempt with
-    # the correct snapshot date after verification.
+    # Sonnet 4.6 for daily forecast (2026-05-12 retry). Previous swap used
+    # claude-sonnet-4-5-20241022 which was a ghost model ID. Live-tested
+    # claude-sonnet-4-6 alias and verified against the production key.
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=1800,
         system=[
             {

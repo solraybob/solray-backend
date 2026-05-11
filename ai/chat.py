@@ -40,7 +40,7 @@ LAST_MODEL_USED: contextvars.ContextVar[str] = contextvars.ContextVar(
 # top-leverage move from the Codex+Gemini roundtable; the cost increase
 # is well within budget after the OpenClaw cron cleanup. Caching keeps
 # Sonnet input cost bounded within active sessions.
-MODEL_CLAUDE_SONNET = "claude-sonnet-4-5-20241022"
+MODEL_CLAUDE_SONNET = "claude-sonnet-4-6"
 MODEL_CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
 MODEL_GPT4O_BREAKGLASS = "gpt-4o-via-break-glass"
 MODEL_HONEST_FALLBACK = "honest-fallback-text"
@@ -543,9 +543,15 @@ Rules:
     recent_context = context_messages[-8:] if len(context_messages) > 8 else context_messages
 
     try:
+        # 2026-05-12: advisor model name fix. The old string
+        # "claude-sonnet-4-5-20241022" mashed Sonnet 4.5's version with
+        # Sonnet 3.5's release date and was rejected by the Anthropic API.
+        # The except below caught the error silently, so this advisor has
+        # been returning empty insights for every synthesis question. Now
+        # using the latest Sonnet 4.6 alias, verified live.
         response = _call_claude_with_retry(
             client,
-            model="claude-sonnet-4-5-20241022",
+            model="claude-sonnet-4-6",
             max_tokens=250,
             system=advisor_prompt,
             messages=recent_context + [{"role": "user", "content": f"Blueprint summary: {blueprint_summary}\n\nQuestion requiring synthesis: {question}"}],
@@ -2278,7 +2284,7 @@ Begin."""
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_HAIKU,
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=300,
             system=system,
             messages=greeting_messages,
@@ -2286,7 +2292,7 @@ Begin."""
         # _sanitize_output is defined below; using it here is fine because the
         # function is module-level and Python resolves names at call time.
         # It runs the frame-leak guard plus em-dash strip in the right order.
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, greeting_messages, max_tokens=300)
@@ -2569,12 +2575,12 @@ def group_chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_HAIKU,
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=700,
             system=system,
             messages=messages,
         )
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, messages, max_tokens=700)
@@ -2933,13 +2939,13 @@ def chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_HAIKU,
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=1600,
             system=final_system,
             messages=messages,
         )
         raw_text = response.content[0].text.strip()
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(raw_text)
     except OracleUnavailable:
         # Three retries to Claude exhausted. Try the GPT-4o break-glass

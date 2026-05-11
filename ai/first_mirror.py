@@ -145,9 +145,10 @@ Return ONLY a JSON object:
     client = _get_client()
     log.info(f"[first_mirror] generating for {name} (sun {sun_sign}, rising {rising})")
 
-    # REVERTED to Haiku 2026-05-11 emergency: see forecast.py note.
+    # Sonnet 4.6 for First Mirror (2026-05-12 retry, see forecast.py note).
+    # First impression matters most; Sonnet 4.6 lands the surprise insight.
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )

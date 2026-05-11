@@ -122,9 +122,9 @@ Output ONLY the JSON. No preface, no closing remarks. Strict JSON.
 """
 
     try:
-        # REVERTED to Haiku 2026-05-12 emergency: see forecast.py note.
+        # Sonnet 4.6 for soul compatibility (2026-05-12 retry, see forecast.py note).
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )

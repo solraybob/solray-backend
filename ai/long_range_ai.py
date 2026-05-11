@@ -82,10 +82,9 @@ Active long-range transits:
 
 Generate a 2-sentence summary for each transit. Return JSON array."""
 
-    # REVERTED to Haiku 2026-05-11 emergency: see forecast.py note. Sonnet
-    # snapshot date in this commit was wrong against the live API.
+    # Sonnet 4.6 for long-range AI (2026-05-12 retry, see forecast.py note).
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=1200,
         system=[
             {
