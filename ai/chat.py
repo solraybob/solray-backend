@@ -63,6 +63,22 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 # surface both.
 #
 # CHANGELOG (most recent at top):
+#   v3.8-memory-and-sonnet (2026-05-12): two material shifts in the same
+#     audit bucket would have polluted the dashboard, so bumping the tag
+#     to cleanly separate the new state from the old. Two changes carried:
+#     (1) Sonnet 4.6 confirmed live as the chat voice across all 8 user-
+#     facing call sites (after the v3.7 ship hit a ghost model ID and
+#     was emergency-reverted, then re-shipped with the correct
+#     "claude-sonnet-4-6" alias). Includes the previously-broken advisor
+#     pattern, now actually delivering synthesis insight for the first
+#     time. (2) Event-grounded memory retrieval wired into /chat: the
+#     NarrativeEvent substrate created in the Akashic Foundation work
+#     last night is now read on every reply (up to 3 past moments scored
+#     against the current message) and written on every turn (one row per
+#     user message, one per Oracle reply). The Oracle now recognizes the
+#     user across days and weeks, not just within a session. No prompt
+#     rule changes; Sonnet-aware calibration will be data-driven after
+#     24-48h of audit observation.
 #   v3.7-sonnet-voice (2026-05-11): Sonnet 4.5 is now the primary voice for
 #     all paid chat replies. The three user-facing call sites (chat(),
 #     _generate_morning_greeting, group_chat) all run on Sonnet. Synthesis
@@ -158,7 +174,7 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 #   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
 #     the moment, overreading guard.
 
-ORACLE_PROMPT_TAG = "v3.7-sonnet-voice"
+ORACLE_PROMPT_TAG = "v3.8-memory-and-sonnet"
 
 
 def _compute_prompt_hash() -> str:
