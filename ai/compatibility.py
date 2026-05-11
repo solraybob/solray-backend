@@ -122,11 +122,9 @@ Output ONLY the JSON. No preface, no closing remarks. Strict JSON.
 """
 
     try:
-        # Sonnet for soul compatibility (2026-05-11): the reading two people
-        # see when they connect via Souls. Emotionally weighted, low volume,
-        # Sonnet writes a deeper read of resonance and friction patterns.
+        # REVERTED to Haiku 2026-05-12 emergency: see forecast.py note.
         response = client.messages.create(
-            model="claude-sonnet-4-5-20241022",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )

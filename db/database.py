@@ -1871,6 +1871,218 @@ async def add_user_memory(
     return memory
 
 
+# ---------------------------------------------------------------------------
+# NarrativeEvent helpers — the lived-history substrate Codex+Gemini flagged
+# ---------------------------------------------------------------------------
+# UserMemory is distilled summary. NarrativeEvent is raw remembered moments
+# with exact user language. The chat handler writes one row per user message
+# and one per Oracle reply (fire-and-forget so latency is unaffected), then
+# retrieves the most relevant past moments before each reply to feed into
+# the Oracle's prompt. This is the substrate for "the unexpected true thing"
+# Gemini called the unified one-move toward 100% perceived realism.
+#
+# Retrieval is intentionally conservative: zero to three moments per turn,
+# only if they clear a relevance threshold, sensitivity-gated, and with a
+# "recently surfaced" penalty so the Oracle never repeats herself.
+
+# Classifier rules for content classification at write time. These are
+# coarse heuristics; the audit pipeline can refine later.
+_INTIMATE_KEYWORDS = ('sex', 'sexuality', 'partner', 'lover', 'desire', 'erotic',
+                      'married', 'divorce', 'affair', 'intimacy')
+_HEALTH_KEYWORDS = ('depress', 'anxiety', 'panic', 'therapy', 'therapist', 'medication',
+                    'diagnos', 'disorder', 'addiction', 'addict', 'sober', 'overdose',
+                    'illness', 'cancer', 'chronic', 'pain', 'insomnia')
+_CRISIS_KEYWORDS = ('suicid', 'kill myself', 'end my life', 'self-harm', 'cutting',
+                    'overdose')
+_BIRTH_DATA_KEYWORDS = ('born at', 'birth time', 'born on', 'birth chart')
+
+def _classify_narrative_sensitivity(content: str) -> str:
+    """Coarse sensitivity classifier for NarrativeEvent at write time."""
+    s = (content or '').lower()
+    if any(k in s for k in _CRISIS_KEYWORDS):
+        return 'health_adjacent'  # crisis content is health-sensitive
+    if any(k in s for k in _HEALTH_KEYWORDS):
+        return 'health_adjacent'
+    if any(k in s for k in _INTIMATE_KEYWORDS):
+        return 'intimate'
+    if any(k in s for k in _BIRTH_DATA_KEYWORDS):
+        return 'birth_data'
+    return 'personal'  # default
+
+
+async def add_narrative_event(
+    db: AsyncSession,
+    user_id: str,
+    role: str,
+    content: str,
+    chat_session_id: Optional[str] = None,
+    origin_surface: str = 'chat',
+    extraction_model: Optional[str] = None,
+    extraction_prompt_version: Optional[str] = None,
+) -> Optional['NarrativeEvent']:
+    """Write one NarrativeEvent row. Defaults to private audience.
+
+    Fail-soft: if anything goes wrong, log and return None rather than break
+    the chat path. The Oracle's reply is more important than the event log.
+    """
+    import logging
+    log = logging.getLogger('solray.narrative')
+    try:
+        text = (content or '').strip()
+        if not text:
+            return None
+        # Cap content length so a single huge message cannot blow up the row.
+        # 4000 chars covers any normal turn; longer is almost always copy-paste
+        # spam or a debug dump.
+        if len(text) > 4000:
+            text = text[:4000]
+        sensitivity = _classify_narrative_sensitivity(text)
+        event = NarrativeEvent(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+            role=role,
+            content=text,
+            audience_class='private',  # always start private; promotion is a separate op
+            sensitivity_class=sensitivity,
+            origin_surface=origin_surface,
+            extraction_model=extraction_model,
+            extraction_prompt_version=extraction_prompt_version,
+        )
+        db.add(event)
+        await db.commit()
+        return event
+    except Exception as e:
+        log.warning(f'[narrative] add_narrative_event failed for user {user_id}: {e}')
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+# Stopwords for the lightweight token-overlap scorer below. We are not pulling
+# in NLTK or running embeddings for a v1; a simple token-overlap baseline
+# is enough to surface "we have talked about this before" moments.
+_NARRATIVE_STOPWORDS = frozenset([
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'do', 'does',
+    'for', 'from', 'had', 'has', 'have', 'he', 'her', 'his', 'i', 'in', 'is', 'it',
+    'its', 'just', 'me', 'my', 'no', 'not', 'now', 'of', 'on', 'or', 'so', 'than',
+    'that', 'the', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'to',
+    'too', 'very', 'was', 'we', 'were', 'what', 'when', 'where', 'who', 'why',
+    'will', 'with', 'would', 'you', 'your', 'yours', 'about', 'if', 'how',
+])
+
+def _narrative_tokens(text: str) -> set:
+    """Cheap content-word tokens for similarity scoring."""
+    import re
+    toks = re.findall(r"[a-z]{3,}", (text or '').lower())
+    return {t for t in toks if t not in _NARRATIVE_STOPWORDS}
+
+
+async def retrieve_relevant_narrative_events(
+    db: AsyncSession,
+    user_id: str,
+    current_message: str,
+    max_results: int = 3,
+    min_relevance: float = 0.15,
+    skip_session_id: Optional[str] = None,
+    pool_size: int = 200,
+    recency_half_life_days: float = 14.0,
+) -> list['NarrativeEvent']:
+    """Score this user's past NarrativeEvents against the current message
+    and return the top max_results that clear min_relevance.
+
+    Scoring (Codex's spec, simplified for v1):
+      - Jaccard token overlap on content words (semantic similarity proxy)
+      - Recency decay with half-life of `recency_half_life_days`
+      - Sensitivity gate: never surface crisis-adjacent or intimate
+        content unless current message is in the same emotional register
+      - Skip current session (we want CROSS-session continuity, not echo)
+      - Cap at pool_size most recent for query speed
+
+    Future: when we have real embeddings, swap the Jaccard step for vector
+    similarity. The rest of the scoring stays the same.
+
+    Returns 0 to max_results events. May return empty if nothing clears
+    the threshold (most turns will get zero, which is correct).
+    """
+    import logging
+    from math import exp
+    log = logging.getLogger('solray.narrative')
+    try:
+        if not current_message or not current_message.strip():
+            return []
+
+        # Pull the user's recent narrative events; bound the pool so this
+        # query stays fast even for power users with thousands of rows.
+        q = (
+            select(NarrativeEvent)
+            .where(NarrativeEvent.user_id == user_id)
+            .where(NarrativeEvent.role == 'user')  # match against what THEY said before
+            .order_by(NarrativeEvent.created_at.desc())
+            .limit(pool_size)
+        )
+        if skip_session_id:
+            q = q.where(NarrativeEvent.chat_session_id != skip_session_id)
+        result = await db.execute(q)
+        candidates = list(result.scalars().all())
+        if not candidates:
+            return []
+
+        current_tokens = _narrative_tokens(current_message)
+        if not current_tokens:
+            return []
+
+        # Crisis/intimate gate: only consider surfacing intimate or
+        # health-adjacent past content if the CURRENT message is in the
+        # same register, otherwise it reads as the Oracle dredging up
+        # unrelated heavy material.
+        current_msg_lower = current_message.lower()
+        current_is_intimate = any(k in current_msg_lower for k in _INTIMATE_KEYWORDS)
+        current_is_health = any(k in current_msg_lower for k in (_HEALTH_KEYWORDS + _CRISIS_KEYWORDS))
+
+        from datetime import datetime as _dt
+        now = _dt.utcnow()
+        scored = []
+        for ev in candidates:
+            # Sensitivity gate
+            if ev.sensitivity_class == 'intimate' and not current_is_intimate:
+                continue
+            if ev.sensitivity_class == 'health_adjacent' and not current_is_health:
+                continue
+
+            # Jaccard similarity on content tokens
+            past_tokens = _narrative_tokens(ev.content)
+            if not past_tokens:
+                continue
+            inter = current_tokens & past_tokens
+            union = current_tokens | past_tokens
+            jaccard = len(inter) / len(union) if union else 0.0
+
+            # Recency boost: 1.0 today, ~0.5 at half_life days ago, decays smoothly
+            age_days = (now - ev.created_at).total_seconds() / 86400.0
+            recency = exp(-age_days / max(1.0, recency_half_life_days))
+
+            # Combined score, slightly favoring relevance over recency
+            score = (jaccard * 0.65) + (recency * 0.35)
+
+            if score < min_relevance:
+                continue
+            scored.append((score, ev))
+
+        # Top-N by score
+        scored.sort(key=lambda x: -x[0])
+        top = [ev for (_s, ev) in scored[:max_results]]
+        log.info(
+            f'[narrative] retrieved {len(top)}/{len(candidates)} for user {user_id} '
+            f'(min_relevance={min_relevance}, half_life={recency_half_life_days}d)'
+        )
+        return top
+    except Exception as e:
+        log.warning(f'[narrative] retrieve failed for user {user_id}: {e}')
+        return []
+
+
 def _memory_fingerprint(content: str) -> str:
     """
     Collapse a memory's content to a fingerprint used for dedup.

@@ -683,6 +683,63 @@ def _format_user_memory(memories: list) -> str:
     return "\n".join(lines)
 
 
+def _format_past_moments(events: list) -> str:
+    """Render retrieved NarrativeEvents as 'PAST MOMENTS THAT MAY MATTER'.
+
+    Roadmap ship #1 (2026-05-11). UserMemory holds distilled summaries; this
+    block holds raw remembered moments with the user's exact prior language.
+    The retrieval helper already filtered for relevance and sensitivity; the
+    Oracle's job is to weave them in only when natural.
+
+    Events is a list of NarrativeEvent rows from
+    db.retrieve_relevant_narrative_events(). Zero events returns empty string
+    so the section is silently omitted on turns that have no relevant past.
+    """
+    if not events:
+        return ""
+    import re
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+
+    def _relative_when(created_at) -> str:
+        try:
+            age_days = (now - created_at).total_seconds() / 86400.0
+            if age_days < 1:
+                return "earlier today"
+            if age_days < 2:
+                return "yesterday"
+            if age_days < 7:
+                return f"{int(age_days)} days ago"
+            if age_days < 30:
+                return f"about {int(age_days / 7)} week{'s' if age_days >= 14 else ''} ago"
+            if age_days < 365:
+                return f"about {int(age_days / 30)} month{'s' if age_days >= 60 else ''} ago"
+            return f"over a year ago"
+        except Exception:
+            return "before"
+
+    def _excerpt(text: str, max_chars: int = 280) -> str:
+        # Single-line, capped, preserve the user's exact words inside quotes.
+        t = re.sub(r"\s+", " ", (text or "").strip())
+        if len(t) > max_chars:
+            t = t[: max_chars - 1].rstrip() + "…"
+        return t
+
+    lines = [
+        "PAST MOMENTS THAT MAY MATTER (from earlier conversations, the user's exact words):",
+    ]
+    for ev in events:
+        when = _relative_when(getattr(ev, 'created_at', None))
+        excerpt = _excerpt(getattr(ev, 'content', '') or '')
+        lines.append(f"  ({when}) \"{excerpt}\"")
+
+    lines.append("")
+    lines.append("How to use these. Use them ONLY if they naturally help this turn. Never announce that you are remembering. Never quote them back word-for-word as proof. Never list more than one in a single reply, and only if it deepens what is happening now. The right shape is a friend who lived through that conversation with them and lets the recognition show in the texture, not the topic. If none of them fit the moment, hold them silent. Continuity is the smell of the room, not a citation.")
+    lines.append("RIGHT: 'You are circling the same question about earning rest, only the costume is different this time.' (when an event captured a prior message about feeling she had to earn rest)")
+    lines.append("WRONG: 'Three weeks ago you said \"I feel like I have to earn rest.\" That same theme is...'")
+    return "\n".join(lines)
+
+
 def _format_connections(connections: list, memories: list) -> str:
     """Format the user's accepted soul connections plus any memories tagged to each.
 
@@ -1541,9 +1598,11 @@ def build_system_prompt_with_memory(
     connections: Optional[list] = None,
     self_state: Optional[Any] = None,
     hive_context: Optional[dict] = None,
+    past_moments: Optional[list] = None,
 ) -> str:
     """Build system prompt including persistent user memory, the user's people,
-    the Oracle's own self-state, and (when available) the collective hive layer.
+    the Oracle's own self-state, the collective hive layer, and (new ship #1)
+    raw past moments retrieved from NarrativeEvent.
 
     Layout into the prompt:
       1. The static realism + voice rules (always)
@@ -1551,21 +1610,22 @@ def build_system_prompt_with_memory(
       3. WHAT YOU KNOW ABOUT THEM (memories about the user themselves)
       4. YOUR PEOPLE (each accepted connection + memories tagged to them)
       5. WHAT THE FIELD KNOWS (the hive layer; quiet seasoning only)
-      6. THIS PERSON'S COMPLETE BLUEPRINT (the chart)
+      6. PAST MOMENTS THAT MAY MATTER (raw NarrativeEvent excerpts, ship #1)
+      7. THIS PERSON'S COMPLETE BLUEPRINT (the chart)
 
-    Context blocks are inserted before the blueprint so the Oracle reads
-    the chart already knowing herself, the person, the orbit, and the
-    field. The hive section is the newest of the five and is the one
-    that finally closes the loop on the collective-intelligence promise
-    on the landing page.
+    The past_moments section is rendered last among the context blocks so it
+    sits closest to the chart and the user's current message, mimicking how
+    a friend would let recent specifics shape the read rather than memories
+    of the person in general.
     """
     base = _build_system_prompt(blueprint, forecast)
     self_section = _format_oracle_self_state(self_state)
     memory_section = _format_user_memory(memories)
     people_section = _format_connections(connections or [], memories or [])
     hive_section = _format_hive_context(hive_context)
+    moments_section = _format_past_moments(past_moments or [])
 
-    sections = [s for s in (self_section, memory_section, people_section, hive_section) if s]
+    sections = [s for s in (self_section, memory_section, people_section, hive_section, moments_section) if s]
     if not sections:
         return base
 
@@ -2218,7 +2278,7 @@ Begin."""
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_SONNET,
+            model=MODEL_CLAUDE_HAIKU,
             max_tokens=300,
             system=system,
             messages=greeting_messages,
@@ -2226,7 +2286,7 @@ Begin."""
         # _sanitize_output is defined below; using it here is fine because the
         # function is module-level and Python resolves names at call time.
         # It runs the frame-leak guard plus em-dash strip in the right order.
-        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, greeting_messages, max_tokens=300)
@@ -2509,12 +2569,12 @@ def group_chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_SONNET,
+            model=MODEL_CLAUDE_HAIKU,
             max_tokens=700,
             system=system,
             messages=messages,
         )
-        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, messages, max_tokens=700)
@@ -2873,13 +2933,13 @@ def chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model=MODEL_CLAUDE_SONNET,
+            model=MODEL_CLAUDE_HAIKU,
             max_tokens=1600,
             system=final_system,
             messages=messages,
         )
         raw_text = response.content[0].text.strip()
-        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
         return _sanitize_output(raw_text)
     except OracleUnavailable:
         # Three retries to Claude exhausted. Try the GPT-4o break-glass
