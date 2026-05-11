@@ -207,7 +207,18 @@ def _compute_prompt_hash() -> str:
     try:
         import inspect
         sources = []
-        for fn_name in ("_build_system_prompt", "build_system_prompt_with_memory"):
+        # 2026-05-12 Codex audit P1: include the composer functions in the
+        # hash so that edits to _build_alive_context or the register
+        # classifier register on the audit dashboard without needing a
+        # manual ORACLE_PROMPT_TAG bump. Composer is now load-bearing
+        # behavior, not just a passive helper.
+        for fn_name in (
+            "_build_system_prompt",
+            "build_system_prompt_with_memory",
+            "_build_alive_context",
+            "_classify_message_register",
+            "_format_past_moments",
+        ):
             fn = globals().get(fn_name)
             if fn is not None:
                 sources.append(inspect.getsource(fn))
@@ -233,57 +244,100 @@ def get_oracle_prompt_version() -> str:
 # ---------------------------------------------------------------------------
 
 def verify_models_at_startup() -> dict:
-    """Ping every Anthropic model the codebase uses with a 5-token test
-    message at process boot. Catches the kind of typo that took the
-    Oracle down on 2026-05-12 (a ghost model ID lurking in the advisor
-    silently for weeks before being copied to the chat path).
+    """Ping every model the codebase uses with a small test call at
+    process boot. Catches the kind of typo that took the Oracle down on
+    2026-05-12 (a ghost model ID lurking in the advisor silently for
+    weeks before being copied to the chat path).
 
-    Returns a dict {model_id: "ok" | "FAIL: <message>"}. Logs each result.
-    Never raises; production traffic should keep flowing even if one
-    model is wedged (the resilience layer handles per-call failures).
-    If the critical chat model is broken at boot, this surfaces it in
-    logs immediately instead of silently returning empty/fallback text
-    to users.
+    2026-05-12 Codex audit follow-up: probe now covers BOTH providers:
+    - Anthropic: MODEL_CLAUDE_SONNET (chat voice + advisor + 4 surfaces)
+                 MODEL_CLAUDE_HAIKU (synthesis paths + marketing + weekly)
+    - OpenAI:    gpt-4o (audit pipeline + break-glass)
+                 whisper-1 (voice transcription; metadata-only probe)
 
-    Why not async startup probe per model: this runs once at boot and
-    every result is a one-shot 5-token call, total time under 3 seconds
-    sequentially. Worth waiting on rather than complicating startup.
+    Returns a dict {model_id: "ok" | "FAIL: <message>" | "skipped: <why>"}.
+    Never raises; production traffic flows even if one model is wedged.
+    Sequential probes total ~3-5 seconds. Run from FastAPI startup in a
+    worker thread (asyncio.to_thread) so the event loop is not blocked.
     """
     import logging
     log = logging.getLogger('solray.startup')
     results: dict = {}
+
+    # --- Anthropic side ---
     try:
         api_key = os.environ.get('ANTHROPIC_API_KEY')
         if not api_key:
-            log.error('[startup-probe] ANTHROPIC_API_KEY missing; skipping model verification')
-            return {'_error': 'no_api_key'}
-        client = anthropic.Anthropic(api_key=api_key, timeout=15.0)
-        # The canonical set the codebase uses. Keep in sync with model=
-        # literals across ai/chat.py, ai/forecast.py, ai/long_range_ai.py,
-        # ai/first_mirror.py, ai/compatibility.py, api/main.py.
-        models_to_check = [
-            (MODEL_CLAUDE_SONNET, 'chat voice + advisor + forecast + first mirror + compatibility + long range'),
-            (MODEL_CLAUDE_HAIKU, 'memory synthesis + self-state synthesis + weekly forecast + marketing'),
-        ]
-        for model_id, role in models_to_check:
-            try:
-                resp = client.messages.create(
-                    model=model_id,
-                    max_tokens=5,
-                    messages=[{'role': 'user', 'content': 'ok'}],
-                )
-                # If we got here, the call succeeded.
-                text = (resp.content[0].text if resp.content else '').strip()[:40]
-                results[model_id] = 'ok'
-                log.info(f'[startup-probe] {model_id}  OK  ({role}; replied {text!r})')
-            except Exception as e:
-                err_msg = str(e)[:200]
-                results[model_id] = f'FAIL: {err_msg}'
-                log.error(f'[startup-probe] {model_id}  FAILED  ({role}): {err_msg}')
-        return results
+            log.error('[startup-probe] ANTHROPIC_API_KEY missing; skipping Anthropic verification')
+            results['_anthropic'] = 'skipped: no_api_key'
+        else:
+            client = anthropic.Anthropic(api_key=api_key, timeout=15.0)
+            anthropic_models = [
+                (MODEL_CLAUDE_SONNET, 'chat voice + advisor + forecast + first mirror + compatibility + long range'),
+                (MODEL_CLAUDE_HAIKU, 'memory synthesis + self-state synthesis + weekly forecast + marketing'),
+            ]
+            for model_id, role in anthropic_models:
+                try:
+                    resp = client.messages.create(
+                        model=model_id,
+                        max_tokens=5,
+                        messages=[{'role': 'user', 'content': 'ok'}],
+                    )
+                    text = (resp.content[0].text if resp.content else '').strip()[:40]
+                    results[model_id] = 'ok'
+                    log.info(f'[startup-probe] anthropic {model_id}  OK  ({role}; replied {text!r})')
+                except Exception as e:
+                    err_msg = str(e)[:200]
+                    results[model_id] = f'FAIL: {err_msg}'
+                    log.error(f'[startup-probe] anthropic {model_id}  FAILED  ({role}): {err_msg}')
     except Exception as outer:
-        log.error(f'[startup-probe] outer failure: {outer}')
-        return {'_error': str(outer)[:200]}
+        log.error(f'[startup-probe] anthropic outer failure: {outer}')
+        results['_anthropic_outer_error'] = str(outer)[:200]
+
+    # --- OpenAI side: gpt-4o (audit + break-glass) + whisper-1 (metadata only) ---
+    try:
+        openai_key = os.environ.get('OPENAI_API_KEY')
+        if not openai_key:
+            log.warning('[startup-probe] OPENAI_API_KEY missing; skipping OpenAI verification (audit + break-glass will silently fail)')
+            results['_openai'] = 'skipped: no_api_key'
+        else:
+            try:
+                from openai import OpenAI  # type: ignore
+            except Exception as imp_err:
+                log.warning(f'[startup-probe] openai package not installed: {imp_err}; skipping OpenAI verification')
+                results['_openai'] = f'skipped: import_error {imp_err}'
+            else:
+                oai = OpenAI(api_key=openai_key, timeout=15.0)
+                # gpt-4o: small chat completion, exact same shape audit & break-glass use.
+                try:
+                    resp = oai.chat.completions.create(
+                        model='gpt-4o',
+                        max_tokens=5,
+                        messages=[{'role': 'user', 'content': 'ok'}],
+                    )
+                    text = (resp.choices[0].message.content or '').strip()[:40]
+                    results['gpt-4o'] = 'ok'
+                    log.info(f'[startup-probe] openai gpt-4o  OK  (audit + break-glass; replied {text!r})')
+                except Exception as e:
+                    err_msg = str(e)[:200]
+                    results['gpt-4o'] = f'FAIL: {err_msg}'
+                    log.error(f'[startup-probe] openai gpt-4o  FAILED  (audit + break-glass): {err_msg}')
+                # whisper-1: no cheap synthetic probe (it requires audio), so verify
+                # via the models.retrieve metadata endpoint instead. Confirms the
+                # model is reachable on this key without burning a transcription.
+                try:
+                    info = oai.models.retrieve('whisper-1')
+                    results['whisper-1'] = 'ok'
+                    log.info(f'[startup-probe] openai whisper-1  OK  (voice transcription; metadata id={getattr(info, "id", "?")})')
+                except Exception as e:
+                    err_msg = str(e)[:200]
+                    results['whisper-1'] = f'FAIL: {err_msg}'
+                    log.error(f'[startup-probe] openai whisper-1  FAILED  (voice transcription): {err_msg}')
+    except Exception as outer:
+        log.error(f'[startup-probe] openai outer failure: {outer}')
+        results['_openai_outer_error'] = str(outer)[:200]
+
+    return results
 
 
 def _get_client() -> anthropic.Anthropic:
@@ -780,23 +834,33 @@ def _classify_message_register(msg: str) -> str:
     Returns a short label the context composer feeds into the Oracle's
     prompt. Deterministic, no LLM call. Pattern matches against the
     word families GO DEEPER and the audit pipeline already care about.
+
+    Codex audit 2026-05-12 P0: use regex word boundaries so 'lost' at
+    end-of-message and 'mars' inside a word like 'marshmallow' do not
+    fail or false-positive. Each pattern is matched as a whole word.
     """
     if not msg or len(msg.strip()) < 3:
         return 'neutral'
+    import re
     s = msg.lower()
-    if any(k in s for k in ('suicid', 'kill myself', 'end my life', 'self-harm')):
+
+    def _has_word(words) -> bool:
+        # Build a single anchored regex per call. Whole-word match using
+        # \b boundaries. Escapes regex metacharacters in the keywords.
+        pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
+        return bool(re.search(pattern, s))
+
+    if _has_word(('suicide', 'suicidal', 'kill myself', 'end my life', 'self-harm', 'self harm')):
         return 'crisis (treat with care; do not deflect to cosmic frame)'
-    if any(k in s for k in ('empty', 'heavy', 'blocked', 'stuck', 'lost ', 'small', 'numb',
-                            'raw', 'tight', 'wrong', 'alone', 'broken', 'scared',
-                            "i feel ", "feeling")):
+    # Phrases first because they convey emotional register more reliably than
+    # single words, then single felt-sense words.
+    if re.search(r"\bi (feel|am feeling|am)\s+(empty|heavy|blocked|stuck|lost|small|numb|raw|tight|alone|broken|scared|sad|tired|exhausted)\b", s):
         return 'felt-sense raw (hold the feeling for one turn before pivoting)'
-    if any(k in s for k in ('what does ', 'how does ', 'explain ', 'what is ',
-                            "what's ", 'why do i', 'help me understand')):
+    if _has_word(('empty', 'numb', 'raw', 'broken', 'scared')):
+        return 'felt-sense raw (hold the feeling for one turn before pivoting)'
+    if _has_word(('explain', 'teach me')) or re.search(r"\bwhat (does|is|are|do)\b|\bhow (does|do|can)\b|\bwhy do i\b|\bhelp me understand\b", s):
         return 'curious / learning (teaching is invited)'
-    if any(k in s for k in (' my chart', ' my moon', ' my sun', ' my rising',
-                            ' my mercury', ' my venus', ' my mars', ' my saturn',
-                            ' my jupiter', ' my pluto', 'transit', 'aspect',
-                            'pluto', 'saturn', 'mercury', 'venus', 'mars')):
+    if _has_word(('transit', 'transits', 'aspect', 'aspects', 'chart')) or re.search(r"\bmy (sun|moon|rising|mercury|venus|mars|jupiter|saturn|pluto|uranus|neptune|chiron|nodes|north node|south node)\b", s):
         return 'chart / cosmic (factual register, math must be precise)'
     return 'neutral'
 
@@ -894,12 +958,22 @@ def _build_alive_context(
         pass
 
     # 4) Did they just mention someone in their orbit?
+    # Codex audit 2026-05-12: use regex word boundaries so a short
+    # connection name like "Ed" does not false-positive inside "edit".
     try:
         if connections and user_message:
+            import re
             msg_lower = user_message.lower()
             for c in connections:
                 name = c.get('name') if isinstance(c, dict) else getattr(c, 'name', None)
-                if name and len(name) >= 3 and name.lower() in msg_lower:
+                if not name or len(name) < 3:
+                    continue
+                # Match first token of name as a whole word. For multi-word
+                # names like "Sol-Ray Bob," matching the first token is
+                # both more lenient and safer than matching the full string.
+                first_token = name.split()[0] if name.split() else name
+                pattern = r"\b" + re.escape(first_token.lower()) + r"\b"
+                if re.search(pattern, msg_lower):
                     sun = (c.get('sun_sign') if isinstance(c, dict) else getattr(c, 'sun_sign', None)) or '?'
                     hd_type = (c.get('hd_type') if isinstance(c, dict) else getattr(c, 'hd_type', None)) or '?'
                     lines.append(
