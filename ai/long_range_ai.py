@@ -85,7 +85,13 @@ Generate a 2-sentence summary for each transit. Return JSON array."""
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1200,
-        system=system_prompt,
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         messages=[{"role": "user", "content": user_prompt}],
     )
 

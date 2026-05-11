@@ -285,6 +285,38 @@ def _is_transient_error(e: Exception) -> bool:
     return any(s in msg for s in transient_signals)
 
 
+def _wrap_system_for_caching(create_kwargs: dict) -> None:
+    """Mutate create_kwargs in-place so the system prompt is marked cacheable.
+
+    Anthropic prompt caching: passing system as a structured list with a
+    cache_control block lets the platform cache the prefix for ~5 minutes.
+    Subsequent calls within that window that share the same prefix pay
+    roughly 10% of normal input price for the cached portion.
+
+    The Solray system prompt is ~20k tokens. Within a single user's chat
+    session (typical 4 to 6 messages over a few minutes) the system prompt
+    is recomputed each turn but is largely identical between turns, so the
+    cache will hit on turns 2 through N. Across users the static voice-rule
+    portion of the prompt is also shared, which produces cross-user cache
+    hits as a bonus. Minimum prefix size for caching is comfortably below
+    our 20k system prompt, so every call qualifies.
+
+    Safe no-op if 'system' is missing, is already a structured list, or
+    is empty. We only wrap raw string system prompts, the canonical shape
+    used everywhere in chat.py.
+    """
+    sys = create_kwargs.get('system')
+    if not sys or not isinstance(sys, str):
+        return
+    create_kwargs['system'] = [
+        {
+            "type": "text",
+            "text": sys,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
 def _call_claude_with_retry(
     client: anthropic.Anthropic,
     *,
@@ -298,10 +330,16 @@ def _call_claude_with_retry(
     Raises the original exception immediately on non-transient errors (auth,
     malformed request, model not found, etc.) so they get fixed rather
     than masked.
+
+    Automatically wraps the system prompt in a cache_control block so the
+    Anthropic prompt-caching layer kicks in. ~60-80% input-token cost
+    reduction on chat replies within a session. Safe no-op if system is
+    already structured or missing.
     """
     import time
     import logging
     log = logging.getLogger("solray.resilience")
+    _wrap_system_for_caching(create_kwargs)
     delays = [0.5, 1.0, 2.0]
     last_err: Optional[Exception] = None
     for attempt in range(max_attempts):

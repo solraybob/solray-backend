@@ -4217,7 +4217,13 @@ async def forecast_week(
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
-            system=_build_system_prompt(blueprint, None),
+            system=[
+                {
+                    "type": "text",
+                    "text": _build_system_prompt(blueprint, None),
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[{"role": "user", "content": f"In 1-2 sentences, what is the main theme of the coming days based on these transits:\n{transit_lines}\nSpeak directly to this person. Be specific."}]
         )
 
