@@ -408,8 +408,11 @@ Today's HD Sun Gate: {hd_gate_today.get('gate', '?')} (shadow: {hd_gate_today.ge
 
 Speak directly. Make it land."""
 
+    # Sonnet for daily forecast (2026-05-11): the reading every user sees on
+    # the Today screen each day. User-facing, the main daily touchpoint of
+    # the Oracle's voice outside of chat. Caching keeps cost bounded.
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-5-20241022",
         max_tokens=1800,
         system=[
             {

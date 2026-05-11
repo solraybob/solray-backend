@@ -145,8 +145,12 @@ Return ONLY a JSON object:
     client = _get_client()
     log.info(f"[first_mirror] generating for {name} (sun {sun_sign}, rising {rising})")
 
+    # Sonnet for First Mirror (2026-05-11): this is the first reading a new
+    # user gets at onboarding. It sets the impression of the Oracle's voice
+    # for the entire relationship. Sonnet's cognition lands the surprise
+    # insight that Haiku could not reliably deliver. Low volume, high impact.
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-5-20241022",
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )

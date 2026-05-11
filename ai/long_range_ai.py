@@ -82,8 +82,11 @@ Active long-range transits:
 
 Generate a 2-sentence summary for each transit. Return JSON array."""
 
+    # Sonnet for long-range AI (2026-05-11): multi-year transit summaries are
+    # user-facing reads that benefit from Sonnet's depth of pattern. Low
+    # volume, caching keeps cost bounded.
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-5-20241022",
         max_tokens=1200,
         system=[
             {
