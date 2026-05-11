@@ -63,6 +63,21 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 # surface both.
 #
 # CHANGELOG (most recent at top):
+#   v3.9-alive-context (2026-05-12): the context composer is live. A
+#     deterministic Python function (_build_alive_context) runs before
+#     every chat call and pulls the most active signals from already-
+#     loaded context: tightest current transit, active arc memory,
+#     surface_next memories, the current message's emotional register,
+#     mention of any soul connection in their orbit, whether past
+#     moments were retrieved, whether this is the opening of a new
+#     session. Emits a WHAT IS ALIVE RIGHT NOW block that goes at the
+#     top of the inserted context so Sonnet reads the selection layer
+#     before the rest of the (~20k token) system prompt. The result is
+#     the model spends fewer tokens choosing what to attend to and more
+#     tokens speaking from the right thread. Pure Python, no LLM call,
+#     near-zero cost. Codex (re)ordered this ahead of the initiative
+#     scheduler because initiative without a deterministic selection
+#     layer becomes "a beautiful notification system over fuzzy inputs."
 #   v3.8-memory-and-sonnet (2026-05-12): two material shifts in the same
 #     audit bucket would have polluted the dashboard, so bumping the tag
 #     to cleanly separate the new state from the old. Two changes carried:
@@ -174,7 +189,7 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 #   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
 #     the moment, overreading guard.
 
-ORACLE_PROMPT_TAG = "v3.8-memory-and-sonnet"
+ORACLE_PROMPT_TAG = "v3.9-alive-context"
 
 
 def _compute_prompt_hash() -> str:
@@ -703,6 +718,191 @@ def _format_user_memory(memories: list) -> str:
         lines.append("If the user is in a brand new conversation and their question has nothing to do with the surfaced memory, hold the memory back and answer their question. Continuity should never feel forced.")
     lines.append("For memories not flagged as BRING THESE IN: hold them as background. Let them inform how you read the person without surfacing them unless the conversation opens that door.")
     return "\n".join(lines)
+
+
+def _classify_message_register(msg: str) -> str:
+    """Lightweight emotional-register classifier for the current message.
+
+    Returns a short label the context composer feeds into the Oracle's
+    prompt. Deterministic, no LLM call. Pattern matches against the
+    word families GO DEEPER and the audit pipeline already care about.
+    """
+    if not msg or len(msg.strip()) < 3:
+        return 'neutral'
+    s = msg.lower()
+    if any(k in s for k in ('suicid', 'kill myself', 'end my life', 'self-harm')):
+        return 'crisis (treat with care; do not deflect to cosmic frame)'
+    if any(k in s for k in ('empty', 'heavy', 'blocked', 'stuck', 'lost ', 'small', 'numb',
+                            'raw', 'tight', 'wrong', 'alone', 'broken', 'scared',
+                            "i feel ", "feeling")):
+        return 'felt-sense raw (hold the feeling for one turn before pivoting)'
+    if any(k in s for k in ('what does ', 'how does ', 'explain ', 'what is ',
+                            "what's ", 'why do i', 'help me understand')):
+        return 'curious / learning (teaching is invited)'
+    if any(k in s for k in (' my chart', ' my moon', ' my sun', ' my rising',
+                            ' my mercury', ' my venus', ' my mars', ' my saturn',
+                            ' my jupiter', ' my pluto', 'transit', 'aspect',
+                            'pluto', 'saturn', 'mercury', 'venus', 'mars')):
+        return 'chart / cosmic (factual register, math must be precise)'
+    return 'neutral'
+
+
+def _build_alive_context(
+    user_message: Optional[str],
+    forecast: Optional[dict],
+    memories: Optional[list],
+    past_moments: Optional[list],
+    connections: Optional[list],
+    conversation_history: Optional[list],
+) -> str:
+    """Roadmap ship #4 (reordered by Codex to #3 before initiative).
+
+    Deterministic context composer. Pulls signals from already-loaded
+    context and emits a concise WHAT IS ALIVE NOW block that sits at
+    the top of the prompt. The block tells Sonnet where to look in the
+    rest of the (~20k token) system prompt instead of asking the model
+    to weight 20k tokens equally on every turn.
+
+    Reads:
+      - tightest current transit (from forecast.aspects)
+      - active_thread memory (from UserMemory, surface_next aware)
+      - surface_next memories that are alive right now
+      - emotional register of the current message
+      - connection mention in the current message
+      - whether any past moments were retrieved this turn
+      - silence duration since last assistant turn (when derivable)
+
+    Codex audit caveat: this is the selection layer. Without it, the
+    Oracle has 20k tokens of context and has to choose what is alive
+    on every turn. With it, we choose for her and the model can focus
+    on the speaking instead of the selecting.
+
+    Returns "" when nothing meaningful is alive (empty prompt rather
+    than a noisy header).
+    """
+    lines = []
+
+    # 1) Tightest active transit, if any are tight.
+    try:
+        if forecast and forecast.get('aspects'):
+            asps = forecast['aspects'] or []
+            tight = sorted(
+                (a for a in asps if isinstance(a, dict) and a.get('orb') is not None),
+                key=lambda a: float(a.get('orb', 99)),
+            )
+            if tight:
+                top = tight[0]
+                orb_v = float(top.get('orb', 99))
+                if orb_v <= 3.0:
+                    tp = top.get('transit_planet', '?')
+                    ap = top.get('aspect', '?')
+                    np_ = top.get('natal_planet', '?')
+                    lines.append(
+                        f"Sharpest sky-to-chart pressure right now: {tp} {ap} natal {np_} "
+                        f"(orb {orb_v}°). This is the loudest transit; it shapes the day's "
+                        f"weather without dictating the conversation."
+                    )
+    except Exception:
+        pass
+
+    # 2) Active thread from memories.
+    active_thread = ""
+    surface_lines = []
+    try:
+        for m in (memories or []):
+            cat = m.category if hasattr(m, 'category') else m.get('category', '')
+            content = m.content if hasattr(m, 'content') else m.get('content', '')
+            cn_id = m.connection_user_id if hasattr(m, 'connection_user_id') else m.get('connection_user_id')
+            cn_name = m.connection_name if hasattr(m, 'connection_name') else m.get('connection_name')
+            # Only consider memories about the user themselves, not about connections.
+            if cn_id or cn_name:
+                continue
+            if cat == 'active_thread' and not active_thread:
+                active_thread = content
+            elif (m.surface_next if hasattr(m, 'surface_next') else m.get('surface_next', False)):
+                if cat not in ('communication_style', 'active_thread'):
+                    surface_lines.append(content)
+        if active_thread:
+            lines.append(f"The arc they are moving through: {active_thread}")
+        if surface_lines:
+            top = surface_lines[:2]
+            joined = " / ".join(top)
+            lines.append(f"Alive in the texture of recent sessions: {joined}")
+    except Exception:
+        pass
+
+    # 3) Register of the current message.
+    try:
+        register = _classify_message_register(user_message or "")
+        if register != 'neutral':
+            lines.append(f"This message's register: {register}")
+    except Exception:
+        pass
+
+    # 4) Did they just mention someone in their orbit?
+    try:
+        if connections and user_message:
+            msg_lower = user_message.lower()
+            for c in connections:
+                name = c.get('name') if isinstance(c, dict) else getattr(c, 'name', None)
+                if name and len(name) >= 3 and name.lower() in msg_lower:
+                    sun = (c.get('sun_sign') if isinstance(c, dict) else getattr(c, 'sun_sign', None)) or '?'
+                    hd_type = (c.get('hd_type') if isinstance(c, dict) else getattr(c, 'hd_type', None)) or '?'
+                    lines.append(
+                        f"They named someone in their orbit: {name} (Sun {sun}, HD {hd_type}). "
+                        f"If this person matters to the question, you can read for the dynamic, not just for the user alone."
+                    )
+                    break
+    except Exception:
+        pass
+
+    # 5) Was a past moment retrieved this turn? (Ship #1 already inserts the
+    # full PAST MOMENTS section below; here we just flag whether it is loaded
+    # so the Oracle knows the recognition is available without having to scan.)
+    try:
+        if past_moments:
+            n = len(past_moments)
+            lines.append(
+                f"{n} past moment{'s' if n != 1 else ''} from earlier conversations matched this turn "
+                f"(see PAST MOMENTS THAT MAY MATTER below). Use only if it deepens what is happening now."
+            )
+    except Exception:
+        pass
+
+    # 6) Silence duration (only when last assistant turn carries a timestamp;
+    # the in-memory conversation_history list usually does not. Skip gracefully.)
+    try:
+        if conversation_history:
+            # Count user messages so far in this session. A first-turn-of-session
+            # signal helps the Oracle know whether continuity from a prior session
+            # is the right register.
+            user_count = sum(1 for m in conversation_history if (m.get('role') == 'user'))
+            if user_count == 0 and user_message:
+                lines.append(
+                    "This is the OPENING of a new session. If memories or past moments fit, "
+                    "the opening is the one place to weave continuity. After this turn, hold "
+                    "it as background unless the conversation reopens it."
+                )
+    except Exception:
+        pass
+
+    if not lines:
+        return ""
+
+    out = [
+        "═══════════════════════════════",
+        "WHAT IS ALIVE RIGHT NOW (selection layer; read this first):",
+        "═══════════════════════════════",
+    ]
+    out.extend(f"  • {ln}" for ln in lines)
+    out.append("")
+    out.append(
+        "The rest of the prompt is the full picture. This block is which threads are currently "
+        "louder than the others. Speak from these unless the user's message clearly opens a "
+        "different door. Do not announce that you are reading from a selection layer; this is "
+        "the equivalent of a friend remembering what is going on with you before you walk in."
+    )
+    return "\n".join(out)
 
 
 def _format_past_moments(events: list) -> str:
@@ -1621,6 +1821,7 @@ def build_system_prompt_with_memory(
     self_state: Optional[Any] = None,
     hive_context: Optional[dict] = None,
     past_moments: Optional[list] = None,
+    alive_context_block: Optional[str] = None,
 ) -> str:
     """Build system prompt including persistent user memory, the user's people,
     the Oracle's own self-state, the collective hive layer, and (new ship #1)
@@ -1648,10 +1849,21 @@ def build_system_prompt_with_memory(
     moments_section = _format_past_moments(past_moments or [])
 
     sections = [s for s in (self_section, memory_section, people_section, hive_section, moments_section) if s]
-    if not sections:
+
+    # The context composer block (ship #3 of the realism roadmap as Codex
+    # reordered). Sits at the very top of the inserted context so the model
+    # reads "what is alive right now" BEFORE the rest of the prompt, then
+    # has a lens for everything that follows. Falls back to empty when the
+    # composer found nothing alive worth surfacing.
+    pre_sections = []
+    if alive_context_block:
+        pre_sections.append(alive_context_block)
+    pre_sections.extend(sections)
+
+    if not pre_sections:
         return base
 
-    pre_blueprint = "\n\n".join(sections)
+    pre_blueprint = "\n\n".join(pre_sections)
     insert_marker = "THIS PERSON'S COMPLETE BLUEPRINT:"
     if insert_marker in base:
         return base.replace(insert_marker, f"{pre_blueprint}\n\n{insert_marker}")
@@ -2904,12 +3116,27 @@ def chat(
     if not conversation_history and not user_message:
         return _generate_morning_greeting(blueprint, forecast)
 
+    # Context composer (ship #3 of realism roadmap, Codex reorder). Deterministic
+    # selection layer: reads what is already loaded and emits a short
+    # WHAT IS ALIVE RIGHT NOW block at the top of the prompt so Sonnet does
+    # not have to weight 20k tokens of context equally. Pure Python, no extra
+    # LLM call, ~free cost.
+    alive_context_block = _build_alive_context(
+        user_message=user_message,
+        forecast=forecast,
+        memories=memories or [],
+        past_moments=past_moments or [],
+        connections=connections or [],
+        conversation_history=conversation_history or [],
+    )
+
     system = build_system_prompt_with_memory(
         blueprint, forecast, memories or [],
         connections=connections or [],
         self_state=self_state,
         hive_context=hive_context,
         past_moments=past_moments or [],
+        alive_context_block=alive_context_block,
     )
 
     # If a soul blueprint is provided, inject the compatibility section
