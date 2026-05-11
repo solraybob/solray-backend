@@ -232,6 +232,60 @@ def get_oracle_prompt_version() -> str:
 # Client
 # ---------------------------------------------------------------------------
 
+def verify_models_at_startup() -> dict:
+    """Ping every Anthropic model the codebase uses with a 5-token test
+    message at process boot. Catches the kind of typo that took the
+    Oracle down on 2026-05-12 (a ghost model ID lurking in the advisor
+    silently for weeks before being copied to the chat path).
+
+    Returns a dict {model_id: "ok" | "FAIL: <message>"}. Logs each result.
+    Never raises; production traffic should keep flowing even if one
+    model is wedged (the resilience layer handles per-call failures).
+    If the critical chat model is broken at boot, this surfaces it in
+    logs immediately instead of silently returning empty/fallback text
+    to users.
+
+    Why not async startup probe per model: this runs once at boot and
+    every result is a one-shot 5-token call, total time under 3 seconds
+    sequentially. Worth waiting on rather than complicating startup.
+    """
+    import logging
+    log = logging.getLogger('solray.startup')
+    results: dict = {}
+    try:
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not api_key:
+            log.error('[startup-probe] ANTHROPIC_API_KEY missing; skipping model verification')
+            return {'_error': 'no_api_key'}
+        client = anthropic.Anthropic(api_key=api_key, timeout=15.0)
+        # The canonical set the codebase uses. Keep in sync with model=
+        # literals across ai/chat.py, ai/forecast.py, ai/long_range_ai.py,
+        # ai/first_mirror.py, ai/compatibility.py, api/main.py.
+        models_to_check = [
+            (MODEL_CLAUDE_SONNET, 'chat voice + advisor + forecast + first mirror + compatibility + long range'),
+            (MODEL_CLAUDE_HAIKU, 'memory synthesis + self-state synthesis + weekly forecast + marketing'),
+        ]
+        for model_id, role in models_to_check:
+            try:
+                resp = client.messages.create(
+                    model=model_id,
+                    max_tokens=5,
+                    messages=[{'role': 'user', 'content': 'ok'}],
+                )
+                # If we got here, the call succeeded.
+                text = (resp.content[0].text if resp.content else '').strip()[:40]
+                results[model_id] = 'ok'
+                log.info(f'[startup-probe] {model_id}  OK  ({role}; replied {text!r})')
+            except Exception as e:
+                err_msg = str(e)[:200]
+                results[model_id] = f'FAIL: {err_msg}'
+                log.error(f'[startup-probe] {model_id}  FAILED  ({role}): {err_msg}')
+        return results
+    except Exception as outer:
+        log.error(f'[startup-probe] outer failure: {outer}')
+        return {'_error': str(outer)[:200]}
+
+
 def _get_client() -> anthropic.Anthropic:
     """Construct an Anthropic client using the ANTHROPIC_API_KEY env var.
 

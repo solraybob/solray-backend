@@ -170,6 +170,27 @@ async def startup():
     """Initialise DB tables on first start, kick off billing scheduler."""
     await init_db()
 
+    # Model health check. Tonight (2026-05-12) the Oracle went down because a
+    # ghost model ID was lurking in the advisor for weeks, then got copied to
+    # the chat path. The try/except masked the failure. This probe pings every
+    # production Anthropic model with a 5-token test message at boot. Logs
+    # OK/FAIL for each. Does not fail startup; the resilience layer handles
+    # per-call failures. The point is to surface the bad ID in logs before
+    # traffic hits, not to crash the process.
+    try:
+        import asyncio as _asyncio
+        from ai.chat import verify_models_at_startup
+        # Run the (sync) probe in a worker thread so it does not block the
+        # FastAPI event loop during startup. Sequential probe is ~2-3s total.
+        results = await _asyncio.to_thread(verify_models_at_startup)
+        bad = [m for m, status in results.items() if not str(status).startswith('ok') and m != '_error']
+        if bad:
+            logger.error(f"[startup-probe] {len(bad)} model(s) failed verification: {bad}")
+        else:
+            logger.info(f"[startup-probe] all {len(results)} models verified ok")
+    except Exception as e:
+        logger.warning(f"[startup-probe] verification raised: {e}")
+
     # One-time (idempotent) backfill: every existing user who was signed up
     # before subscriptions existed gets a fresh 5-day trial from today.
     try:
