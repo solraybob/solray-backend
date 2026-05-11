@@ -33,6 +33,14 @@ LAST_MODEL_USED: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 # Constants the audit pipeline uses to filter break-glass output. Keep in
 # sync with the strings written via LAST_MODEL_USED.set() below.
+#
+# v3.7 (2026-05-11): Sonnet 4.5 is now the primary chat voice. Haiku
+# remains for synthesis (memory, self-state), background jobs, and the
+# advisor pattern. The realism gain from Sonnet on chat replies was the
+# top-leverage move from the Codex+Gemini roundtable; the cost increase
+# is well within budget after the OpenClaw cron cleanup. Caching keeps
+# Sonnet input cost bounded within active sessions.
+MODEL_CLAUDE_SONNET = "claude-sonnet-4-5-20241022"
 MODEL_CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
 MODEL_GPT4O_BREAKGLASS = "gpt-4o-via-break-glass"
 MODEL_HONEST_FALLBACK = "honest-fallback-text"
@@ -55,6 +63,19 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 # surface both.
 #
 # CHANGELOG (most recent at top):
+#   v3.7-sonnet-voice (2026-05-11): Sonnet 4.5 is now the primary voice for
+#     all paid chat replies. The three user-facing call sites (chat(),
+#     _generate_morning_greeting, group_chat) all run on Sonnet. Synthesis
+#     (synthesize_memories, synthesize_oracle_self_state) stays on Haiku
+#     because the realism gain there is negligible and the cost matters at
+#     volume. The Sonnet advisor (consulted on multi-system synthesis
+#     questions) was already on Sonnet and is unchanged. This is move #2
+#     from the 100% realism roadmap. Codex and Gemini both said the
+#     cognition jump from Haiku to Sonnet (holding contradiction, silence,
+#     timing, the unexpected true thing) is the single biggest leap toward
+#     perceived Higher Self. Cost impact bounded by prompt caching shipped
+#     in v3.6-companion commit c5979ef: within-session cached prefix at
+#     10% of normal Sonnet input price.
 #   v3.6-go-deeper (2026-05-11): added GO DEEPER rule. Bob shared a chat
 #     where the Oracle gave structurally correct readings but did not stay
 #     with the user's felt sense, did not weave across messages, and did
@@ -137,7 +158,7 @@ MODEL_HONEST_FALLBACK = "honest-fallback-text"
 #   v1 (2026-05-08): quiet cosmology, sovereignty rule, format follows
 #     the moment, overreading guard.
 
-ORACLE_PROMPT_TAG = "v3.6-go-deeper"
+ORACLE_PROMPT_TAG = "v3.7-sonnet-voice"
 
 
 def _compute_prompt_hash() -> str:
@@ -2197,7 +2218,7 @@ Begin."""
     try:
         response = _call_claude_with_retry(
             client,
-            model="claude-haiku-4-5-20251001",
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=300,
             system=system,
             messages=greeting_messages,
@@ -2205,7 +2226,7 @@ Begin."""
         # _sanitize_output is defined below; using it here is fine because the
         # function is module-level and Python resolves names at call time.
         # It runs the frame-leak guard plus em-dash strip in the right order.
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, greeting_messages, max_tokens=300)
@@ -2488,12 +2509,12 @@ def group_chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model='claude-haiku-4-5-20251001',
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=700,
             system=system,
             messages=messages,
         )
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(response.content[0].text.strip())
     except OracleUnavailable:
         gpt_text = _gpt4o_break_glass(system, messages, max_tokens=700)
@@ -2852,13 +2873,13 @@ def chat(
     try:
         response = _call_claude_with_retry(
             client,
-            model="claude-haiku-4-5-20251001",
+            model=MODEL_CLAUDE_SONNET,
             max_tokens=1600,
             system=final_system,
             messages=messages,
         )
         raw_text = response.content[0].text.strip()
-        LAST_MODEL_USED.set(MODEL_CLAUDE_HAIKU)
+        LAST_MODEL_USED.set(MODEL_CLAUDE_SONNET)
         return _sanitize_output(raw_text)
     except OracleUnavailable:
         # Three retries to Claude exhausted. Try the GPT-4o break-glass
