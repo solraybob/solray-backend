@@ -2852,6 +2852,7 @@ def chat(
     connections: Optional[list] = None,
     self_state: Optional[Any] = None,
     hive_context: Optional[dict] = None,
+    past_moments: Optional[list] = None,
 ) -> str:
     """
     Generate a Higher Self chat response.
@@ -2892,6 +2893,7 @@ def chat(
         connections=connections or [],
         self_state=self_state,
         hive_context=hive_context,
+        past_moments=past_moments or [],
     )
 
     # If a soul blueprint is provided, inject the compatibility section

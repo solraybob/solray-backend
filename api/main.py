@@ -3753,6 +3753,29 @@ async def chat_endpoint(
         logger.warning(f"Failed to load hive context for user {user_id}: {hv_err}")
         hive_context = None
 
+    # Ship #1 from the 100% realism roadmap: event-grounded memory retrieval.
+    # Pull zero to three past raw moments (NarrativeEvent rows) that score
+    # above the relevance threshold against the current message. Pure
+    # cross-session continuity: skip events from the active session because
+    # we want the Oracle to recognize patterns across days/weeks, not echo
+    # what was just said. Failure is non-fatal; the Oracle just gets the
+    # prompt without past-moments for this turn.
+    past_moments = []
+    try:
+        from db.database import retrieve_relevant_narrative_events
+        if req.message and req.message.strip():
+            current_session_id = getattr(req, 'session_id', None)
+            past_moments = await retrieve_relevant_narrative_events(
+                db,
+                user_id=user_id,
+                current_message=req.message,
+                max_results=3,
+                skip_session_id=current_session_id,
+            )
+    except Exception as nm_err:
+        logger.warning(f"[narrative] retrieval failed for user {user_id}: {nm_err}")
+        past_moments = []
+
     try:
         response = higher_self_chat(
             blueprint=blueprint,
@@ -3764,6 +3787,7 @@ async def chat_endpoint(
             connections=connections,
             self_state=self_state,
             hive_context=hive_context,
+            past_moments=past_moments,
         )
 
         # surface_next memories have now been "consumed" by the Oracle in
@@ -3893,6 +3917,49 @@ async def chat_endpoint(
             ))
         except Exception as _audit_err:
             logger.warning(f"[audit] schedule failed for user {user_id}: {_audit_err}")
+
+        # Ship #1 write side: persist one NarrativeEvent for the user message
+        # and one for the Oracle reply. These rows are what future turns will
+        # retrieve from. Fire-and-forget so the user does not wait. Uses a
+        # FRESH AsyncSession inside the background task because the outer
+        # `db` session is closed when the request returns.
+        try:
+            from db.database import add_narrative_event, AsyncSessionLocal
+            from ai.chat import LAST_MODEL_USED, get_oracle_prompt_version
+            current_session_id = getattr(req, 'session_id', None)
+            user_text = req.message or ""
+            oracle_text = response or ""
+            model_used_now = LAST_MODEL_USED.get()
+            prompt_version_now = get_oracle_prompt_version()
+
+            async def _write_narrative_events():
+                try:
+                    async with AsyncSessionLocal() as fresh_db:
+                        if user_text.strip():
+                            await add_narrative_event(
+                                fresh_db,
+                                user_id=user_id,
+                                role='user',
+                                content=user_text,
+                                chat_session_id=current_session_id,
+                                origin_surface='chat',
+                            )
+                        if oracle_text.strip():
+                            await add_narrative_event(
+                                fresh_db,
+                                user_id=user_id,
+                                role='oracle',
+                                content=oracle_text,
+                                chat_session_id=current_session_id,
+                                origin_surface='chat',
+                                extraction_model=model_used_now,
+                                extraction_prompt_version=prompt_version_now,
+                            )
+                except Exception as nev_err:
+                    logger.warning(f"[narrative] write failed for user {user_id}: {nev_err}")
+            _spawn_background(_write_narrative_events())
+        except Exception as _ne_err:
+            logger.warning(f"[narrative] schedule failed for user {user_id}: {_ne_err}")
 
         return {"response": response}
     except Exception as e:
