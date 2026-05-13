@@ -3708,6 +3708,14 @@ async def chat_endpoint(
     blueprint = await get_blueprint(db, user_id)
     if not blueprint:
         raise HTTPException(status_code=404, detail='Blueprint not found')
+    # Inject user identity (name, sex) into blueprint.meta so the Oracle
+    # addresses each user in their own name and stated pronouns. Sex is
+    # captured at signup; legacy users without it fall back to feminine
+    # defaults in the prompt builder (preserves prior behavior).
+    if 'meta' not in blueprint:
+        blueprint['meta'] = {}
+    blueprint['meta'].setdefault('name', user.name)
+    blueprint['meta']['sex'] = getattr(user, 'sex', None)
     from datetime import date
     today_str = date.today().isoformat()
     forecast = await get_cached_forecast(db, user_id, today_str)
