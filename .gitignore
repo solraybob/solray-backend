@@ -6,3 +6,7 @@ solray.db
 secrets/
 .env
 .env.local
+
+# Credentials, never commit
+DEPLOYMENT.md
+*.keystore
