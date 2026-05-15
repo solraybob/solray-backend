@@ -929,6 +929,45 @@ class ChatLineage(Base):
     )
 
 
+class AuditDriftAlert(Base):
+    """One row per drift detection event. Codex audit recommended starting
+    simple: surface, metric, window, value, threshold, status, created_at.
+    More metrics can be added once Page-Hinkley proves out.
+    """
+    __tablename__ = 'audit_drift_alerts'
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    created_at   = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    surface      = Column(String(48), nullable=False)
+    metric       = Column(String(32), nullable=False, default='audit_score_page_hinkley')
+    window_days  = Column(Integer, nullable=False, default=7)
+    value        = Column(Float, nullable=False)
+    threshold    = Column(Float, nullable=False)
+    samples      = Column(Integer, nullable=False, default=0)
+    status       = Column(String(16), nullable=False, default='active', index=True)
+    notes        = Column(Text, nullable=True)
+    resolved_at  = Column(DateTime, nullable=True)
+
+
+class CronHeartbeat(Base):
+    """One row per cron-job run. Records job name, started_at, finished_at,
+    success/failure, notes. The /admin/hub/overview surfaces last_success
+    per job so you can tell at a glance whether crons are firing.
+
+    Codex audit (May 2026) flagged this gap: without heartbeats you assume
+    crons are running when they may not be.
+    """
+    __tablename__ = 'cron_heartbeats'
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    job_name     = Column(String(64), nullable=False, index=True)
+    started_at   = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    finished_at  = Column(DateTime, nullable=True)
+    success      = Column(Boolean, nullable=False, default=False)
+    duration_ms  = Column(Integer, nullable=True)
+    notes        = Column(Text, nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # DB Initialisation
 # ---------------------------------------------------------------------------

@@ -4994,3 +4994,112 @@ async def hub_overview(
         },
         "usage_queue": queue,
     }
+
+
+@app.post('/admin/hub/cron/drift', summary='Run audit drift detection (admin only, cron-triggered)')
+async def hub_cron_drift(
+    surface: str = "chat",
+    window_days: int = 7,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Runs Page-Hinkley over the last N days of OracleAudit scores. Writes
+    an AuditDriftAlert row if drift is detected. Returns the result.
+
+    Designed to be Railway-cron-triggered: a daily POST to this endpoint.
+    Heartbeat is recorded in cron_heartbeats so the hub can show last-run
+    status per job.
+    """
+    from datetime import datetime
+    from db.database import CronHeartbeat
+    import time as _t
+    started = datetime.utcnow()
+    start_t = _t.monotonic()
+    job_name = f"drift_detector__{surface}"
+    notes = None
+    success = False
+    try:
+        from ai.drift_detector import detect_audit_drift
+        result = await detect_audit_drift(db, surface=surface, window_days=int(window_days))
+        success = True
+        notes = f"alert_fired={result.get('alert_fired')} samples={result.get('samples')} stat={result.get('statistic', 0):.2f}"
+    except Exception as e:
+        result = {"error": f"{type(e).__name__}: {e}"}
+        notes = str(e)[:500]
+    # Record heartbeat (separate session so it survives if detect crashed)
+    try:
+        from db.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as sess:
+            hb = CronHeartbeat(
+                job_name=job_name,
+                started_at=started,
+                finished_at=datetime.utcnow(),
+                success=success,
+                duration_ms=int((_t.monotonic() - start_t) * 1000),
+                notes=notes,
+            )
+            sess.add(hb)
+            await sess.commit()
+    except Exception:
+        pass
+    return result
+
+
+@app.get('/admin/hub/drift', summary='Recent audit drift alerts (admin only)')
+async def hub_drift(
+    limit: int = 20,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns recent AuditDriftAlert rows, newest first."""
+    from sqlalchemy import select
+    from db.database import AuditDriftAlert
+    q = await db.execute(
+        select(AuditDriftAlert).order_by(AuditDriftAlert.created_at.desc()).limit(max(1, min(int(limit), 100)))
+    )
+    rows = q.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at.isoformat() + "Z",
+            "surface": r.surface,
+            "metric": r.metric,
+            "window_days": r.window_days,
+            "value": r.value,
+            "threshold": r.threshold,
+            "samples": r.samples,
+            "status": r.status,
+            "notes": r.notes,
+            "resolved_at": r.resolved_at.isoformat() + "Z" if r.resolved_at else None,
+        } for r in rows
+    ]
+
+
+@app.get('/admin/hub/cron', summary='Cron heartbeat status (admin only)')
+async def hub_cron_status(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the most recent run per cron job. Lets the hub show at a
+    glance whether scheduled jobs are firing.
+    """
+    from sqlalchemy import select, func as sql_func
+    from db.database import CronHeartbeat
+    # Last 50 rows is enough to find latest per job for the few jobs we run
+    q = await db.execute(
+        select(CronHeartbeat).order_by(CronHeartbeat.started_at.desc()).limit(200)
+    )
+    rows = q.scalars().all()
+    latest = {}
+    for r in rows:
+        if r.job_name in latest:
+            continue
+        latest[r.job_name] = {
+            "job_name": r.job_name,
+            "last_started_at": r.started_at.isoformat() + "Z",
+            "last_finished_at": r.finished_at.isoformat() + "Z" if r.finished_at else None,
+            "last_success": bool(r.success),
+            "duration_ms": r.duration_ms,
+            "notes": r.notes,
+        }
+    return {"jobs": list(latest.values())}
