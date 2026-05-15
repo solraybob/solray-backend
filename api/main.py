@@ -202,6 +202,100 @@ class SecurityHeadersMiddleware:
 
         await self.app(scope, receive, send_with_headers)
 
+
+# ---------------------------------------------------------------------------
+# Rate limiting middleware (in-memory, IP-based)
+#
+# Per-IP token bucket per path-prefix. Pure Python, no external dep, lost on
+# restart, which is fine for our scale (single Railway instance, abuse
+# attempts are typically one burst rather than sustained low-rate).
+#
+# Limits per IP per 60-second window:
+#   /users/login           10
+#   /users/register         5
+#   /users/forgot-password  5
+#   /users/reset-password   5
+#   /chat                  30
+#   /chat/transcribe       30
+# All other endpoints: unlimited at this layer (admin is gated by require_admin
+# which is stronger; payment endpoints have their own activation lockdown).
+# ---------------------------------------------------------------------------
+
+import time as _time_rate
+from collections import defaultdict as _dd
+from threading import Lock as _Lock
+
+_RATE_LIMITS = {
+    '/users/login':           (10, 60),
+    '/users/register':         (5, 60),
+    '/users/forgot-password':  (5, 60),
+    '/users/reset-password':   (5, 60),
+    '/chat/transcribe':       (30, 60),
+    '/chat':                  (30, 60),  # checked last among /chat* via startswith order
+}
+_rate_buckets: dict = _dd(list)  # key=(ip, path_prefix) -> list[timestamps]
+_rate_lock = _Lock()
+
+
+class RateLimitMiddleware:
+    """Reject requests that exceed per-IP per-path counts."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        # Find the most-specific matching prefix
+        matched_prefix = None
+        matched_limit = None
+        matched_window = None
+        for prefix, (limit, window) in _RATE_LIMITS.items():
+            if path == prefix or path.startswith(prefix + '/'):
+                matched_prefix = prefix
+                matched_limit = limit
+                matched_window = window
+                break
+        if matched_prefix is None:
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client") or ("", 0)
+        ip = client[0] if client else "unknown"
+        now = _time_rate.monotonic()
+        key = (ip, matched_prefix)
+
+        with _rate_lock:
+            bucket = _rate_buckets[key]
+            # Drop timestamps outside the window
+            cutoff = now - matched_window
+            while bucket and bucket[0] < cutoff:
+                bucket.pop(0)
+            if len(bucket) >= matched_limit:
+                # 429 with Retry-After
+                retry_after = max(1, int(matched_window - (now - bucket[0])))
+                headers = [
+                    (b"content-type", b"application/json"),
+                    (b"retry-after", str(retry_after).encode()),
+                ]
+                await send({"type": "http.response.start", "status": 429, "headers": headers})
+                await send({
+                    "type": "http.response.body",
+                    "body": (
+                        b'{"detail":"Too many requests. Try again in '
+                        + str(retry_after).encode()
+                        + b' seconds."}'
+                    ),
+                })
+                return
+            bucket.append(now)
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(RateLimitMiddleware)
+
 app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(
