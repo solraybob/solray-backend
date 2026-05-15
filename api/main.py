@@ -151,6 +151,59 @@ _ADMIN_EMAILS_FROM_ENV = {
 ADMIN_EMAILS = {e.lower() for e in _DEFAULT_ADMIN_EMAILS} | _ADMIN_EMAILS_FROM_ENV
 
 # CORS — restrict to known frontend origins
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+#
+# Adds baseline security headers to every response. Catches the OWASP
+# "header hygiene" basics that get reviewed by app store reviewers and
+# scanned by tools like Mozilla Observatory:
+#
+#   - Strict-Transport-Security: enforce HTTPS for two years on this host
+#   - X-Content-Type-Options: prevent MIME-sniffing
+#   - X-Frame-Options: prevent clickjacking via iframe embedding
+#   - Referrer-Policy: limit cross-origin referrer leakage
+#   - Permissions-Policy: deny default access to camera/geolocation; mic
+#     stays available for the in-app voice composer
+#
+# Content-Security-Policy is intentionally omitted on the API responses
+# (JSON has no scripts to gate); /admin/hub serves HTML and would benefit
+# from a CSP, future ship.
+# ---------------------------------------------------------------------------
+
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                add = {
+                    b"strict-transport-security": b"max-age=63072000; includeSubDomains; preload",
+                    b"x-content-type-options": b"nosniff",
+                    b"x-frame-options": b"DENY",
+                    b"referrer-policy": b"strict-origin-when-cross-origin",
+                    b"permissions-policy": b"camera=(), microphone=(self), geolocation=(), payment=()",
+                }
+                existing_keys = {k.lower() for k, _ in headers}
+                for k, v in add.items():
+                    if k not in existing_keys:
+                        headers.append((k, v))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
