@@ -5103,3 +5103,16 @@ async def hub_cron_status(
             "notes": r.notes,
         }
     return {"jobs": list(latest.values())}
+
+
+@app.get('/admin/hub', summary='Solray Business Hub UI (HTML)')
+async def hub_ui():
+    """The hub page itself. Open to anyone (no server-side auth on this
+    route), but the JSON endpoints it calls require admin auth via JWT.
+    The HTML contains zero user data and zero secrets - it is just a
+    JavaScript client that asks the user for their JWT and then calls
+    the protected /admin/hub/* endpoints on their behalf.
+    """
+    from fastapi.responses import HTMLResponse
+    from api.hub_html import HUB_HTML
+    return HTMLResponse(content=HUB_HTML, status_code=200)
