@@ -2089,23 +2089,57 @@ async def subscribe(
     }
 
 
-@app.post('/subscribe/card', summary='Attach a payment card')
+@app.post('/subscribe/card', summary='Attach a payment card (verified path only)')
 async def attach_payment_card(
     req: AttachCardRequest,
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Store a Teya multi-use token on the subscription and activate it.
+    """Store a Teya multi-use token on the subscription. NEVER activates.
 
-    Called after the user completes the SecurePay hosted card form.
-    SecurePay already charged the first month, so we activate immediately
-    without a second charge.
+    Codex audit (2026-05-15) flagged a P0 bypass: this endpoint previously
+    accepted user-supplied teya_token + card metadata and unconditionally
+    flipped sub.status to 'active'. Any authenticated user could call this
+    with bogus values and get free Solray. The proper activation path is
+    /subscribe/teya-return, which is called by Borgun's verified redirect
+    and looks up the order_id against a session_created PaymentEvent row.
+
+    This endpoint now ONLY stores card metadata. Status flipping is
+    server-verified-only via /subscribe/teya-return. If a token is attached
+    here but no verified Teya callback has fired, status stays whatever it
+    was (trial / expired / past_due) and the user does not get access.
     """
+    from sqlalchemy import select
+    from payments.models import PaymentEvent
+
     sub = await get_subscription(db, user_id)
     if not sub:
         raise HTTPException(status_code=404, detail="No subscription found. Start a trial first.")
 
-    # Store the token and card details
+    # Require a verified payment event for this user before accepting a token.
+    # Only the Teya server-to-server callback writes 'charge' events; the
+    # client cannot fabricate one. Without it, refuse to store anything.
+    verified_q = await db.execute(
+        select(PaymentEvent)
+        .where(PaymentEvent.user_id == user_id)
+        .where(PaymentEvent.event_type.in_(("charge", "session_completed")))
+        .where(PaymentEvent.teya_status == "success")
+        .limit(1)
+    )
+    verified = verified_q.scalar_one_or_none()
+    if verified is None:
+        # No verified callback yet -> caller is either a developer hitting the
+        # endpoint with curl, or a confused frontend retrying after redirect.
+        # Either way: refuse silently rather than upgrade. Return current state.
+        return {
+            "status": sub.status,
+            "card_brand": sub.card_brand,
+            "card_last_four": sub.card_last_four,
+            "message": "No verified payment found. Activation happens server-side after Teya callback.",
+        }
+
+    # Verified path: safe to store the token (status is unchanged here; only
+    # /subscribe/teya-return flips status when Borgun confirms).
     sub = await attach_card(
         db, user_id,
         teya_token=req.teya_token,
@@ -2113,22 +2147,11 @@ async def attach_payment_card(
         card_brand=req.card_brand,
     )
 
-    # Activate the subscription — first month was already charged by SecurePay
-    from datetime import datetime, timedelta
-    from payments.subscription_manager import BILLING_CYCLE_DAYS
-    now = datetime.utcnow()
-    sub.status = "active"
-    sub.current_period_start = now
-    sub.current_period_end = now + timedelta(days=BILLING_CYCLE_DAYS)
-    sub.updated_at = now
-    await db.commit()
-    await db.refresh(sub)
-
     return {
         "status": sub.status,
         "card_brand": sub.card_brand,
         "card_last_four": sub.card_last_four,
-        "message": "Subscription activated.",
+        "message": "Card metadata stored. Subscription status is controlled by the Teya callback path.",
     }
 
 
