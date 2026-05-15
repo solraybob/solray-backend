@@ -4960,7 +4960,7 @@ async def hub_overview(
 
     # Memory + narrative size
     mem_q = await db.execute(select(sql_func.count(UserMemory.id)))
-    nev_q = await db.execute(select(sql_func.count(NarrativeEvent.id)))
+    nev_q = await db.execute(select(sql_func.count(NarrativeEvent.event_id)))
     mem_count = int(mem_q.scalar() or 0)
     nev_count = int(nev_q.scalar() or 0)
 
