@@ -4891,7 +4891,7 @@ async def hub_overview(
     to be the main /admin/hub landing-page payload.
     """
     from datetime import datetime, timedelta
-    from sqlalchemy import select, func as sql_func
+    from sqlalchemy import select, func as sql_func, case as sql_case
     from db.database import (
         User, OracleAudit, ApiUsage, ChatLineage,
         UserMemory, NarrativeEvent,
@@ -4942,7 +4942,7 @@ async def hub_overview(
     err_q = await db.execute(
         select(
             sql_func.count(ApiUsage.id).label('all'),
-            sql_func.sum(sql_func.case((ApiUsage.is_success.is_(False), 1), else_=0)).label('err'),
+            sql_func.sum(sql_case((ApiUsage.is_success.is_(False), 1), else_=0)).label('err'),
         ).where(ApiUsage.created_at >= last_24h)
     )
     e = err_q.first()
