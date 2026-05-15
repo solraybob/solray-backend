@@ -3715,6 +3715,13 @@ async def chat_endpoint(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail='User not found')
+    # Generate request_uuid early so log_api_usage and log_chat_lineage can
+    # correlate to the same logical request. Capture start_time for latency.
+    import uuid as _uuid_mod
+    import time as _time_mod
+    _request_uuid = str(_uuid_mod.uuid4())
+    _chat_start_t = _time_mod.monotonic()
+
     blueprint = await get_blueprint(db, user_id)
     if not blueprint:
         raise HTTPException(status_code=404, detail='Blueprint not found')
@@ -3999,6 +4006,39 @@ async def chat_endpoint(
             _spawn_background(_write_narrative_events())
         except Exception as _ne_err:
             logger.warning(f"[narrative] schedule failed for user {user_id}: {_ne_err}")
+
+        # Hub slice 2: lineage write. Append-only provenance trail of this
+        # request. Fire-and-forget so it never blocks the user response.
+        try:
+            from db.database import log_chat_lineage
+            from ai.chat import ORACLE_PROMPT_TAG as _opt
+            _memory_ids = [str(m.get('id')) for m in (memories or []) if isinstance(m, dict) and m.get('id')]
+            _event_ids = [str(e.get('id')) for e in (past_moments or []) if isinstance(e, dict) and e.get('id')]
+            async def _write_lineage():
+                try:
+                    await log_chat_lineage(
+                        request_uuid=_request_uuid,
+                        user_id=user_id,
+                        session_id=current_session_id if 'current_session_id' in locals() else None,
+                        prompt_hash=None,  # filled in once prompt_hash is exposed by chat()
+                        system_prompt_version=_opt,
+                        retrieval_version="v1",
+                        model=None,  # filled by api_usage rows
+                        is_break_glass=False,
+                        retrieved_memory_ids=_memory_ids,
+                        retrieved_event_ids=_event_ids,
+                        hive_context_used=bool(hive_context),
+                        user_message_excerpt=req.message or "",
+                        reply_excerpt=str(response or "")[:2000],
+                        response_latency_ms=int((_time_mod.monotonic() - _chat_start_t) * 1000),
+                        total_tokens=0,
+                        cost_usd_micros=0,
+                    )
+                except Exception as _le:
+                    logger.warning(f"[lineage] write failed for user {user_id}: {_le}")
+            _spawn_background(_write_lineage())
+        except Exception as _le_outer:
+            logger.warning(f"[lineage] schedule failed for user {user_id}: {_le_outer}")
 
         return {"response": response}
     except Exception as e:
@@ -4764,4 +4804,193 @@ async def hub_cost(
         "by_model": by_model,
         "top_users_by_cost": top_users,
         "queue_stats": queue_stats,
+    }
+
+
+@app.get('/admin/hub/lineage/{request_uuid}', summary='Full provenance trail for one chat request (admin only)')
+async def hub_lineage_one(
+    request_uuid: str,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns a single ChatLineage row plus joined ApiUsage entries and the
+    OracleAudit row for that request. Use it when a user complains about a
+    specific reply: paste the request_uuid and get the whole picture.
+    """
+    from sqlalchemy import select
+    from db.database import ChatLineage, ApiUsage, OracleAudit
+    lin_q = await db.execute(select(ChatLineage).where(ChatLineage.request_uuid == request_uuid))
+    lin = lin_q.scalar_one_or_none()
+    if lin is None:
+        raise HTTPException(status_code=404, detail='request_uuid not found')
+
+    usage_q = await db.execute(select(ApiUsage).where(ApiUsage.request_uuid == request_uuid))
+    usage = usage_q.scalars().all()
+
+    audit = None
+    if lin.audit_id:
+        audit_q = await db.execute(select(OracleAudit).where(OracleAudit.id == lin.audit_id))
+        audit = audit_q.scalar_one_or_none()
+
+    return {
+        "lineage": {
+            "request_uuid": lin.request_uuid,
+            "user_id": lin.user_id,
+            "session_id": lin.session_id,
+            "created_at": lin.created_at.isoformat() + 'Z' if lin.created_at else None,
+            "prompt_hash": lin.prompt_hash,
+            "system_prompt_version": lin.system_prompt_version,
+            "retrieval_version": lin.retrieval_version,
+            "model": lin.model,
+            "is_break_glass": lin.is_break_glass,
+            "retrieved_memory_count": lin.retrieved_memory_count,
+            "retrieved_event_count": lin.retrieved_event_count,
+            "hive_context_used": lin.hive_context_used,
+            "user_message_excerpt": lin.user_message_excerpt,
+            "reply_excerpt": lin.reply_excerpt,
+            "response_latency_ms": lin.response_latency_ms,
+            "audit_id": lin.audit_id,
+            "audit_score": lin.audit_score,
+            "total_tokens": lin.total_tokens,
+            "cost_usd": (lin.cost_usd_micros or 0) / 1_000_000.0,
+        },
+        "usage_calls": [
+            {
+                "id": u.id,
+                "surface": u.surface,
+                "provider": u.provider,
+                "model": u.model,
+                "tokens": u.total_tokens,
+                "cost_usd": (u.cost_usd_micros or 0) / 1_000_000.0,
+                "duration_ms": u.duration_ms,
+                "is_success": u.is_success,
+                "retries": u.retries,
+                "error_type": u.error_type,
+            } for u in usage
+        ],
+        "audit": ({
+            "id": audit.id,
+            "score": audit.score,
+            "violations_json": audit.violations_json,
+            "notes": audit.notes,
+            "model_used": audit.model_used,
+            "oracle_prompt_version": audit.oracle_prompt_version,
+            "audit_prompt_version": audit.audit_prompt_version,
+            "created_at": audit.created_at.isoformat() + 'Z' if audit.created_at else None,
+        } if audit else None),
+    }
+
+
+@app.get('/admin/hub/overview', summary='Solray Business Hub top-level KPIs (admin only)')
+async def hub_overview(
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """One-call snapshot of how Solray is running right now: users, MRR,
+    audit voice quality, AI spend, error rates, and queue health. Built
+    to be the main /admin/hub landing-page payload.
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import select, func as sql_func
+    from db.database import (
+        User, OracleAudit, ApiUsage, ChatLineage,
+        UserMemory, NarrativeEvent,
+    )
+    from payments.models import Subscription
+
+    now = datetime.utcnow()
+    last_24h = now - timedelta(hours=24)
+    last_7d = now - timedelta(days=7)
+    last_30d = now - timedelta(days=30)
+
+    # Users + subscribers (subscription state lives on Subscription table,
+    # not User; status values: trial | active | past_due | cancelled | expired)
+    total_users_q = await db.execute(select(sql_func.count(User.id)))
+    total_users = int(total_users_q.scalar() or 0)
+
+    active_subs_q = await db.execute(
+        select(sql_func.count(Subscription.id)).where(Subscription.status.in_(['trial', 'active', 'past_due']))
+    )
+    active_subs = int(active_subs_q.scalar() or 0)
+
+    paying_subs_q = await db.execute(
+        select(sql_func.count(Subscription.id)).where(Subscription.status == 'active')
+    )
+    paying_subs = int(paying_subs_q.scalar() or 0)
+
+    # Audit voice quality (last 7 days)
+    audit_q = await db.execute(
+        select(
+            sql_func.avg(OracleAudit.score).label('avg'),
+            sql_func.count(OracleAudit.id).label('n'),
+        ).where(OracleAudit.created_at >= last_7d)
+    )
+    a = audit_q.first()
+    audit_7d = {"avg_score": round(float(a.avg or 0), 2), "samples": int(a.n or 0)}
+
+    # AI cost (7 days)
+    cost_q = await db.execute(
+        select(
+            sql_func.coalesce(sql_func.sum(ApiUsage.cost_usd_micros), 0).label('cost'),
+            sql_func.count(ApiUsage.id).label('calls'),
+        ).where(ApiUsage.created_at >= last_7d)
+    )
+    c = cost_q.first()
+    spend_7d = {"cost_usd": (c.cost or 0) / 1_000_000.0, "calls": int(c.calls or 0)}
+
+    # Error rate (24h)
+    err_q = await db.execute(
+        select(
+            sql_func.count(ApiUsage.id).label('all'),
+            sql_func.sum(sql_func.case((ApiUsage.is_success.is_(False), 1), else_=0)).label('err'),
+        ).where(ApiUsage.created_at >= last_24h)
+    )
+    e = err_q.first()
+    err_24h = {
+        "total": int(e.all or 0),
+        "errors": int(e.err or 0),
+        "error_rate": round(float((e.err or 0) / e.all), 4) if (e.all or 0) > 0 else 0.0,
+    }
+
+    # Chat volume (24h)
+    chat_q = await db.execute(
+        select(sql_func.count(ChatLineage.id)).where(ChatLineage.created_at >= last_24h)
+    )
+    chats_24h = int(chat_q.scalar() or 0)
+
+    # Memory + narrative size
+    mem_q = await db.execute(select(sql_func.count(UserMemory.id)))
+    nev_q = await db.execute(select(sql_func.count(NarrativeEvent.id)))
+    mem_count = int(mem_q.scalar() or 0)
+    nev_count = int(nev_q.scalar() or 0)
+
+    # Queue health
+    try:
+        from ai.usage_logger import get_queue_stats
+        queue = get_queue_stats()
+    except Exception:
+        queue = {"queue_depth": -1, "enabled": False}
+
+    # MRR estimate (paying users * 23 USD)
+    mrr_usd = paying_subs * 23.0
+
+    return {
+        "now": now.isoformat() + 'Z',
+        "users": {
+            "total": total_users,
+            "active_or_trialing": active_subs,
+            "paying": paying_subs,
+        },
+        "revenue": {
+            "mrr_usd_estimate": mrr_usd,
+        },
+        "voice_quality_7d": audit_7d,
+        "ai_spend_7d": spend_7d,
+        "errors_24h": err_24h,
+        "chats_24h": chats_24h,
+        "memory": {
+            "user_memory_rows": mem_count,
+            "narrative_event_rows": nev_count,
+        },
+        "usage_queue": queue,
     }

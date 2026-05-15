@@ -869,6 +869,66 @@ class ApiUsage(Base):
     )
 
 
+class ChatLineage(Base):
+    """One row per /chat request. Append-only provenance trail.
+
+    Captures everything that contributed to one Oracle reply: which memories
+    were retrieved, which events were grounded, which prompt version ran,
+    which model answered, what the audit said, how long it took, how much
+    it cost. When a user complains about a specific reply, we can replay
+    the exact state.
+
+    request_uuid is the canonical id for the request. Unique index prevents
+    duplicate writes if the /chat handler retries internally.
+
+    retrieved_memory_ids and retrieved_event_ids are JSON arrays of ids
+    (text). We also store retrieved_memory_count and retrieved_event_count
+    for cheap aggregates (no JSON parse needed for daily rollups).
+
+    system_prompt_version is ORACLE_PROMPT_TAG at request time. retrieval_
+    version tags the retrieval algorithm so we can correlate "scores
+    changed" with "we changed how we pick memories." Bump both when
+    the relevant code changes.
+
+    audit_id is a soft pointer to oracle_audit.id (set when the background
+    audit finishes). We use a column not a FK because the audit happens
+    after the lineage write; FK would force ordering.
+    """
+    __tablename__ = 'chat_lineage'
+
+    id                       = Column(Integer, primary_key=True, autoincrement=True)
+    request_uuid             = Column(String(36), nullable=False, unique=True, index=True)
+    user_id                  = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    session_id               = Column(String(36), nullable=True, index=True)
+    created_at               = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    prompt_hash              = Column(String(40), nullable=True)
+    system_prompt_version    = Column(String(32), nullable=True, index=True)
+    retrieval_version        = Column(String(32), nullable=True)
+    model                    = Column(String(64), nullable=True)
+    is_break_glass           = Column(Boolean, nullable=False, default=False)
+
+    retrieved_memory_ids     = Column(Text, nullable=True)   # JSON array
+    retrieved_memory_count   = Column(Integer, nullable=False, default=0)
+    retrieved_event_ids      = Column(Text, nullable=True)   # JSON array
+    retrieved_event_count    = Column(Integer, nullable=False, default=0)
+    hive_context_used        = Column(Boolean, nullable=False, default=False)
+
+    user_message_excerpt     = Column(Text, nullable=True)
+    reply_excerpt            = Column(Text, nullable=True)
+    response_latency_ms      = Column(Integer, nullable=True)
+
+    audit_id                 = Column(Integer, nullable=True)
+    audit_score              = Column(Integer, nullable=True, index=True)
+
+    total_tokens             = Column(Integer, nullable=False, default=0)
+    cost_usd_micros          = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index('ix_chat_lineage_user_created', 'user_id', 'created_at'),
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB Initialisation
 # ---------------------------------------------------------------------------
@@ -2928,3 +2988,81 @@ async def get_user_hive_context(
 
     return out
 
+
+
+
+# ---------------------------------------------------------------------------
+# ChatLineage helper (Hub slice 2)
+# ---------------------------------------------------------------------------
+
+async def log_chat_lineage(
+    *,
+    request_uuid: str,
+    user_id,
+    session_id=None,
+    prompt_hash=None,
+    system_prompt_version=None,
+    retrieval_version="v1",
+    model=None,
+    is_break_glass: bool = False,
+    retrieved_memory_ids=None,
+    retrieved_event_ids=None,
+    hive_context_used: bool = False,
+    user_message_excerpt: str = "",
+    reply_excerpt: str = "",
+    response_latency_ms=None,
+    total_tokens: int = 0,
+    cost_usd_micros: int = 0,
+) -> None:
+    """Append-only insert into chat_lineage. Failures swallowed silently.
+
+    Called from the /chat handler after the reply is assembled. Fire-and-
+    forget via the AsyncSessionLocal pattern, never blocks the response.
+    """
+    import json as _json
+    import logging as _log
+    _logger = _log.getLogger("solray.lineage")
+    try:
+        async with AsyncSessionLocal() as session:
+            row = ChatLineage(
+                request_uuid=request_uuid,
+                user_id=user_id,
+                session_id=session_id,
+                prompt_hash=(prompt_hash or "")[:40] or None,
+                system_prompt_version=(system_prompt_version or "")[:32] or None,
+                retrieval_version=(retrieval_version or "")[:32] or None,
+                model=(model or "")[:64] or None,
+                is_break_glass=bool(is_break_glass),
+                retrieved_memory_ids=_json.dumps(retrieved_memory_ids or []),
+                retrieved_memory_count=len(retrieved_memory_ids or []),
+                retrieved_event_ids=_json.dumps(retrieved_event_ids or []),
+                retrieved_event_count=len(retrieved_event_ids or []),
+                hive_context_used=bool(hive_context_used),
+                user_message_excerpt=(user_message_excerpt or "")[:1000] or None,
+                reply_excerpt=(reply_excerpt or "")[:2000] or None,
+                response_latency_ms=response_latency_ms,
+                total_tokens=int(total_tokens or 0),
+                cost_usd_micros=int(cost_usd_micros or 0),
+            )
+            session.add(row)
+            await session.commit()
+    except Exception as e:
+        _logger.warning("[lineage] write failed: %s: %s", type(e).__name__, e)
+
+
+async def attach_audit_to_lineage(request_uuid: str, audit_id: int, audit_score: int) -> None:
+    """Backfill the audit_id/audit_score onto a previously-written lineage row.
+
+    The audit fires AFTER the chat reply, so lineage is written first and
+    the audit pointer is attached when the audit completes. Best-effort.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(ChatLineage)
+                .where(ChatLineage.request_uuid == request_uuid)
+                .values(audit_id=audit_id, audit_score=audit_score)
+            )
+            await session.commit()
+    except Exception:
+        pass
