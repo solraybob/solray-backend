@@ -304,6 +304,7 @@ async def _audit_with_gpt4o(
     user_message: str,
     oracle_reply: str,
     chart_facts: str = "",
+    user_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Run the audit. Returns a {score, violations, notes} dict, or None on failure.
 
@@ -334,6 +335,8 @@ async def _audit_with_gpt4o(
     try:
         oai = AsyncOpenAI(api_key=api_key, timeout=20.0)
         prompt = _build_audit_prompt(user_message, oracle_reply, chart_facts)
+        import time as _t
+        _start = _t.monotonic()
         resp = await oai.chat.completions.create(
             model="gpt-4o",
             max_tokens=300,
@@ -341,6 +344,21 @@ async def _audit_with_gpt4o(
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
+        try:
+            from ai.usage_logger import log_api_usage, extract_openai_usage
+            usage = extract_openai_usage(resp)
+            log_api_usage(
+                surface="audit",
+                provider="openai",
+                model="gpt-4o",
+                user_id=user_id,
+                duration_ms=int((_t.monotonic() - _start) * 1000),
+                is_success=True,
+                provider_request_id=getattr(resp, "id", None),
+                **usage,
+            )
+        except Exception:
+            pass
         text = resp.choices[0].message.content or ""
         try:
             parsed = json.loads(text)
@@ -360,6 +378,19 @@ async def _audit_with_gpt4o(
         notes = str(parsed.get("notes") or "").strip()[:280]
         return {"score": score, "violations": violations, "notes": notes}
     except Exception as e:
+        try:
+            from ai.usage_logger import log_api_usage
+            log_api_usage(
+                surface="audit",
+                provider="openai",
+                model="gpt-4o",
+                user_id=user_id,
+                is_success=False,
+                error_type=type(e).__name__,
+                error_message_trunc=str(e)[:500],
+            )
+        except Exception:
+            pass
         log.warning(f"[audit] GPT-4o call failed: {type(e).__name__}: {e}")
         return None
 
@@ -466,7 +497,7 @@ async def audit_oracle_reply(
         return
 
     chart_facts = _format_chart_facts_for_audit(blueprint) if blueprint else ""
-    result = await _audit_with_gpt4o(user_message or "", oracle_reply, chart_facts)
+    result = await _audit_with_gpt4o(user_message or "", oracle_reply, chart_facts, user_id=user_id)
     if result is None:
         return
 

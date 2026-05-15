@@ -481,6 +481,9 @@ def _call_claude_with_retry(
     client: anthropic.Anthropic,
     *,
     max_attempts: int = 3,
+    _surface: str = "chat",
+    _user_id: Optional[str] = None,
+    _request_uuid: Optional[str] = None,
     **create_kwargs,
 ):
     """Wrap client.messages.create with exponential backoff on transient errors.
@@ -495,6 +498,11 @@ def _call_claude_with_retry(
     Anthropic prompt-caching layer kicks in. ~60-80% input-token cost
     reduction on chat replies within a session. Safe no-op if system is
     already structured or missing.
+
+    Usage logging: every call records to the ApiUsage table via the
+    in-process queue (ai/usage_logger.py). Surface is the subsystem
+    making the call (chat / forecast / first_mirror / etc). Fire-and-
+    forget; never blocks the response.
     """
     import time
     import logging
@@ -502,13 +510,52 @@ def _call_claude_with_retry(
     _wrap_system_for_caching(create_kwargs)
     delays = [0.5, 1.0, 2.0]
     last_err: Optional[Exception] = None
+    model_for_log = create_kwargs.get("model", "unknown")
+    start_t = time.monotonic()
     for attempt in range(max_attempts):
         try:
-            return client.messages.create(**create_kwargs)
+            response = client.messages.create(**create_kwargs)
+            # Record usage on success. Best-effort, never raises.
+            try:
+                from ai.usage_logger import log_api_usage, extract_anthropic_usage
+                usage = extract_anthropic_usage(response)
+                log_api_usage(
+                    surface=_surface,
+                    provider="anthropic",
+                    model=model_for_log,
+                    user_id=_user_id,
+                    request_uuid=_request_uuid,
+                    provider_request_id=getattr(response, "id", None),
+                    duration_ms=int((time.monotonic() - start_t) * 1000),
+                    is_success=True,
+                    retries=attempt,
+                    oracle_prompt_version=ORACLE_PROMPT_TAG,
+                    **usage,
+                )
+            except Exception:
+                pass
+            return response
         except Exception as e:
             last_err = e
             if not _is_transient_error(e):
                 # Permanent error — raise immediately, don't burn budget.
+                try:
+                    from ai.usage_logger import log_api_usage
+                    log_api_usage(
+                        surface=_surface,
+                        provider="anthropic",
+                        model=model_for_log,
+                        user_id=_user_id,
+                        request_uuid=_request_uuid,
+                        duration_ms=int((time.monotonic() - start_t) * 1000),
+                        is_success=False,
+                        error_type=type(e).__name__,
+                        error_message_trunc=str(e)[:500],
+                        retries=attempt,
+                        oracle_prompt_version=ORACLE_PROMPT_TAG,
+                    )
+                except Exception:
+                    pass
                 log.warning(
                     f"[claude] non-transient {type(e).__name__} on attempt {attempt + 1}: {e}"
                 )
@@ -516,6 +563,23 @@ def _call_claude_with_retry(
             if attempt == max_attempts - 1:
                 # Final transient failure — convert to OracleUnavailable so
                 # the caller can decide between break-glass and fallback.
+                try:
+                    from ai.usage_logger import log_api_usage
+                    log_api_usage(
+                        surface=_surface,
+                        provider="anthropic",
+                        model=model_for_log,
+                        user_id=_user_id,
+                        request_uuid=_request_uuid,
+                        duration_ms=int((time.monotonic() - start_t) * 1000),
+                        is_success=False,
+                        error_type=type(e).__name__,
+                        error_message_trunc=str(e)[:500],
+                        retries=attempt,
+                        oracle_prompt_version=ORACLE_PROMPT_TAG,
+                    )
+                except Exception:
+                    pass
                 log.warning(
                     f"[claude] exhausted {max_attempts} retries; last error "
                     f"{type(e).__name__}: {e}"

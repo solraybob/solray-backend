@@ -804,6 +804,71 @@ class OracleAudit(Base):
     audit_prompt_version  = Column(String(32), nullable=False, default='audit-v1')
 
 
+class ApiUsage(Base):
+    """One row per LLM API call. Cost, tokens, latency, errors, retries.
+
+    Populated by ai/usage_logger.py via the in-process async queue. Writes
+    are batched (every 10 items or 2s, whichever first) so the chat reply
+    is never blocked on a usage insert.
+
+    surface is the calling subsystem: 'chat', 'forecast', 'audit',
+    'memory_synthesis', 'first_mirror', 'compatibility', 'self_state',
+    'morning_greeting', 'initiative_draft', 'initiative_audit', etc. Used
+    to slice cost by Oracle subsystem.
+
+    provider is 'anthropic' or 'openai'. model is the exact model string.
+
+    Tokens are provider-native counts. For Anthropic input_tokens already
+    excludes the cached prefix; cache_creation_tokens and cache_read_tokens
+    are separate. For OpenAI cache_* are 0.
+
+    cost_usd_micros is USD * 1_000_000, integer for precision. Computed
+    from ai/pricing.py using pricing_version, so historical cost is
+    reproducible even when rates change.
+
+    is_success / error_type let us separate "cost spiked" from "errors
+    spiked" without joining other tables.
+
+    request_uuid is the canonical id; provider_request_id is whatever
+    the provider returned. Unique index on (provider, provider_request_id)
+    prevents duplicate writes under retries.
+    """
+    __tablename__ = 'api_usage'
+
+    id                       = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                  = Column(String(36), ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    created_at               = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    surface                  = Column(String(48), nullable=False, index=True)
+    provider                 = Column(String(16), nullable=False)
+    model                    = Column(String(64), nullable=False, index=True)
+
+    input_tokens             = Column(Integer, nullable=False, default=0)
+    output_tokens            = Column(Integer, nullable=False, default=0)
+    cache_creation_tokens    = Column(Integer, nullable=False, default=0)
+    cache_read_tokens        = Column(Integer, nullable=False, default=0)
+    total_tokens             = Column(Integer, nullable=False, default=0)
+
+    cost_usd_micros          = Column(Integer, nullable=False, default=0)
+    pricing_version          = Column(String(16), nullable=False, default='unknown')
+
+    duration_ms              = Column(Integer, nullable=True)
+    is_success               = Column(Boolean, nullable=False, default=True, index=True)
+    error_type               = Column(String(64), nullable=True)
+    error_message_trunc      = Column(Text, nullable=True)
+    retries                  = Column(Integer, nullable=False, default=0)
+    is_stream                = Column(Boolean, nullable=False, default=False)
+
+    request_uuid             = Column(String(36), nullable=True, index=True)
+    provider_request_id      = Column(String(128), nullable=True)
+    oracle_prompt_version    = Column(String(32), nullable=True)
+
+    __table_args__ = (
+        Index('ix_api_usage_provider_req', 'provider', 'provider_request_id', unique=False),
+        Index('ix_api_usage_created_surface', 'created_at', 'surface'),
+    )
+
+
 # ---------------------------------------------------------------------------
 # DB Initialisation
 # ---------------------------------------------------------------------------

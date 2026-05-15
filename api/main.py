@@ -170,6 +170,16 @@ async def startup():
     """Initialise DB tables on first start, kick off billing scheduler."""
     await init_db()
 
+    # Start the API-usage logger queue + background writer. Codex audit
+    # (May 2026) recommended in-process queue with batched inserts over
+    # per-request background tasks. Drains queue every 10 items or 2s,
+    # whichever first. Non-fatal if it fails.
+    try:
+        from ai.usage_logger import start_writer as _start_usage_writer
+        await _start_usage_writer()
+    except Exception as e:
+        logger.warning(f"[startup] usage logger writer failed to start: {e}")
+
     # Model health check. Tonight (2026-05-12) the Oracle went down because a
     # ghost model ID was lurking in the advisor for weeks, then got copied to
     # the chat path. The try/except masked the failure. This probe pings every
@@ -4615,3 +4625,143 @@ async def admin_run_canaries(
     report = await run_canary_checks(db, send_alert=True)
     return report
 # Force redeploy Tue Apr 14 18:15:01 CEST 2026
+
+
+# ---------------------------------------------------------------------------
+# Solray Business Hub — observability endpoints
+#
+# Read-only admin endpoints aggregating ApiUsage, OracleAudit, and friends
+# into a single business-intelligence surface. Layer 1 (data) lives in the
+# tables; Layer 2 (these endpoints) does the queries; Layer 3 (Jinja UI)
+# renders them into a single hub page. All endpoints require admin auth.
+#
+# Shipped progressively. /admin/hub/cost was the first. Drift, lineage,
+# users, and the Jinja UI layer follow in subsequent ships.
+# ---------------------------------------------------------------------------
+
+@app.get('/admin/hub/cost', summary='API usage and cost analytics (admin only)')
+async def hub_cost(
+    days: int = 7,
+    admin_id: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns token usage and USD cost rollups for the last N days.
+
+    Pulls from api_usage. Costs are computed at write time using pricing.py
+    so they survive future rate changes.
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import select, func as sql_func
+    from db.database import ApiUsage
+
+    days = max(1, min(int(days or 7), 90))
+    since = datetime.utcnow() - timedelta(days=days)
+
+    # Totals
+    totals_q = await db.execute(
+        select(
+            sql_func.count(ApiUsage.id).label('calls'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.total_tokens), 0).label('tokens'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.cost_usd_micros), 0).label('cost_micros'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.cache_read_tokens), 0).label('cache_read'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.input_tokens + ApiUsage.cache_creation_tokens), 0).label('input_plus_create'),
+        ).where(ApiUsage.created_at >= since)
+    )
+    t = totals_q.first()
+    total_calls = int(t.calls or 0)
+    total_tokens = int(t.tokens or 0)
+    total_cost_usd = (t.cost_micros or 0) / 1_000_000.0
+    cache_hit_ratio = 0.0
+    if (t.input_plus_create or 0) > 0:
+        cache_hit_ratio = (t.cache_read or 0) / float((t.cache_read or 0) + (t.input_plus_create or 0))
+
+    # By surface
+    by_surface_q = await db.execute(
+        select(
+            ApiUsage.surface,
+            sql_func.count(ApiUsage.id).label('calls'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.total_tokens), 0).label('tokens'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.cost_usd_micros), 0).label('cost_micros'),
+        ).where(ApiUsage.created_at >= since).group_by(ApiUsage.surface)
+    )
+    by_surface = [
+        {
+            "surface": r.surface,
+            "calls": int(r.calls or 0),
+            "tokens": int(r.tokens or 0),
+            "cost_usd": (r.cost_micros or 0) / 1_000_000.0,
+        }
+        for r in by_surface_q.fetchall()
+    ]
+    by_surface.sort(key=lambda x: x["cost_usd"], reverse=True)
+
+    # By model
+    by_model_q = await db.execute(
+        select(
+            ApiUsage.model,
+            sql_func.count(ApiUsage.id).label('calls'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.total_tokens), 0).label('tokens'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.cost_usd_micros), 0).label('cost_micros'),
+        ).where(ApiUsage.created_at >= since).group_by(ApiUsage.model)
+    )
+    by_model = [
+        {
+            "model": r.model,
+            "calls": int(r.calls or 0),
+            "tokens": int(r.tokens or 0),
+            "cost_usd": (r.cost_micros or 0) / 1_000_000.0,
+        }
+        for r in by_model_q.fetchall()
+    ]
+    by_model.sort(key=lambda x: x["cost_usd"], reverse=True)
+
+    # Top users by cost
+    top_users_q = await db.execute(
+        select(
+            ApiUsage.user_id,
+            sql_func.count(ApiUsage.id).label('calls'),
+            sql_func.coalesce(sql_func.sum(ApiUsage.cost_usd_micros), 0).label('cost_micros'),
+        ).where(ApiUsage.created_at >= since, ApiUsage.user_id.is_not(None)).group_by(ApiUsage.user_id)
+    )
+    top_users = [
+        {
+            "user_id": r.user_id,
+            "calls": int(r.calls or 0),
+            "cost_usd": (r.cost_micros or 0) / 1_000_000.0,
+        }
+        for r in top_users_q.fetchall()
+    ]
+    top_users.sort(key=lambda x: x["cost_usd"], reverse=True)
+    top_users = top_users[:10]
+
+    # Errors
+    err_q = await db.execute(
+        select(sql_func.count(ApiUsage.id))
+        .where(ApiUsage.created_at >= since, ApiUsage.is_success.is_(False))
+    )
+    error_count = int(err_q.scalar() or 0)
+    error_rate = (error_count / total_calls) if total_calls else 0.0
+
+    # Queue health (writer stats)
+    try:
+        from ai.usage_logger import get_queue_stats
+        queue_stats = get_queue_stats()
+    except Exception:
+        queue_stats = {"queue_depth": -1, "enabled": False}
+
+    return {
+        "window_days": days,
+        "since": since.isoformat() + "Z",
+        "totals": {
+            "calls": total_calls,
+            "tokens": total_tokens,
+            "cost_usd": round(total_cost_usd, 4),
+            "errors": error_count,
+            "error_rate": round(error_rate, 4),
+            "cache_hit_ratio": round(cache_hit_ratio, 4),
+        },
+        "by_surface": by_surface,
+        "by_model": by_model,
+        "top_users_by_cost": top_users,
+        "queue_stats": queue_stats,
+    }
